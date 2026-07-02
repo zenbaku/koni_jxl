@@ -25,9 +25,6 @@ final class LfCoefficients {
       throw const JxlInvalidBitstreamException(
           'adaptive smoothing is incompatible with subsampling');
     }
-    if (header.flags & FrameFlags.useLfFrame != 0) {
-      throw JxlUnsupportedException('lf-frames');
-    }
 
     final info = List<ModularChannel?>.filled(3, null);
     var coeff = <List<Float32List>>[];
@@ -37,6 +34,27 @@ final class LfCoefficients {
       info[cMap[i]] = ModularChannel(
           sizeY, sizeX, header.jpegUpsamplingY[i], header.jpegUpsamplingX[i]);
       coeff.add(floatMatrix(sizeY, sizeX));
+    }
+
+    if (header.flags & FrameFlags.useLfFrame != 0) {
+      // The dequantized LF is a direct copy of the LF frame's pixels at
+      // this LF group's position; the LF context indices stay zero.
+      final lfFrame = frame.lfFrame!;
+      final pos = frame.getLFGroupLocation(parent.lfGroupID);
+      final pY = pos.y << 8;
+      final pX = pos.x << 8;
+      for (var c = 0; c < 3; c++) {
+        lfFrame[c].castToFloat(frame.globalMetadata.bitDepth.bitsPerSample);
+        final b = lfFrame[c].floatRows;
+        final co = coeff[c];
+        for (var y = 0; y < co.length; y++) {
+          co[y].setRange(0, co[y].length, b[pY + y], pX);
+        }
+      }
+      dequantLFCoeff0 = List<Float32List>.of(coeff[0], growable: false);
+      dequantLFCoeff1 = List<Float32List>.of(coeff[1], growable: false);
+      dequantLFCoeff2 = List<Float32List>.of(coeff[2], growable: false);
+      return;
     }
 
     final extraPrecision = reader.readBits(2);

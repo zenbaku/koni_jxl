@@ -63,11 +63,13 @@ Supported today:
   (`JxlDecoder.decodeAnimation`, `JxlAnimationView` widget) — the
   newtons_cradle conformance animation is bit-exact on all 36 frames
 - ✅ Splines (both spline conformance cases within 1/255 of djxl)
+- ✅ Progressive DC (LF frames), multi-pass AC — files from
+  `cjxl --progressive_dc` decode within lossy tolerance of djxl
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 
 - ⏳ Spot-color rendering, extra-channel blend modes
-- ⏳ Progressive decode (LF frames), JPEG reconstruction
+- ⏳ JPEG bitstream reconstruction
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless

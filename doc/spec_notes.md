@@ -50,6 +50,18 @@ only described by an embedded ICC profile (`want_icc`) are decoded as if
 tagged sRGB; a full ICC-driven output transform is out of scope for v1
 (the raw ICC profile is exposed on `JxlImage.iccProfile`).
 
+## Progressive (LF frames)
+
+LF frames (progressive DC, `cjxl --progressive_dc=N`) decode through the
+normal frame machinery: an LF frame's pixels are stored per lf-level and
+become the referencing frame's dequantized LF coefficients directly (the
+LF context indices stay zero, matching the reference decoders). Synthetic
+progressive_dc corpus files gate this within the normal lossy thresholds.
+The `progressive` conformance testcase decodes correctly but differs from
+djxl by a smooth per-channel tone curve: its color is described only by
+an embedded ICC profile, which koni_jxl decodes as sRGB (the documented
+ICC limitation, verified as a monotonic +-1-tight value mapping).
+
 ## Performance status
 
 Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a

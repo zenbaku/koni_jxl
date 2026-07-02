@@ -157,9 +157,35 @@ void performEdgePreservingFilter(Frame frame, int colors) {
     } else {
       sigmaScale = stepMultiplier;
     }
-    if (i == 0) {
-      _epfPassGeneral(inputRows, outputRows, colors, rf, inverseSigma,
-          invModularSigma, sigmaScale, i, padded.height, padded.width);
+    if (i == 0 && colors == 1) {
+      _epfPass0Gray(
+          frame.buffer[0].floatRows,
+          outputBuffer[0].floatRows,
+          inputRows,
+          outputRows,
+          rf,
+          inverseSigma,
+          invModularSigma,
+          sigmaScale,
+          padded.height,
+          padded.width);
+    } else if (i == 0) {
+      _epfPass0Color(
+          frame.buffer[0].floatRows,
+          frame.buffer[1].floatRows,
+          frame.buffer[2].floatRows,
+          outputBuffer[0].floatRows,
+          outputBuffer[1].floatRows,
+          outputBuffer[2].floatRows,
+          inputRows,
+          outputRows,
+          colors,
+          rf,
+          inverseSigma,
+          invModularSigma,
+          sigmaScale,
+          padded.height,
+          padded.width);
     } else if (colors == 1) {
       _epfPassGray(
           frame.buffer[0].floatRows,
@@ -240,7 +266,251 @@ void _epfPixelGeneral(
   }
 }
 
-void _epfPassGeneral(
+/// Pass 0 (epfIterations == 3): the 12-cross double-cross pass with fully
+/// unrolled interior kernels (direct row locals passed from a call site
+/// with statically known concrete lists; nested-container access in or
+/// feeding the pixel loop is a 10x+ AOT penalty) and the general
+/// mirroring path for the 3-pixel border.
+void _epfPass0Gray(
+    List<Float32List> input,
+    List<Float32List> output,
+    List<List<Float32List>> inputRows,
+    List<List<Float32List>> outputRows,
+    RestorationFilter rf,
+    List<Float32List>? inverseSigma,
+    double invModularSigma,
+    double sigmaScale,
+    int height,
+    int width) {
+  final scaleSum =
+      rf.epfChannelScale[0] + rf.epfChannelScale[1] + rf.epfChannelScale[2];
+  final borderSadMul = rf.epfBorderSadMul;
+  final sumChannels = Float32List(1);
+  final xEnd = width - 3 < 3 ? 3 : width - 3;
+  for (var y = 0; y < height; y++) {
+    final sigmaRow = inverseSigma?[y >> 3];
+    if (y < 3 || y + 3 >= height) {
+      for (var x = 0; x < width; x++) {
+        final s = sigmaRow != null ? sigmaRow[x >> 3] : invModularSigma;
+        if (s.isNaN || s > 1 / 0.3) {
+          output[y][x] = input[y][x];
+          continue;
+        }
+        _epfPixelGeneral(
+            inputRows,
+            outputRows,
+            1,
+            rf.epfChannelScale,
+            borderSadMul,
+            _epfDoubleCrossDy,
+            _epfDoubleCrossDx,
+            sigmaScale,
+            s,
+            0,
+            y,
+            x,
+            height,
+            width,
+            sumChannels);
+      }
+      continue;
+    }
+    final rM3 = input[y - 3];
+    final rM2 = input[y - 2];
+    final rM1 = input[y - 1];
+    final r0 = input[y + 0];
+    final rP1 = input[y + 1];
+    final rP2 = input[y + 2];
+    final rP3 = input[y + 3];
+    final out = output[y];
+    final modY = y & 7;
+    final borderY = modY == 0 || modY == 7;
+    for (var x = 0; x < width; x++) {
+      final s = sigmaRow != null ? sigmaRow[x >> 3] : invModularSigma;
+      if (s.isNaN || s > 1 / 0.3) {
+        out[x] = r0[x];
+        continue;
+      }
+      if (x < 3 || x >= xEnd) {
+        _epfPixelGeneral(
+            inputRows,
+            outputRows,
+            1,
+            rf.epfChannelScale,
+            borderSadMul,
+            _epfDoubleCrossDy,
+            _epfDoubleCrossDx,
+            sigmaScale,
+            s,
+            0,
+            y,
+            x,
+            height,
+            width,
+            sumChannels);
+        continue;
+      }
+      final modX = x & 7;
+      final mul = borderY || modX == 0 || modX == 7
+          ? sigmaScale * s * borderSadMul
+          : sigmaScale * s;
+      var sumW = 0.0;
+      var sum = 0.0;
+      var w = 1 -
+          ((r0[x] - r0[x]).abs() +
+                  (rM1[x] - rM1[x]).abs() +
+                  (rP1[x] - rP1[x]).abs() +
+                  (r0[x - 1] - r0[x - 1]).abs() +
+                  (r0[x + 1] - r0[x + 1]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += r0[x] * w;
+      w = 1 -
+          ((r0[x] - rM1[x]).abs() +
+                  (rM1[x] - rM2[x]).abs() +
+                  (rP1[x] - r0[x]).abs() +
+                  (r0[x - 1] - rM1[x - 1]).abs() +
+                  (r0[x + 1] - rM1[x + 1]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rM1[x] * w;
+      w = 1 -
+          ((r0[x] - rP1[x]).abs() +
+                  (rM1[x] - r0[x]).abs() +
+                  (rP1[x] - rP2[x]).abs() +
+                  (r0[x - 1] - rP1[x - 1]).abs() +
+                  (r0[x + 1] - rP1[x + 1]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rP1[x] * w;
+      w = 1 -
+          ((r0[x] - r0[x - 1]).abs() +
+                  (rM1[x] - rM1[x - 1]).abs() +
+                  (rP1[x] - rP1[x - 1]).abs() +
+                  (r0[x - 1] - r0[x - 2]).abs() +
+                  (r0[x + 1] - r0[x]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += r0[x - 1] * w;
+      w = 1 -
+          ((r0[x] - r0[x + 1]).abs() +
+                  (rM1[x] - rM1[x + 1]).abs() +
+                  (rP1[x] - rP1[x + 1]).abs() +
+                  (r0[x - 1] - r0[x]).abs() +
+                  (r0[x + 1] - r0[x + 2]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += r0[x + 1] * w;
+      w = 1 -
+          ((r0[x] - rP1[x - 1]).abs() +
+                  (rM1[x] - r0[x - 1]).abs() +
+                  (rP1[x] - rP2[x - 1]).abs() +
+                  (r0[x - 1] - rP1[x - 2]).abs() +
+                  (r0[x + 1] - rP1[x]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rP1[x - 1] * w;
+      w = 1 -
+          ((r0[x] - rP1[x + 1]).abs() +
+                  (rM1[x] - r0[x + 1]).abs() +
+                  (rP1[x] - rP2[x + 1]).abs() +
+                  (r0[x - 1] - rP1[x]).abs() +
+                  (r0[x + 1] - rP1[x + 2]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rP1[x + 1] * w;
+      w = 1 -
+          ((r0[x] - rM1[x + 1]).abs() +
+                  (rM1[x] - rM2[x + 1]).abs() +
+                  (rP1[x] - r0[x + 1]).abs() +
+                  (r0[x - 1] - rM1[x]).abs() +
+                  (r0[x + 1] - rM1[x + 2]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rM1[x + 1] * w;
+      w = 1 -
+          ((r0[x] - rM1[x - 1]).abs() +
+                  (rM1[x] - rM2[x - 1]).abs() +
+                  (rP1[x] - r0[x - 1]).abs() +
+                  (r0[x - 1] - rM1[x - 2]).abs() +
+                  (r0[x + 1] - rM1[x]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rM1[x - 1] * w;
+      w = 1 -
+          ((r0[x] - rM2[x]).abs() +
+                  (rM1[x] - rM3[x]).abs() +
+                  (rP1[x] - rM1[x]).abs() +
+                  (r0[x - 1] - rM2[x - 1]).abs() +
+                  (r0[x + 1] - rM2[x + 1]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rM2[x] * w;
+      w = 1 -
+          ((r0[x] - rP2[x]).abs() +
+                  (rM1[x] - rP1[x]).abs() +
+                  (rP1[x] - rP3[x]).abs() +
+                  (r0[x - 1] - rP2[x - 1]).abs() +
+                  (r0[x + 1] - rP2[x + 1]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += rP2[x] * w;
+      w = 1 -
+          ((r0[x] - r0[x + 2]).abs() +
+                  (rM1[x] - rM1[x + 2]).abs() +
+                  (rP1[x] - rP1[x + 2]).abs() +
+                  (r0[x - 1] - r0[x + 1]).abs() +
+                  (r0[x + 1] - r0[x + 3]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += r0[x + 2] * w;
+      w = 1 -
+          ((r0[x] - r0[x - 2]).abs() +
+                  (rM1[x] - rM1[x - 2]).abs() +
+                  (rP1[x] - rP1[x - 2]).abs() +
+                  (r0[x - 1] - r0[x - 3]).abs() +
+                  (r0[x + 1] - r0[x - 1]).abs()) *
+              scaleSum *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sum += r0[x - 2] * w;
+      out[x] = sum / sumW;
+    }
+  }
+}
+
+void _epfPass0Color(
+    List<Float32List> in0,
+    List<Float32List> in1,
+    List<Float32List> in2,
+    List<Float32List> out0,
+    List<Float32List> out1,
+    List<Float32List> out2,
     List<List<Float32List>> inputRows,
     List<List<Float32List>> outputRows,
     int colors,
@@ -248,38 +518,433 @@ void _epfPassGeneral(
     List<Float32List>? inverseSigma,
     double invModularSigma,
     double sigmaScale,
-    int i,
     int height,
     int width) {
-  final crossDy = i == 0 ? _epfDoubleCrossDy : _epfCrossDy;
-  final crossDx = i == 0 ? _epfDoubleCrossDx : _epfCrossDx;
+  final cs0 = rf.epfChannelScale[0];
+  final cs1 = rf.epfChannelScale[1];
+  final cs2 = rf.epfChannelScale[2];
+  final borderSadMul = rf.epfBorderSadMul;
   final sumChannels = Float32List(colors);
+  final xEnd = width - 3 < 3 ? 3 : width - 3;
   for (var y = 0; y < height; y++) {
-    for (var x = 0; x < width; x++) {
-      final s =
-          inverseSigma != null ? inverseSigma[y >> 3][x >> 3] : invModularSigma;
-      if (s.isNaN || s > 1 / 0.3) {
-        for (var c = 0; c < colors; c++) {
-          outputRows[c][y][x] = inputRows[c][y][x];
+    final sigmaRow = inverseSigma?[y >> 3];
+    if (y < 3 || y + 3 >= height) {
+      for (var x = 0; x < width; x++) {
+        final s = sigmaRow != null ? sigmaRow[x >> 3] : invModularSigma;
+        if (s.isNaN || s > 1 / 0.3) {
+          for (var c = 0; c < colors; c++) {
+            outputRows[c][y][x] = inputRows[c][y][x];
+          }
+          continue;
         }
+        _epfPixelGeneral(
+            inputRows,
+            outputRows,
+            colors,
+            rf.epfChannelScale,
+            borderSadMul,
+            _epfDoubleCrossDy,
+            _epfDoubleCrossDx,
+            sigmaScale,
+            s,
+            0,
+            y,
+            x,
+            height,
+            width,
+            sumChannels);
+      }
+      continue;
+    }
+    final aM3 = in0[y - 3];
+    final aM2 = in0[y - 2];
+    final aM1 = in0[y - 1];
+    final a0 = in0[y + 0];
+    final aP1 = in0[y + 1];
+    final aP2 = in0[y + 2];
+    final aP3 = in0[y + 3];
+    final bM3 = in1[y - 3];
+    final bM2 = in1[y - 2];
+    final bM1 = in1[y - 1];
+    final b0 = in1[y + 0];
+    final bP1 = in1[y + 1];
+    final bP2 = in1[y + 2];
+    final bP3 = in1[y + 3];
+    final qM3 = in2[y - 3];
+    final qM2 = in2[y - 2];
+    final qM1 = in2[y - 1];
+    final q0 = in2[y + 0];
+    final qP1 = in2[y + 1];
+    final qP2 = in2[y + 2];
+    final qP3 = in2[y + 3];
+    final oa = out0[y];
+    final ob = out1[y];
+    final oc = out2[y];
+    final modY = y & 7;
+    final borderY = modY == 0 || modY == 7;
+    for (var x = 0; x < width; x++) {
+      final s = sigmaRow != null ? sigmaRow[x >> 3] : invModularSigma;
+      if (s.isNaN || s > 1 / 0.3) {
+        oa[x] = a0[x];
+        ob[x] = b0[x];
+        oc[x] = q0[x];
         continue;
       }
-      _epfPixelGeneral(
-          inputRows,
-          outputRows,
-          colors,
-          rf.epfChannelScale,
-          rf.epfBorderSadMul,
-          crossDy,
-          crossDx,
-          sigmaScale,
-          s,
-          i,
-          y,
-          x,
-          height,
-          width,
-          sumChannels);
+      if (x < 3 || x >= xEnd) {
+        _epfPixelGeneral(
+            inputRows,
+            outputRows,
+            colors,
+            rf.epfChannelScale,
+            borderSadMul,
+            _epfDoubleCrossDy,
+            _epfDoubleCrossDx,
+            sigmaScale,
+            s,
+            0,
+            y,
+            x,
+            height,
+            width,
+            sumChannels);
+        continue;
+      }
+      final modX = x & 7;
+      final mul = borderY || modX == 0 || modX == 7
+          ? sigmaScale * s * borderSadMul
+          : sigmaScale * s;
+      var sumW = 0.0;
+      var sumA = 0.0;
+      var sumB = 0.0;
+      var sumQ = 0.0;
+      var w = 1 -
+          (((a0[x] - a0[x]).abs() +
+                          (aM1[x] - aM1[x]).abs() +
+                          (aP1[x] - aP1[x]).abs() +
+                          (a0[x - 1] - a0[x - 1]).abs() +
+                          (a0[x + 1] - a0[x + 1]).abs()) *
+                      cs0 +
+                  ((b0[x] - b0[x]).abs() +
+                          (bM1[x] - bM1[x]).abs() +
+                          (bP1[x] - bP1[x]).abs() +
+                          (b0[x - 1] - b0[x - 1]).abs() +
+                          (b0[x + 1] - b0[x + 1]).abs()) *
+                      cs1 +
+                  ((q0[x] - q0[x]).abs() +
+                          (qM1[x] - qM1[x]).abs() +
+                          (qP1[x] - qP1[x]).abs() +
+                          (q0[x - 1] - q0[x - 1]).abs() +
+                          (q0[x + 1] - q0[x + 1]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += a0[x] * w;
+      sumB += b0[x] * w;
+      sumQ += q0[x] * w;
+      w = 1 -
+          (((a0[x] - aM1[x]).abs() +
+                          (aM1[x] - aM2[x]).abs() +
+                          (aP1[x] - a0[x]).abs() +
+                          (a0[x - 1] - aM1[x - 1]).abs() +
+                          (a0[x + 1] - aM1[x + 1]).abs()) *
+                      cs0 +
+                  ((b0[x] - bM1[x]).abs() +
+                          (bM1[x] - bM2[x]).abs() +
+                          (bP1[x] - b0[x]).abs() +
+                          (b0[x - 1] - bM1[x - 1]).abs() +
+                          (b0[x + 1] - bM1[x + 1]).abs()) *
+                      cs1 +
+                  ((q0[x] - qM1[x]).abs() +
+                          (qM1[x] - qM2[x]).abs() +
+                          (qP1[x] - q0[x]).abs() +
+                          (q0[x - 1] - qM1[x - 1]).abs() +
+                          (q0[x + 1] - qM1[x + 1]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aM1[x] * w;
+      sumB += bM1[x] * w;
+      sumQ += qM1[x] * w;
+      w = 1 -
+          (((a0[x] - aP1[x]).abs() +
+                          (aM1[x] - a0[x]).abs() +
+                          (aP1[x] - aP2[x]).abs() +
+                          (a0[x - 1] - aP1[x - 1]).abs() +
+                          (a0[x + 1] - aP1[x + 1]).abs()) *
+                      cs0 +
+                  ((b0[x] - bP1[x]).abs() +
+                          (bM1[x] - b0[x]).abs() +
+                          (bP1[x] - bP2[x]).abs() +
+                          (b0[x - 1] - bP1[x - 1]).abs() +
+                          (b0[x + 1] - bP1[x + 1]).abs()) *
+                      cs1 +
+                  ((q0[x] - qP1[x]).abs() +
+                          (qM1[x] - q0[x]).abs() +
+                          (qP1[x] - qP2[x]).abs() +
+                          (q0[x - 1] - qP1[x - 1]).abs() +
+                          (q0[x + 1] - qP1[x + 1]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aP1[x] * w;
+      sumB += bP1[x] * w;
+      sumQ += qP1[x] * w;
+      w = 1 -
+          (((a0[x] - a0[x - 1]).abs() +
+                          (aM1[x] - aM1[x - 1]).abs() +
+                          (aP1[x] - aP1[x - 1]).abs() +
+                          (a0[x - 1] - a0[x - 2]).abs() +
+                          (a0[x + 1] - a0[x]).abs()) *
+                      cs0 +
+                  ((b0[x] - b0[x - 1]).abs() +
+                          (bM1[x] - bM1[x - 1]).abs() +
+                          (bP1[x] - bP1[x - 1]).abs() +
+                          (b0[x - 1] - b0[x - 2]).abs() +
+                          (b0[x + 1] - b0[x]).abs()) *
+                      cs1 +
+                  ((q0[x] - q0[x - 1]).abs() +
+                          (qM1[x] - qM1[x - 1]).abs() +
+                          (qP1[x] - qP1[x - 1]).abs() +
+                          (q0[x - 1] - q0[x - 2]).abs() +
+                          (q0[x + 1] - q0[x]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += a0[x - 1] * w;
+      sumB += b0[x - 1] * w;
+      sumQ += q0[x - 1] * w;
+      w = 1 -
+          (((a0[x] - a0[x + 1]).abs() +
+                          (aM1[x] - aM1[x + 1]).abs() +
+                          (aP1[x] - aP1[x + 1]).abs() +
+                          (a0[x - 1] - a0[x]).abs() +
+                          (a0[x + 1] - a0[x + 2]).abs()) *
+                      cs0 +
+                  ((b0[x] - b0[x + 1]).abs() +
+                          (bM1[x] - bM1[x + 1]).abs() +
+                          (bP1[x] - bP1[x + 1]).abs() +
+                          (b0[x - 1] - b0[x]).abs() +
+                          (b0[x + 1] - b0[x + 2]).abs()) *
+                      cs1 +
+                  ((q0[x] - q0[x + 1]).abs() +
+                          (qM1[x] - qM1[x + 1]).abs() +
+                          (qP1[x] - qP1[x + 1]).abs() +
+                          (q0[x - 1] - q0[x]).abs() +
+                          (q0[x + 1] - q0[x + 2]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += a0[x + 1] * w;
+      sumB += b0[x + 1] * w;
+      sumQ += q0[x + 1] * w;
+      w = 1 -
+          (((a0[x] - aP1[x - 1]).abs() +
+                          (aM1[x] - a0[x - 1]).abs() +
+                          (aP1[x] - aP2[x - 1]).abs() +
+                          (a0[x - 1] - aP1[x - 2]).abs() +
+                          (a0[x + 1] - aP1[x]).abs()) *
+                      cs0 +
+                  ((b0[x] - bP1[x - 1]).abs() +
+                          (bM1[x] - b0[x - 1]).abs() +
+                          (bP1[x] - bP2[x - 1]).abs() +
+                          (b0[x - 1] - bP1[x - 2]).abs() +
+                          (b0[x + 1] - bP1[x]).abs()) *
+                      cs1 +
+                  ((q0[x] - qP1[x - 1]).abs() +
+                          (qM1[x] - q0[x - 1]).abs() +
+                          (qP1[x] - qP2[x - 1]).abs() +
+                          (q0[x - 1] - qP1[x - 2]).abs() +
+                          (q0[x + 1] - qP1[x]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aP1[x - 1] * w;
+      sumB += bP1[x - 1] * w;
+      sumQ += qP1[x - 1] * w;
+      w = 1 -
+          (((a0[x] - aP1[x + 1]).abs() +
+                          (aM1[x] - a0[x + 1]).abs() +
+                          (aP1[x] - aP2[x + 1]).abs() +
+                          (a0[x - 1] - aP1[x]).abs() +
+                          (a0[x + 1] - aP1[x + 2]).abs()) *
+                      cs0 +
+                  ((b0[x] - bP1[x + 1]).abs() +
+                          (bM1[x] - b0[x + 1]).abs() +
+                          (bP1[x] - bP2[x + 1]).abs() +
+                          (b0[x - 1] - bP1[x]).abs() +
+                          (b0[x + 1] - bP1[x + 2]).abs()) *
+                      cs1 +
+                  ((q0[x] - qP1[x + 1]).abs() +
+                          (qM1[x] - q0[x + 1]).abs() +
+                          (qP1[x] - qP2[x + 1]).abs() +
+                          (q0[x - 1] - qP1[x]).abs() +
+                          (q0[x + 1] - qP1[x + 2]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aP1[x + 1] * w;
+      sumB += bP1[x + 1] * w;
+      sumQ += qP1[x + 1] * w;
+      w = 1 -
+          (((a0[x] - aM1[x + 1]).abs() +
+                          (aM1[x] - aM2[x + 1]).abs() +
+                          (aP1[x] - a0[x + 1]).abs() +
+                          (a0[x - 1] - aM1[x]).abs() +
+                          (a0[x + 1] - aM1[x + 2]).abs()) *
+                      cs0 +
+                  ((b0[x] - bM1[x + 1]).abs() +
+                          (bM1[x] - bM2[x + 1]).abs() +
+                          (bP1[x] - b0[x + 1]).abs() +
+                          (b0[x - 1] - bM1[x]).abs() +
+                          (b0[x + 1] - bM1[x + 2]).abs()) *
+                      cs1 +
+                  ((q0[x] - qM1[x + 1]).abs() +
+                          (qM1[x] - qM2[x + 1]).abs() +
+                          (qP1[x] - q0[x + 1]).abs() +
+                          (q0[x - 1] - qM1[x]).abs() +
+                          (q0[x + 1] - qM1[x + 2]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aM1[x + 1] * w;
+      sumB += bM1[x + 1] * w;
+      sumQ += qM1[x + 1] * w;
+      w = 1 -
+          (((a0[x] - aM1[x - 1]).abs() +
+                          (aM1[x] - aM2[x - 1]).abs() +
+                          (aP1[x] - a0[x - 1]).abs() +
+                          (a0[x - 1] - aM1[x - 2]).abs() +
+                          (a0[x + 1] - aM1[x]).abs()) *
+                      cs0 +
+                  ((b0[x] - bM1[x - 1]).abs() +
+                          (bM1[x] - bM2[x - 1]).abs() +
+                          (bP1[x] - b0[x - 1]).abs() +
+                          (b0[x - 1] - bM1[x - 2]).abs() +
+                          (b0[x + 1] - bM1[x]).abs()) *
+                      cs1 +
+                  ((q0[x] - qM1[x - 1]).abs() +
+                          (qM1[x] - qM2[x - 1]).abs() +
+                          (qP1[x] - q0[x - 1]).abs() +
+                          (q0[x - 1] - qM1[x - 2]).abs() +
+                          (q0[x + 1] - qM1[x]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aM1[x - 1] * w;
+      sumB += bM1[x - 1] * w;
+      sumQ += qM1[x - 1] * w;
+      w = 1 -
+          (((a0[x] - aM2[x]).abs() +
+                          (aM1[x] - aM3[x]).abs() +
+                          (aP1[x] - aM1[x]).abs() +
+                          (a0[x - 1] - aM2[x - 1]).abs() +
+                          (a0[x + 1] - aM2[x + 1]).abs()) *
+                      cs0 +
+                  ((b0[x] - bM2[x]).abs() +
+                          (bM1[x] - bM3[x]).abs() +
+                          (bP1[x] - bM1[x]).abs() +
+                          (b0[x - 1] - bM2[x - 1]).abs() +
+                          (b0[x + 1] - bM2[x + 1]).abs()) *
+                      cs1 +
+                  ((q0[x] - qM2[x]).abs() +
+                          (qM1[x] - qM3[x]).abs() +
+                          (qP1[x] - qM1[x]).abs() +
+                          (q0[x - 1] - qM2[x - 1]).abs() +
+                          (q0[x + 1] - qM2[x + 1]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aM2[x] * w;
+      sumB += bM2[x] * w;
+      sumQ += qM2[x] * w;
+      w = 1 -
+          (((a0[x] - aP2[x]).abs() +
+                          (aM1[x] - aP1[x]).abs() +
+                          (aP1[x] - aP3[x]).abs() +
+                          (a0[x - 1] - aP2[x - 1]).abs() +
+                          (a0[x + 1] - aP2[x + 1]).abs()) *
+                      cs0 +
+                  ((b0[x] - bP2[x]).abs() +
+                          (bM1[x] - bP1[x]).abs() +
+                          (bP1[x] - bP3[x]).abs() +
+                          (b0[x - 1] - bP2[x - 1]).abs() +
+                          (b0[x + 1] - bP2[x + 1]).abs()) *
+                      cs1 +
+                  ((q0[x] - qP2[x]).abs() +
+                          (qM1[x] - qP1[x]).abs() +
+                          (qP1[x] - qP3[x]).abs() +
+                          (q0[x - 1] - qP2[x - 1]).abs() +
+                          (q0[x + 1] - qP2[x + 1]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += aP2[x] * w;
+      sumB += bP2[x] * w;
+      sumQ += qP2[x] * w;
+      w = 1 -
+          (((a0[x] - a0[x + 2]).abs() +
+                          (aM1[x] - aM1[x + 2]).abs() +
+                          (aP1[x] - aP1[x + 2]).abs() +
+                          (a0[x - 1] - a0[x + 1]).abs() +
+                          (a0[x + 1] - a0[x + 3]).abs()) *
+                      cs0 +
+                  ((b0[x] - b0[x + 2]).abs() +
+                          (bM1[x] - bM1[x + 2]).abs() +
+                          (bP1[x] - bP1[x + 2]).abs() +
+                          (b0[x - 1] - b0[x + 1]).abs() +
+                          (b0[x + 1] - b0[x + 3]).abs()) *
+                      cs1 +
+                  ((q0[x] - q0[x + 2]).abs() +
+                          (qM1[x] - qM1[x + 2]).abs() +
+                          (qP1[x] - qP1[x + 2]).abs() +
+                          (q0[x - 1] - q0[x + 1]).abs() +
+                          (q0[x + 1] - q0[x + 3]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += a0[x + 2] * w;
+      sumB += b0[x + 2] * w;
+      sumQ += q0[x + 2] * w;
+      w = 1 -
+          (((a0[x] - a0[x - 2]).abs() +
+                          (aM1[x] - aM1[x - 2]).abs() +
+                          (aP1[x] - aP1[x - 2]).abs() +
+                          (a0[x - 1] - a0[x - 3]).abs() +
+                          (a0[x + 1] - a0[x - 1]).abs()) *
+                      cs0 +
+                  ((b0[x] - b0[x - 2]).abs() +
+                          (bM1[x] - bM1[x - 2]).abs() +
+                          (bP1[x] - bP1[x - 2]).abs() +
+                          (b0[x - 1] - b0[x - 3]).abs() +
+                          (b0[x + 1] - b0[x - 1]).abs()) *
+                      cs1 +
+                  ((q0[x] - q0[x - 2]).abs() +
+                          (qM1[x] - qM1[x - 2]).abs() +
+                          (qP1[x] - qP1[x - 2]).abs() +
+                          (q0[x - 1] - q0[x - 3]).abs() +
+                          (q0[x + 1] - q0[x - 1]).abs()) *
+                      cs2) *
+              mul;
+      if (w < 0) w = 0;
+      sumW += w;
+      sumA += a0[x - 2] * w;
+      sumB += b0[x - 2] * w;
+      sumQ += q0[x - 2] * w;
+      oa[x] = sumA / sumW;
+      ob[x] = sumB / sumW;
+      oc[x] = sumQ / sumW;
     }
   }
 }

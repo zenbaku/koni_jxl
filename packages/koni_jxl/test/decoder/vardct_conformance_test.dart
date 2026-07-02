@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:koni_jxl/koni_jxl.dart';
 import 'package:test/test.dart';
@@ -10,7 +11,9 @@ import '../util/pnm.dart';
 /// M5 gate: VarDCT/lossy conformance testcases decode within tolerance of
 /// djxl. Excluded (skip list, tracked for later):
 /// cafe + bench_oriented_brg (YCbCr/jbrd), upsampling (M6), noise (M6),
-/// progressive (LF frames), animation_* (multi-frame), cmyk_layers (CMYK),
+/// progressive (ICC-only output transform; LF frames themselves decode
+/// and are gated by the corpus progdc files), animation_* (multi-frame,
+/// gated in animation_test), cmyk_layers (CMYK),
 /// spot (spot-color rendering), grayscale + grayscale_public_university
 /// (output tagged by ICC profile only; we decode as sRGB),
 /// lossless_pfm (float samples), blendmodes (extra-channel blending),
@@ -75,4 +78,14 @@ void main() {
       });
     }
   }, skip: haveConformance && haveDjxl ? null : 'corpus or djxl unavailable');
+
+  test('progressive (LF frames) decodes to full size', () {
+    final input = File('${conformanceDir.path}/progressive/input.jxl');
+    final image =
+        JxlDecoder.decode(Uint8List.fromList(input.readAsBytesSync()));
+    expect(image.width, 4064);
+    expect(image.height, 2704);
+  },
+      skip: conformanceDir.existsSync() ? false : 'conformance not available',
+      timeout: const Timeout(Duration(minutes: 3)));
 }

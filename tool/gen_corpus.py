@@ -240,6 +240,12 @@ def main():
         jobs.append(("color_cover", "color_cover_d1_e7_noise",
                      ["-d", "1.0", "-e", "7", "--photon_noise_iso=3200"],
                      False, True))
+        jobs.append(("color_cover", "color_cover_d1.0_e5_progdc1",
+                     ["-d", "1.0", "-e", "5", "--progressive_dc=1"],
+                     False, True))
+        jobs.append(("gray_screentone", "gray_screentone_d1.0_e5_progdc2",
+                     ["-d", "1.0", "-e", "5", "--progressive_dc=2"],
+                     False, True))
 
     # Animated fixture: 4 distinct full frames, GIF -> lossless JXL, with
     # per-frame PPM references for the bit-exact animation gate.

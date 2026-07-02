@@ -199,7 +199,12 @@ final class Frame {
     return (height: height, width: width);
   }
 
-  void decodeFrame() {
+  /// The LF frame's channel buffers when this frame uses one
+  /// (`FrameFlags.useLfFrame`).
+  List<ImageBuffer>? lfFrame;
+
+  void decodeFrame({List<ImageBuffer>? lfFrame}) {
+    this.lfFrame = lfFrame;
     if (globalMetadata.bitDepth.usesFloatSamples) {
       throw JxlUnsupportedException('float-samples');
     }

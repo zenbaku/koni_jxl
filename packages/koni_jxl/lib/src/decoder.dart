@@ -39,6 +39,7 @@ final class _DecoderState {
   late ImageHeader imageHeader;
   final List<List<ImageBuffer?>?> _reference =
       List<List<ImageBuffer?>?>.filled(4, null);
+  final List<List<ImageBuffer>?> _lfBuffer = List.filled(5, null);
   List<ImageBuffer?>? _canvas;
   int _visibleFrames = 0;
   int _invisibleFrames = 0;
@@ -68,8 +69,9 @@ final class _DecoderState {
       final header = frame.readFrameHeader();
       frame.readToc();
 
-      if (header.lfLevel > 0 || header.flags & FrameFlags.useLfFrame != 0) {
-        throw JxlUnsupportedException('lf-frames');
+      if (header.flags & FrameFlags.useLfFrame != 0 &&
+          _lfBuffer[header.lfLevel] == null) {
+        throw const JxlInvalidBitstreamException('LF level too large');
       }
       if (const bool.fromEnvironment('jxl.framedebug')) {
         // ignore: avoid_print
@@ -80,7 +82,11 @@ final class _DecoderState {
             'src=${header.blendingInfo.source} '
             'alpha=${header.blendingInfo.alphaChannel}) isLast=${header.isLast}');
       }
-      frame.decodeFrame();
+      frame.decodeFrame(lfFrame: _lfBuffer[header.lfLevel]);
+      if (header.lfLevel > 0) {
+        _lfBuffer[header.lfLevel - 1] = frame.buffer;
+      }
+      if (header.type == FrameFlags.lfFrame) continue;
 
       final save = (header.saveAsReference != 0 || header.duration == 0) &&
           !header.isLast &&

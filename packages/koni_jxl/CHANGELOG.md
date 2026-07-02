@@ -22,6 +22,6 @@
   coefficient-order setup.
 - Splines (centripetal Catmull-Rom rendering with per-spline DCT32
   color/sigma profiles).
+- Progressive files: LF frames (progressive DC) and multi-pass AC.
 - Not yet supported (throws `JxlUnsupportedException`): spot-color
-  rendering, progressive/LF frames, JPEG reconstruction, float (HDR)
-  sample formats.
+  rendering, JPEG reconstruction, float (HDR) sample formats.

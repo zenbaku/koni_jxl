@@ -108,6 +108,7 @@ them proves less than it looks like. This machine has everything.
 
 ## Remaining known gaps (throw `JxlUnsupportedException`)
 
-Spot-color rendering, progressive/LF frames, JPEG bitstream
-reconstruction, float (HDR) sample formats, ICC-driven output
-transforms. None block the manga use case.
+Spot-color rendering, JPEG bitstream reconstruction, float (HDR) sample
+formats, ICC-driven output transforms. None block the manga use case.
+Known slow path: EPF pass 0 (epfIterations == 3, rare) is scalar; an
+11MP triple-pass progressive photo takes ~6.5 s.
