@@ -132,6 +132,9 @@ final class PrefixSymbolDistribution extends SymbolDistribution {
     final level1Symbols = List<int>.filled(18, 0);
     for (var i = 17; i >= 0; i--) {
       final index = --level1Codecounts[level1Lengths[i]];
+      if (index < 0 || index >= 18) {
+        throw const JxlInvalidBitstreamException('invalid level 1 prefix code');
+      }
       level1LengthsScrambled[index] = level1Lengths[i];
       level1Symbols[index] = i;
     }
@@ -213,6 +216,9 @@ final class PrefixSymbolDistribution extends SymbolDistribution {
     final level2LengthsScrambled = List<int>.filled(alphabetSize, 0);
     for (var i = alphabetSize - 1; i >= 0; i--) {
       final index = --level2Counts[level2Lengths[i]];
+      if (index < 0 || index >= alphabetSize) {
+        throw const JxlInvalidBitstreamException('invalid level 2 prefix code');
+      }
       level2LengthsScrambled[index] = level2Lengths[i];
       level2Symbols[index] = i;
     }
