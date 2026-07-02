@@ -41,22 +41,35 @@ void main() {
     final stem = golden.uri.pathSegments.last;
     test('re-encode $stem', () {
       final ref = PnmImage.parse(golden.readAsBytesSync());
-      if (ref.maxValue != 255) return; // 16-bit sources: not yet supported
       final gray = ref.channels == 1;
       final n = ref.channels;
-      final pixels = Uint8List(ref.width * ref.height * n);
-      for (var c = 0; c < n; c++) {
-        final plane = ref.intPlanes![c];
-        for (var i = 0; i < plane.length; i++) {
-          pixels[i * n + c] = plane[i];
+      final Uint8List encoded;
+      if (ref.maxValue == 255) {
+        final pixels = Uint8List(ref.width * ref.height * n);
+        for (var c = 0; c < n; c++) {
+          final plane = ref.intPlanes![c];
+          for (var i = 0; i < plane.length; i++) {
+            pixels[i * n + c] = plane[i];
+          }
         }
+        encoded = JxlEncoder.encodeLossless(pixels,
+            width: ref.width, height: ref.height, grayscale: gray);
+      } else {
+        final pixels = Uint16List(ref.width * ref.height * n);
+        for (var c = 0; c < n; c++) {
+          final plane = ref.intPlanes![c];
+          for (var i = 0; i < plane.length; i++) {
+            pixels[i * n + c] = plane[i];
+          }
+        }
+        encoded = JxlEncoder.encodeLossless16(pixels,
+            width: ref.width, height: ref.height, grayscale: gray);
       }
-      final encoded = JxlEncoder.encodeLossless(pixels,
-          width: ref.width, height: ref.height, grayscale: gray);
 
       final image = JxlDecoder.decode(encoded);
       for (var c = 0; c < n; c++) {
-        expect(channelAsInts(image.channels[c], 255), ref.intPlanes![c],
+        expect(
+            channelAsInts(image.channels[c], ref.maxValue), ref.intPlanes![c],
             reason: 'our decoder, channel $c');
       }
 

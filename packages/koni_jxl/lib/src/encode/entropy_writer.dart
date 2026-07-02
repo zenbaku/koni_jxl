@@ -329,6 +329,89 @@ void _writeComplexPrefixCode(BitWriter w, List<int> lengths) {
   return (token, n, extra);
 }
 
+/// One LZ77-processed op stream: literals interleaved with
+/// (length, distance) matches, ready for histogramming and emission.
+final class Lz77Ops {
+  final List<int> kinds = []; // 0 = literal, 1 = match
+  final List<int> ctxs = []; // context of the pixel at this position
+  final List<int> a = []; // literal value / match length
+  final List<int> b = []; // unused / match distance
+}
+
+const lz77MinSymbol = 224;
+const lz77MinLength = 3;
+const lz77LengthConfig = HybridIntegerConfig(4, 0, 0);
+
+/// Greedy hash-chain LZ77 over the token-value sequence of one section.
+/// Distances are in value positions (the decoder's window semantics).
+Lz77Ops lz77Compress(List<int> contexts, List<int> values) {
+  final ops = Lz77Ops();
+  final n = values.length;
+  const hashBits = 15;
+  const chainDepth = 24;
+  final chains = List<int>.filled(1 << hashBits, -1);
+  final prev = List<int>.filled(n < 1 ? 1 : n, -1);
+
+  int hash(int i) {
+    var h = values[i] * 0x9E3779B1;
+    h ^= values[i + 1] * 0x85EBCA6B;
+    h ^= values[i + 2] * 0xC2B2AE35;
+    return (h ^ (h >>> 13)) & ((1 << hashBits) - 1);
+  }
+
+  void insert(int i) {
+    if (i + 2 >= n) return;
+    final h = hash(i);
+    prev[i] = chains[h];
+    chains[h] = i;
+  }
+
+  var i = 0;
+  while (i < n) {
+    var bestLen = 0;
+    var bestDist = 0;
+    if (i + lz77MinLength <= n && i + 2 < n) {
+      var cand = chains[hash(i)];
+      var depth = 0;
+      while (cand >= 0 && depth < chainDepth) {
+        final dist = i - cand;
+        if (dist > (1 << 20) - 1) break;
+        var len = 0;
+        final maxLen = n - i;
+        while (len < maxLen && values[cand + len] == values[i + len]) {
+          len++;
+        }
+        if (len > bestLen) {
+          bestLen = len;
+          bestDist = dist;
+          if (len >= 4096) break; // long enough
+        }
+        cand = prev[cand];
+        depth++;
+      }
+    }
+    if (bestLen >= lz77MinLength) {
+      ops.kinds.add(1);
+      ops.ctxs.add(contexts[i]);
+      ops.a.add(bestLen);
+      ops.b.add(bestDist);
+      final end = i + bestLen;
+      while (i < end) {
+        insert(i);
+        i++;
+      }
+    } else {
+      ops.kinds.add(0);
+      ops.ctxs.add(contexts[i]);
+      ops.a.add(values[i]);
+      ops.b.add(0);
+      insert(i);
+      i++;
+    }
+  }
+  return ops;
+}
+
 /// Built entropy codes: serializes the stream header once, then emits
 /// tokens into any number of section writers (prefix codes are stateless).
 final class EntropyCodes {
@@ -336,55 +419,136 @@ final class EntropyCodes {
       this._histograms, this.numContexts);
 
   final HybridIntegerConfig config;
+
+  /// Pixel contexts (excluding the LZ77 distance cluster, when present).
   final int numContexts;
   final List<List<int>> _codes;
   final List<List<int>> _lens;
   final List<int> _alphabetSizes;
   final List<List<int>> _histograms;
 
+  int get _numClusters => usesLz77 ? numContexts + 1 : numContexts;
+
   /// Builds histograms and prefix codes over all [contexts]/[values].
   factory EntropyCodes.build(int numContexts, List<int> contexts,
       List<int> values, HybridIntegerConfig config) {
-    final maxToken = List<int>.filled(numContexts, -1);
+    final codes = EntropyCodes._(config, [], [], [], [], numContexts);
     for (var i = 0; i < values.length; i++) {
-      final (token, _, _) = tokenizeHybrid(config, values[i]);
-      if (token > maxToken[contexts[i]]) maxToken[contexts[i]] = token;
+      final (token, nbits, _) = tokenizeHybrid(config, values[i]);
+      codes._count(contexts[i], token, nbits);
     }
-    final alphabetSizes = [
-      for (var c = 0; c < numContexts; c++)
-        maxToken[c] < 0 ? 1 : maxToken[c] + 1,
-    ];
-    final histograms = [
-      for (var c = 0; c < numContexts; c++)
-        List<int>.filled(alphabetSizes[c], 0),
-    ];
-    for (var i = 0; i < values.length; i++) {
-      final (token, _, _) = tokenizeHybrid(config, values[i]);
-      histograms[contexts[i]][token]++;
+    codes._finishHistograms(numContexts);
+    return codes;
+  }
+
+  /// Builds codes over LZ77 op streams: [numContexts] pixel contexts plus
+  /// one distance cluster (the last).
+  factory EntropyCodes.buildLz77(
+      int numContexts, List<Lz77Ops> sections, HybridIntegerConfig config) {
+    final codes = EntropyCodes._(config, [], [], [], [], numContexts)
+      ..usesLz77 = true;
+    for (final ops in sections) {
+      for (var i = 0; i < ops.kinds.length; i++) {
+        if (ops.kinds[i] == 0) {
+          final (token, nbits, _) = tokenizeHybrid(config, ops.a[i]);
+          assert(token < lz77MinSymbol,
+              'literal token collides with LZ77 length symbols');
+          codes._count(ops.ctxs[i], token, nbits);
+        } else {
+          final (lt, lnbits, _) =
+              tokenizeHybrid(lz77LengthConfig, ops.a[i] - lz77MinLength);
+          codes._count(ops.ctxs[i], lz77MinSymbol + lt, lnbits);
+          final (dt, dnbits, _) = tokenizeHybrid(config, ops.b[i] + 119);
+          codes._count(numContexts, dt, dnbits);
+        }
+      }
     }
-    return EntropyCodes._(
-        config,
-        List.filled(numContexts, const []),
-        List.filled(numContexts, const []),
-        alphabetSizes,
-        histograms,
-        numContexts);
+    codes._finishHistograms(numContexts + 1);
+    return codes;
+  }
+
+  final Map<int, Map<int, int>> _sparse = {};
+  bool usesLz77 = false;
+  double _extraBits = 0;
+
+  void _count(int context, int token, [int extraBits = 0]) {
+    final m = _sparse.putIfAbsent(context, () => {});
+    m[token] = (m[token] ?? 0) + 1;
+    _extraBits += extraBits;
+  }
+
+  /// Exact-code-length estimate of the payload size in bits: the actual
+  /// Huffman lengths are computed per cluster, so the prefix-coding
+  /// 1-bit-per-symbol floor is accounted for (Shannon entropy is not a
+  /// safe proxy for highly skewed histograms).
+  double estimatedBits() {
+    var bits = _extraBits;
+    for (final hist in _histograms) {
+      var used = 0;
+      var total = 0;
+      for (final count in hist) {
+        if (count > 0) used++;
+        total += count;
+      }
+      if (total == 0 || used <= 1) continue; // zero-bit symbols
+      final lens = huffmanLengths(hist, 15);
+      for (var s = 0; s < hist.length; s++) {
+        bits += hist[s] * lens[s];
+      }
+      // Rough per-cluster header cost.
+      bits += 8.0 * hist.length.clamp(4, 64) + 40;
+    }
+    return bits;
+  }
+
+  void _finishHistograms(int clusters) {
+    for (var c = 0; c < clusters; c++) {
+      final m = _sparse[c];
+      var maxToken = -1;
+      if (m != null) {
+        for (final t in m.keys) {
+          if (t > maxToken) maxToken = t;
+        }
+      }
+      final size = maxToken < 0 ? 1 : maxToken + 1;
+      _alphabetSizes.add(size);
+      final hist = List<int>.filled(size, 0);
+      m?.forEach((t, count) => hist[t] = count);
+      _histograms.add(hist);
+      _codes.add(const []);
+      _lens.add(const []);
+    }
   }
 
   /// Writes the distribution header (mirror of `EntropyStream.read`).
   void writeHeader(BitWriter w) {
-    w.writeBool(false); // lz77
-    if (numContexts > 1) {
+    w.writeBool(usesLz77);
+    if (usesLz77) {
+      w.writeU32(lz77MinSymbol, 224, 0, 512, 0, 4096, 0, 8, 15);
+      w.writeU32(lz77MinLength, 3, 0, 4, 0, 5, 2, 9, 8);
+      // lz_length_config, read with logAlphabetSize 8.
+      w.writeBits(lz77LengthConfig.splitExponent, ceilLog1p(8));
+      if (lz77LengthConfig.splitExponent != 8) {
+        w.writeBits(lz77LengthConfig.msbInToken,
+            ceilLog1p(lz77LengthConfig.splitExponent));
+        w.writeBits(
+            lz77LengthConfig.lsbInToken,
+            ceilLog1p(
+                lz77LengthConfig.splitExponent - lz77LengthConfig.msbInToken));
+      }
+    }
+    final clusters = _numClusters;
+    if (clusters > 1) {
       w.writeBool(true); // simple cluster map
-      final nbits = ceilLog1p(numContexts - 1);
+      final nbits = ceilLog1p(clusters - 1);
       assert(nbits <= 3, 'simple cluster map supports up to 8 contexts');
       w.writeBits(nbits, 2);
-      for (var i = 0; i < numContexts; i++) {
+      for (var i = 0; i < clusters; i++) {
         w.writeBits(i, nbits);
       }
     }
     w.writeBool(true); // use_prefix_code
-    for (var c = 0; c < numContexts; c++) {
+    for (var c = 0; c < clusters; c++) {
       w.writeBits(config.splitExponent, ceilLog1p(15));
       if (config.splitExponent != 15) {
         w.writeBits(config.msbInToken, ceilLog1p(config.splitExponent));
@@ -392,7 +556,7 @@ final class EntropyCodes {
             ceilLog1p(config.splitExponent - config.msbInToken));
       }
     }
-    for (var c = 0; c < numContexts; c++) {
+    for (var c = 0; c < clusters; c++) {
       final size = _alphabetSizes[c];
       if (size == 1) {
         w.writeBool(false);
@@ -403,7 +567,7 @@ final class EntropyCodes {
         w.writeBits(size - 1 - (1 << n), n);
       }
     }
-    for (var c = 0; c < numContexts; c++) {
+    for (var c = 0; c < clusters; c++) {
       if (_alphabetSizes[c] == 1) {
         _codes[c] = const [0];
         _lens[c] = const [0];
@@ -412,6 +576,23 @@ final class EntropyCodes {
       final (cc, ll) = writePrefixCode(w, _histograms[c], _alphabetSizes[c]);
       _codes[c] = cc;
       _lens[c] = ll;
+    }
+  }
+
+  /// Emits one LZ77 op stream.
+  void writeOps(BitWriter w, Lz77Ops ops) {
+    assert(usesLz77);
+    for (var i = 0; i < ops.kinds.length; i++) {
+      if (ops.kinds[i] == 0) {
+        writeToken(w, ops.ctxs[i], ops.a[i]);
+      } else {
+        final (t, nbits, extra) =
+            tokenizeHybrid(lz77LengthConfig, ops.a[i] - lz77MinLength);
+        final sym = lz77MinSymbol + t;
+        w.writeBits(_codes[ops.ctxs[i]][sym], _lens[ops.ctxs[i]][sym]);
+        if (nbits > 0) w.writeBits(extra, nbits);
+        writeToken(w, numContexts, ops.b[i] + 119);
+      }
     }
   }
 

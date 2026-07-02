@@ -105,11 +105,15 @@ final again = JxlEncoder.encodeImage(decodedImage);  // JXL -> JXL transcode
 ```
 
 Every encoded file is gated bit-exact through **both** this package's
-decoder and djxl. On real manga pages the output is smaller than
-`cjxl -e1`/`-e2` (93–98%) at ~0.3 s/page; highly repetitive synthetic
-content compresses worse than higher-effort cjxl (LZ77 and palette
-support are future work). 8-bit gray/RGB with optional alpha; 16-bit and
-lossy encoding are not yet supported.
+decoder and djxl. The encoder picks per image between LZ77, palette
+(≤256 colors) and YCoCg RCT by exact coded-size estimates. Sizes vs
+`cjxl -e1` on the benchmark set: real manga page 93%, color cover 78%,
+16-color art 112%, synthetic screentone **7%** (LZ77 dominates there).
+~0.3–1 s/page single-threaded. 8/16-bit gray/RGB with optional alpha;
+lossy encoding is not implemented (use cjxl for that).
+
+Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` run the encoder in
+a background isolate.
 
 ## Development
 

@@ -82,11 +82,18 @@ Modular images have no DC image and stream straight to complete.
 The lossless encoder emits: explicit image metadata (the all-default
 header implies XYB), a modular frame with a frame-level global MA tree
 (7 gradient-activity contexts over properties 11 and 10, all leaves
-clamped-gradient), YCoCg RCT (type 6) for color, prefix-coded residuals
-(no LZ77 yet), one section per 256x256 group with the histograms shared
-via the LfGlobal tree stream. Sizes on real manga pages beat cjxl -e1/-e2
-slightly; synthetic repetitive content (screentone tiles) needs LZ77 to
-be competitive — planned, along with palette and 16-bit input.
+clamped-gradient), YCoCg RCT (type 6) for color, prefix-coded residuals,
+one section per 256x256 group with the histograms shared via the
+LfGlobal tree stream. Per image the encoder chooses between LZ77
+(hash-chain matcher over the token-value stream, linear distances
+D + 119, length symbols at 224 in the pixel contexts), palette
+(<= 256 colors, luminance-sorted) and YCoCg RCT, using exact
+Huffman-code-length size estimates — Shannon entropy is NOT a safe
+proxy: prefix codes pay a 1-bit-per-symbol floor that dominates
+highly skewed histograms (a 16-color image estimated 1K by entropy
+but coded 33K until LZ77 was chosen on exact costs). 16-bit input is
+supported. Remaining encoder ideas: ANS (removes the 1-bit floor),
+per-image learned trees, delta palette.
 
 ## Performance status
 

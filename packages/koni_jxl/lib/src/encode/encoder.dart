@@ -47,6 +47,38 @@ final class JxlEncoder {
     return _encodeModular(setup, planes);
   }
 
+  /// Losslessly encodes interleaved 16-bit pixels (same layout as
+  /// [encodeLossless]).
+  static Uint8List encodeLossless16(
+    Uint16List pixels, {
+    required int width,
+    required int height,
+    bool grayscale = false,
+    bool hasAlpha = false,
+  }) {
+    final setup = JxlEncodeSetup(
+        width: width,
+        height: height,
+        bitsPerSample: 16,
+        grayscale: grayscale,
+        hasAlpha: hasAlpha);
+    final n = setup.channelCount;
+    if (pixels.length != width * height * n) {
+      throw ArgumentError('expected ${width * height * n} samples, '
+          'got ${pixels.length}');
+    }
+    final planes = [
+      for (var c = 0; c < n; c++) Int32List(width * height),
+    ];
+    for (var c = 0; c < n; c++) {
+      final plane = planes[c];
+      for (var i = 0; i < width * height; i++) {
+        plane[i] = pixels[i * n + c];
+      }
+    }
+    return _encodeModular(setup, planes);
+  }
+
   /// Losslessly re-encodes a decoded [JxlImage] (integer samples only).
   static Uint8List encodeImage(JxlImage image) {
     final header = image.header;
@@ -192,6 +224,25 @@ void _forwardRct(List<Int32List> planes) {
   }
 }
 
+/// Collects the distinct colors of the first three [planes]; null when
+/// more than [maxColors].
+List<int>? _detectPalette(List<Int32List> planes, int maxColors) {
+  final seen = <int>{};
+  final p0 = planes[0];
+  final p1 = planes[1];
+  final p2 = planes[2];
+  for (var i = 0; i < p0.length; i++) {
+    seen.add((p0[i] << 40) | (p1[i] << 20) | p2[i]);
+    if (seen.length > maxColors) return null;
+  }
+  final colors = seen.toList()
+    ..sort((a, b) {
+      int lum(int k) => (k >>> 40) + ((k >>> 20) & 0xFFFFF) + (k & 0xFFFFF);
+      return lum(a) - lum(b);
+    });
+  return colors;
+}
+
 Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   const groupDim = 256;
   final width = setup.width;
@@ -203,8 +254,45 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       ceilDiv(width, groupDim << 3) * ceilDiv(height, groupDim << 3);
   final singleSection = numGroups == 1;
   final globalChannels = width <= groupDim && height <= groupDim;
-  final useRct = !setup.grayscale;
-  if (useRct) _forwardRct(planes);
+
+  // Transform choice: palette when the color count is small, RCT
+  // otherwise (color images only).
+  List<int>? palette;
+  var useRct = false;
+  if (!setup.grayscale) {
+    palette = _detectPalette(planes, 256);
+    if (palette != null) {
+      final lookup = <int, int>{};
+      for (var i = 0; i < palette.length; i++) {
+        lookup[palette[i]] = i;
+      }
+      final p0 = planes[0];
+      final p1 = planes[1];
+      final p2 = planes[2];
+      final index = Int32List(p0.length);
+      for (var i = 0; i < p0.length; i++) {
+        index[i] = lookup[(p0[i] << 40) | (p1[i] << 20) | p2[i]]!;
+      }
+      planes = [index, ...planes.sublist(3)];
+    } else {
+      useRct = true;
+      _forwardRct(planes);
+    }
+  }
+
+  // Meta (palette) channel tokens: always part of the global stream.
+  final metaContexts = <int>[];
+  final metaValues = <int>[];
+  if (palette != null) {
+    final n = palette.length;
+    final pal = Int32List(3 * n);
+    for (var i = 0; i < n; i++) {
+      pal[i] = palette[i] >>> 40;
+      pal[n + i] = (palette[i] >>> 20) & 0xFFFFF;
+      pal[2 * n + i] = palette[i] & 0xFFFFF;
+    }
+    _tokenizeTile(pal, n, 0, 0, n, 3, metaContexts, metaValues);
+  }
 
   // Tokenize every group tile (channel-major inside each group, matching
   // decodeChannels order).
@@ -220,14 +308,61 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
           plane, width, ox, oy, tw, th, groupContexts[g], groupValues[g]);
     }
   }
+
+  // Section token sequences: the LfGlobal section carries the meta channel
+  // (and, for small images, all pixel channels); otherwise one section per
+  // group. LZ77 windows are per section.
+  final sectionContexts = <List<int>>[
+    [
+      ...metaContexts,
+      if (globalChannels)
+        for (var g = 0; g < numGroups; g++) ...groupContexts[g],
+    ],
+    if (!globalChannels)
+      for (var g = 0; g < numGroups; g++) groupContexts[g],
+  ];
+  final sectionValues = <List<int>>[
+    [
+      ...metaValues,
+      if (globalChannels)
+        for (var g = 0; g < numGroups; g++) ...groupValues[g],
+    ],
+    if (!globalChannels)
+      for (var g = 0; g < numGroups; g++) groupValues[g],
+  ];
+
+  final sectionOps = [
+    for (var s = 0; s < sectionValues.length; s++)
+      lz77Compress(sectionContexts[s], sectionValues[s]),
+  ];
+  final lzCodes = EntropyCodes.buildLz77(_numContexts, sectionOps, _config);
   final allContexts = <int>[];
   final allValues = <int>[];
-  for (var g = 0; g < numGroups; g++) {
-    allContexts.addAll(groupContexts[g]);
-    allValues.addAll(groupValues[g]);
+  for (var s = 0; s < sectionValues.length; s++) {
+    allContexts.addAll(sectionContexts[s]);
+    allValues.addAll(sectionValues[s]);
   }
-  final residualCodes =
+  final plainCodes =
       EntropyCodes.build(_numContexts, allContexts, allValues, _config);
+  // Pick whichever encoding the histograms say is smaller.
+  final useLz77 = lzCodes.estimatedBits() < plainCodes.estimatedBits();
+  if (const bool.fromEnvironment('jxl.encdebug')) {
+    // ignore: avoid_print
+    print('palette=${palette?.length} rct=$useRct lz=$useLz77 '
+        'lzEst=${(lzCodes.estimatedBits() / 8192).round()}K '
+        'plainEst=${(plainCodes.estimatedBits() / 8192).round()}K');
+  }
+  final residualCodes = useLz77 ? lzCodes : plainCodes;
+
+  void writeSectionPayload(BitWriter w, int s) {
+    if (useLz77) {
+      residualCodes.writeOps(w, sectionOps[s]);
+    } else {
+      for (var i = 0; i < sectionValues[s].length; i++) {
+        residualCodes.writeToken(w, sectionContexts[s][i], sectionValues[s][i]);
+      }
+    }
+  }
 
   // --- LfGlobal section ---
   final lfGlobal = BitWriter();
@@ -239,7 +374,16 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // Global modular stream header.
   lfGlobal.writeBool(true); // use_global_tree
   lfGlobal.writeBool(true); // default wp_params
-  if (useRct) {
+  if (palette != null) {
+    lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
+    lfGlobal.writeBits(1, 2); // transform: palette
+    lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
+    lfGlobal.writeU32(3, 1, 0, 3, 0, 4, 0, 1, 13); // num_c = 3
+    lfGlobal.writeU32(
+        palette.length, 0, 8, 256, 10, 1280, 12, 5376, 16); // nb_colors
+    lfGlobal.writeU32(0, 0, 0, 1, 8, 257, 10, 1281, 16); // nb_deltas = 0
+    lfGlobal.writeBits(0, 4); // d_pred
+  } else if (useRct) {
     lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
     lfGlobal.writeBits(0, 2); // transform: RCT
     lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
@@ -247,27 +391,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   } else {
     lfGlobal.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 0
   }
-  if (globalChannels) {
-    // Small image: the channels are encoded in the global stream itself.
-    for (var g = 0; g < numGroups; g++) {
-      for (var i = 0; i < groupValues[g].length; i++) {
-        residualCodes.writeToken(
-            lfGlobal, groupContexts[g][i], groupValues[g][i]);
-      }
-    }
-  }
-
-  // --- Group sections ---
-  Uint8List writeGroupSection(int g) {
-    final w = BitWriter();
-    w.writeBool(true); // use_global_tree
-    w.writeBool(true); // default wp_params
-    w.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms
-    for (var i = 0; i < groupValues[g].length; i++) {
-      residualCodes.writeToken(w, groupContexts[g][i], groupValues[g][i]);
-    }
-    return w.toBytes();
-  }
+  writeSectionPayload(lfGlobal, 0);
 
   // --- Assemble the codestream ---
   final out = BitWriter();
@@ -281,11 +405,20 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     writeToc(out, [body.length]);
     out.writeBytes(body);
   } else {
+    Uint8List writeGroupSection(int s) {
+      final w = BitWriter();
+      w.writeBool(true); // use_global_tree
+      w.writeBool(true); // default wp_params
+      w.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms
+      writeSectionPayload(w, s);
+      return w.toBytes();
+    }
+
     final sections = <Uint8List>[
       lfGlobal.toBytes(),
       for (var i = 0; i < numLfGroups; i++) Uint8List(0), // LF groups
       Uint8List(0), // HfGlobal + passes (nothing for modular)
-      for (var g = 0; g < numGroups; g++) writeGroupSection(g),
+      for (var g = 0; g < numGroups; g++) writeGroupSection(1 + g),
     ];
     writeToc(out, [for (final s in sections) s.length]);
     for (final s in sections) {

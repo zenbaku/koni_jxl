@@ -145,3 +145,24 @@ Stream<ui.Image> decodeJxlProgressive(Stream<List<int>> chunks) async* {
   });
   yield await _rgbaToUiImage(pixels, width, height);
 }
+
+/// Losslessly encodes raw RGBA pixels to JPEG XL in a background isolate.
+Future<Uint8List> encodeJxlFromRgba(Uint8List rgba,
+    {required int width, required int height}) {
+  return Isolate.run(() => JxlEncoder.encodeLossless(rgba,
+      width: width, height: height, hasAlpha: true));
+}
+
+/// Losslessly encodes a [ui.Image] to JPEG XL (reads back RGBA, encodes in
+/// a background isolate).
+Future<Uint8List> encodeJxlFromUiImage(ui.Image image) async {
+  final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (data == null) {
+    throw StateError('could not read pixels from the ui.Image');
+  }
+  final rgba = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+  final width = image.width;
+  final height = image.height;
+  return Isolate.run(() => JxlEncoder.encodeLossless(rgba,
+      width: width, height: height, hasAlpha: true));
+}

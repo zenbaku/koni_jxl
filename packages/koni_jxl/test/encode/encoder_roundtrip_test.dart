@@ -89,6 +89,45 @@ void _check(int width, int height,
   }
 }
 
+void _check16(int width, int height,
+    {bool grayscale = false, bool hasAlpha = false, int seed = 3}) {
+  final channels = (grayscale ? 1 : 3) + (hasAlpha ? 1 : 0);
+  final rng = math.Random(seed);
+  final pixels = Uint16List(width * height * channels);
+  for (var i = 0; i < pixels.length; i++) {
+    pixels[i] = switch (i % 3) {
+      0 => (i * 977) & 0xFFFF,
+      1 => rng.nextInt(1 << 16),
+      _ => 65535,
+    };
+  }
+  final encoded = JxlEncoder.encodeLossless16(pixels,
+      width: width, height: height, grayscale: grayscale, hasAlpha: hasAlpha);
+  final image = JxlDecoder.decode(encoded);
+  for (var c = 0; c < channels; c++) {
+    final ours = channelAsInts(image.channels[c], 65535);
+    for (var i = 0; i < width * height; i++) {
+      if (ours[i] != pixels[i * channels + c]) {
+        fail('16-bit mismatch at px $i channel $c');
+      }
+    }
+  }
+}
+
+Uint8List _flatColors(int width, int height, int colors) {
+  final out = Uint8List(width * height * 3);
+  var i = 0;
+  for (var y = 0; y < height; y++) {
+    for (var x = 0; x < width; x++) {
+      final k = ((x ~/ 13) + (y ~/ 11) * 3) % colors;
+      out[i++] = (k * 37) & 255;
+      out[i++] = (k * 91 + 13) & 255;
+      out[i++] = (k * 151 + 7) & 255;
+    }
+  }
+  return out;
+}
+
 void main() {
   test('single-group images', () {
     _check(8, 8);
@@ -102,6 +141,54 @@ void main() {
     _check(511, 300, grayscale: true);
     _check(300, 511);
     _check(1000, 600, seed: 42);
+  });
+
+  test('palette (few distinct colors)', () {
+    for (final (w, h, colors) in [
+      (100, 80, 4),
+      (400, 300, 17),
+      (300, 400, 256)
+    ]) {
+      final pixels = _flatColors(w, h, colors);
+      final encoded = JxlEncoder.encodeLossless(pixels, width: w, height: h);
+      final image = JxlDecoder.decode(encoded);
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        for (var i = 0; i < w * h; i++) {
+          if (ours[i] != pixels[i * 3 + c]) {
+            fail('palette mismatch at px $i channel $c ($colors colors)');
+          }
+        }
+      }
+      if (_haveDjxl) {
+        final dir = Directory.systemTemp.createTempSync('koni_enc');
+        try {
+          final jxlPath = '${dir.path}/t.jxl';
+          final outPath = '${dir.path}/t.ppm';
+          File(jxlPath).writeAsBytesSync(encoded);
+          final r =
+              Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+          expect(r.exitCode, 0, reason: 'djxl: ${r.stderr}');
+          final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+          for (var c = 0; c < 3; c++) {
+            final theirs = ref.intPlanes![c];
+            for (var i = 0; i < w * h; i++) {
+              if (theirs[i] != pixels[i * 3 + c]) {
+                fail('djxl palette mismatch at px $i channel $c');
+              }
+            }
+          }
+        } finally {
+          dir.deleteSync(recursive: true);
+        }
+      }
+    }
+  });
+
+  test('16-bit', () {
+    _check16(64, 48);
+    _check16(300, 260, grayscale: true);
+    _check16(100, 100, hasAlpha: true);
   });
 
   test('alpha', () {

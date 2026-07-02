@@ -116,5 +116,8 @@ them proves less than it looks like. This machine has everything.
 
 Spot-color rendering, JPEG bitstream reconstruction, float (HDR) sample
 formats, ICC-driven output transforms. None block the manga use case.
-Known slow path: EPF pass 0 (epfIterations == 3, rare) is scalar; an
+Encoder sizing decisions must use exact Huffman code lengths, never
+Shannon entropy (the 1-bit-per-symbol prefix floor dominates skewed
+histograms). Known slow path: EPF pass 0 (epfIterations == 3, rare) is
+scalar; an
 11MP triple-pass progressive photo takes ~6.5 s.

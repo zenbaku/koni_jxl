@@ -16,9 +16,6 @@ final class JxlEncodeSetup {
     if (bitsPerSample != 8 && bitsPerSample != 16) {
       throw ArgumentError('bitsPerSample must be 8 or 16');
     }
-    if (hasAlpha && bitsPerSample != 8) {
-      throw ArgumentError('alpha is currently supported for 8-bit only');
-    }
   }
 
   final int width;
@@ -65,7 +62,17 @@ void writeImageHeader(BitWriter w, JxlEncodeSetup s) {
   // Extra channels.
   w.writeU32(s.hasAlpha ? 1 : 0, 0, 0, 1, 0, 2, 4, 1, 12);
   if (s.hasAlpha) {
-    w.writeBool(true); // d_alpha: default 8-bit unassociated alpha
+    if (s.bitsPerSample == 8) {
+      w.writeBool(true); // d_alpha: default 8-bit unassociated alpha
+    } else {
+      w.writeBool(false); // d_alpha
+      w.writeEnum(0); // type: alpha
+      w.writeBool(false); // integer samples
+      w.writeU32(s.bitsPerSample, 8, 0, 10, 0, 12, 0, 1, 6);
+      w.writeU32(0, 0, 0, 3, 0, 4, 0, 1, 3); // dim_shift
+      w.writeU32(0, 0, 0, 0, 4, 16, 5, 48, 10); // empty name
+      w.writeBool(false); // alpha_associated
+    }
   }
   w.writeBool(false); // xyb_encoded
   // ColorEncoding.

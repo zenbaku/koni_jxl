@@ -106,6 +106,21 @@ void main() {
     });
   });
 
+  group('encodeJxlFromRgba', () {
+    test('round-trips through the decoder', () async {
+      const w = 40, h = 30;
+      final rgba = Uint8List(w * h * 4);
+      for (var i = 0; i < rgba.length; i++) {
+        rgba[i] = (i * 7) & 255;
+      }
+      final encoded = await encodeJxlFromRgba(rgba, width: w, height: h);
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, w);
+      expect(image.height, h);
+      expect(image.toRgba8(), rgba);
+    });
+  });
+
   group('JxlImageProvider', () {
     test('memory provider resolves an ImageInfo with correct size', () async {
       final provider = JxlImageProvider.memory(sample.readAsBytesSync());
