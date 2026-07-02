@@ -1,17 +1,39 @@
 import 'dart:typed_data';
 
+import '../exceptions.dart';
+import '../jxl_limits.dart';
+
 /// A single image plane, either integer or float samples.
 ///
 /// Storage is row-based: each row is an independent typed list. This keeps
 /// hot loops monomorphic (typed-data *views* are a different internal class
 /// than real typed lists and wreck AOT inlining/bounds-check elimination).
+void _checkPlaneSize(int height, int width) {
+  if (height < 0 ||
+      width < 0 ||
+      (width != 0 && height > JxlLimits.maxPlanePixels ~/ width)) {
+    throw JxlInvalidBitstreamException(
+        'plane ${width}x$height exceeds JxlLimits.maxPlanePixels');
+  }
+}
+
 final class ImageBuffer {
-  ImageBuffer.int32(this.height, this.width)
+  factory ImageBuffer.int32(int height, int width) {
+    _checkPlaneSize(height, width);
+    return ImageBuffer._int32(height, width);
+  }
+
+  ImageBuffer._int32(this.height, this.width)
       : _intRows =
             List.generate(height, (_) => Int32List(width), growable: false),
         _floatRows = null;
 
-  ImageBuffer.float32(this.height, this.width)
+  factory ImageBuffer.float32(int height, int width) {
+    _checkPlaneSize(height, width);
+    return ImageBuffer._float32(height, width);
+  }
+
+  ImageBuffer._float32(this.height, this.width)
       : _intRows = null,
         _floatRows =
             List.generate(height, (_) => Float32List(width), growable: false);

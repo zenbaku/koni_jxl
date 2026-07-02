@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../jxl_limits.dart';
 
 /// The `Extensions` bundle: 64 optional payloads gated by a bitmask key.
 /// Payload contents are opaque; they are read and retained but not
@@ -17,7 +18,7 @@ final class Extensions {
     for (var i = 0; i < 64; i++) {
       if ((1 << i) & extensionsKey != 0) {
         final length = reader.readU64();
-        if (length < 0 || length > 0x7FFFFFFF) {
+        if (length < 0 || length > JxlLimits.maxExtensionBytes) {
           throw const JxlInvalidBitstreamException(
               'extension payload too large');
         }

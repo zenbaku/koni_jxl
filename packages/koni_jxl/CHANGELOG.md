@@ -14,6 +14,8 @@
   7-context gradient tree, per-image choice of LZ77 / palette / YCoCg
   RCT by exact coded-size estimation, prefix codes; output verified
   bit-exact through this decoder and djxl on every test.
+- Robustness: all decode surfaces throw only `JxlException` on malformed
+  input (fuzz-verified); `JxlLimits` caps header-driven allocations.
 - Header-only `JxlInfo.parse`, embedded ICC profile decoding.
 - `jxl_info` and `jxl_dec` CLIs.
 - VarDCT (lossy) still images decode within ~1 RMSE of libjxl: all 27

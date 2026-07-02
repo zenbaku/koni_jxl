@@ -97,11 +97,22 @@ final class HfCoefficients {
         }
         final pixelGroupY = sGroupY << 3;
         final pixelGroupX = sGroupX << 3;
+        // A block must fit within its 32x32 group grid; a corrupt oversized
+        // transform near the edge would otherwise index past nonZeroes.
+        if (sGroupY + tt.dctSelectHeight > 32 ||
+            sGroupX + tt.dctSelectWidth > 32) {
+          throw const JxlInvalidBitstreamException(
+              'transform block extends past its group');
+        }
         final predicted =
             _getPredictedNonZeroes(nonZeroes, c, sGroupY, sGroupX);
         final blockCtx = _getBlockContext(c, tt.orderID, hfMult, lfIndex);
         final nonZeroCtx = offset + _getNonZeroContext(predicted, blockCtx);
         var nonZero = stream.readSymbol(reader, nonZeroCtx);
+        if (nonZero > tt.pixelHeight * tt.pixelWidth - numBlocks) {
+          throw const JxlInvalidBitstreamException(
+              'nonzero coefficient count out of range');
+        }
         final base = c * 1024;
         final fill = (nonZero + numBlocks - 1) ~/ numBlocks;
         for (var iy = 0; iy < tt.dctSelectHeight; iy++) {

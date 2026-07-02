@@ -100,6 +100,9 @@ final class Frame {
   }
 
   void readToc({bool allowTruncated = false}) {
+    if (tocEntryCount > 1 << 20) {
+      throw const JxlInvalidBitstreamException('too many TOC sections');
+    }
     toc = Toc.read(globalReader, tocEntryCount, allowTruncated: allowTruncated);
   }
 

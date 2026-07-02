@@ -2,6 +2,7 @@ import '../color/color_encoding.dart';
 import '../entropy/entropy_stream.dart';
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../jxl_limits.dart';
 import '../modular/ma_tree.dart';
 import '../modular/modular_stream.dart';
 import '../vardct/hf_block_context.dart';
@@ -21,6 +22,9 @@ final class LfGlobal {
     if (header.flags & FrameFlags.patches != 0) {
       final stream = EntropyStream.read(reader, 10);
       final numPatches = stream.readSymbol(reader, 0);
+      if (numPatches > JxlLimits.maxFeatureCount) {
+        throw const JxlInvalidBitstreamException('too many patches');
+      }
       for (var i = 0; i < numPatches; i++) {
         lf.patches.add(Patch.read(stream, reader, metadata.extraChannels.length,
             metadata.alphaIndices.length));

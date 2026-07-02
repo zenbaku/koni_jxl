@@ -51,7 +51,7 @@ final class ExtraChannelInfo {
       final nameLen = reader.readU32(0, 0, 0, 4, 16, 5, 48, 10);
       // No byte-alignment guarantee, so read the UTF-8 name bytewise.
       final nameBuffer = List<int>.generate(nameLen, (_) => reader.readBits(8));
-      name = utf8.decode(nameBuffer);
+      name = utf8.decode(nameBuffer, allowMalformed: true);
       alphaAssociated = type == ExtraChannelType.alpha && reader.readBool();
     } else {
       type = ExtraChannelType.alpha;

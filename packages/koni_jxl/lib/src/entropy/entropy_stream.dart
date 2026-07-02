@@ -156,8 +156,9 @@ final class EntropyStream {
       return hybridInt;
     }
 
-    assert(context < _clusterMap.length,
-        'context $context out of range (${_clusterMap.length})');
+    if (context < 0 || context >= _clusterMap.length) {
+      throw const JxlInvalidBitstreamException('entropy context out of range');
+    }
     final cluster = _clusterMap[context];
     final dist = _dists[cluster];
     var token = dist.readSymbol(reader, _ansState);

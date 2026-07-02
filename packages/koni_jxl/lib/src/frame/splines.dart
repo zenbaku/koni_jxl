@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import '../entropy/entropy_stream.dart';
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../jxl_limits.dart';
 import '../util/math_helper.dart';
 import 'frame.dart';
 
@@ -12,6 +13,9 @@ final class SplinesBundle {
   SplinesBundle.read(BitReader reader) {
     final stream = EntropyStream.read(reader, 6);
     numSplines = 1 + stream.readSymbol(reader, 2);
+    if (numSplines > JxlLimits.maxFeatureCount) {
+      throw const JxlInvalidBitstreamException('too many splines');
+    }
     splineY = List.filled(numSplines, 0);
     splineX = List.filled(numSplines, 0);
     for (var i = 0; i < numSplines; i++) {
@@ -33,6 +37,9 @@ final class SplinesBundle {
     coeffSigma = List.generate(numSplines, (_) => List.filled(32, 0));
     for (var i = 0; i < numSplines; i++) {
       final count = 1 + stream.readSymbol(reader, 3);
+      if (count > JxlLimits.maxFeatureCount) {
+        throw const JxlInvalidBitstreamException('too many control points');
+      }
       controlPointsY[i].add(splineY[i]);
       controlPointsX[i].add(splineX[i]);
       final deltaY = List.filled(count - 1, 0);
@@ -241,6 +248,9 @@ void _renderSpline(Frame frame, SplinesBundle bundle, int splineID) {
   }
 
   final totalArc = (arcY.length - 2.0) * renderDistance + arcLen.last;
+  if (arcY.length > JxlLimits.maxFeatureCount) {
+    throw const JxlInvalidBitstreamException('spline arc too long');
+  }
   if (totalArc <= 0) return;
 
   final width = frame.boundsWidth;

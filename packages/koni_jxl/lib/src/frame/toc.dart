@@ -25,10 +25,41 @@ List<int> readPermutation(
       throw const JxlInvalidBitstreamException('illegal lehmer value');
     }
   }
-  final temp = List<int>.generate(size, (i) => i);
+  // Decode the Lehmer sequence into a permutation. A naive `removeAt` from
+  // a shrinking list is O(size^2); a Fenwick tree of remaining slots makes
+  // "select the k-th still-available index" O(log size), which matters for
+  // both large legitimate TOCs and adversarial inputs.
+  final tree = Int32List(size + 1); // 1-based counts of available slots
+  void add(int i, int delta) {
+    for (var x = i + 1; x <= size; x += x & -x) {
+      tree[x] += delta;
+    }
+  }
+
+  for (var i = 0; i < size; i++) {
+    add(i, 1);
+  }
+  // Finds the position of the (k+1)-th available slot (0-based k).
+  int selectAndRemove(int k) {
+    var pos = 0;
+    var remaining = k + 1;
+    var logSize = 1;
+    while (logSize * 2 <= size) {
+      logSize *= 2;
+    }
+    for (var step = logSize; step > 0; step >>= 1) {
+      if (pos + step <= size && tree[pos + step] < remaining) {
+        pos += step;
+        remaining -= tree[pos];
+      }
+    }
+    add(pos, -1); // pos is 0-based index of the found slot
+    return pos;
+  }
+
   final permutation = List<int>.filled(size, 0);
   for (var i = 0; i < size; i++) {
-    permutation[i] = temp.removeAt(lehmer[i]);
+    permutation[i] = selectAndRemove(lehmer[i]);
   }
   return permutation;
 }

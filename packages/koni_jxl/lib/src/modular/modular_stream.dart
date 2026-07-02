@@ -73,6 +73,13 @@ final class ModularStream {
 
     for (var i = 0; i < nbTransforms; i++) {
       final t = transforms[i];
+      if (t.tr == TransformInfo.palette || t.tr == TransformInfo.rct) {
+        final needed = t.tr == TransformInfo.rct ? 3 : t.numC;
+        if (t.beginC < 0 || needed < 1 || t.beginC + needed > channels.length) {
+          throw const JxlInvalidBitstreamException(
+              'transform channel range out of bounds');
+        }
+      }
       if (t.tr == TransformInfo.palette) {
         if (t.beginC < nbMetaChannels) {
           nbMetaChannels += 2 - t.numC;
@@ -121,6 +128,10 @@ final class ModularStream {
         for (final sp in squeezeList) {
           final begin = sp.beginC;
           final end = begin + sp.numC - 1;
+          if (begin < 0 || sp.numC < 1 || end >= channels.length) {
+            throw const JxlInvalidBitstreamException(
+                'squeeze channel range out of bounds');
+          }
           final offset = sp.inPlace ? end + 1 : channels.length;
           if (begin < nbMetaChannels) {
             if (!sp.inPlace) {

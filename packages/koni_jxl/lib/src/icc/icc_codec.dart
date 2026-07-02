@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import '../entropy/entropy_stream.dart';
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../jxl_limits.dart';
 import '../util/math_helper.dart';
 
 /// Decodes JPEG XL's entropy-coded ICC representation.
@@ -121,6 +122,9 @@ abstract final class IccCodec {
   static Uint8List decompress(Uint8List encoded) {
     final commandReader = BitReader(encoded);
     final outputSize = commandReader.readIccVarint();
+    if (outputSize > JxlLimits.maxIccBytes) {
+      throw const JxlInvalidBitstreamException('ICC profile too large');
+    }
     final commandSize = commandReader.readIccVarint();
     final commandStart = commandReader.bitsRead >> 3;
     final dataStart = commandStart + commandSize;

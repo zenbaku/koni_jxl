@@ -4,6 +4,7 @@ import '../color/color_encoding.dart';
 import '../color/opsin_inverse.dart';
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../jxl_limits.dart';
 import 'animation.dart';
 import 'bit_depth.dart';
 import 'extensions.dart';
@@ -121,6 +122,9 @@ final class ImageHeader {
       bitDepth = BitDepthHeader.read(reader);
       modular16BitBuffers = reader.readBool();
       final extraChannelCount = reader.readU32(0, 0, 1, 0, 2, 4, 1, 12);
+      if (extraChannelCount > JxlLimits.maxChannels) {
+        throw const JxlInvalidBitstreamException('too many extra channels');
+      }
       extraChannels = List.generate(
           extraChannelCount, (_) => ExtraChannelInfo.read(reader));
       xybEncoded = reader.readBool();
@@ -152,7 +156,7 @@ final class ImageHeader {
     int? iccEncodedSize;
     if (colorEncoding.useIccProfile) {
       final encodedSize = reader.readU64();
-      if (encodedSize < 0 || encodedSize > 0x7FFFFFFF) {
+      if (encodedSize < 0 || encodedSize > JxlLimits.maxIccBytes) {
         throw const JxlInvalidBitstreamException('ICC size too large');
       }
       iccEncodedSize = encodedSize;

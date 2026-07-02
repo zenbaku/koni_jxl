@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import '../entropy/entropy_stream.dart';
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../jxl_limits.dart';
 import '../util/math_helper.dart';
 import 'ma_tree.dart';
 import 'wp_params.dart';
@@ -99,6 +100,12 @@ final class ModularChannel {
   final Int32List _subpred = Int32List(4);
 
   void allocate() {
+    if (height < 0 ||
+        width < 0 ||
+        (width != 0 && height > JxlLimits.maxPlanePixels ~/ width)) {
+      throw JxlInvalidBitstreamException(
+          'channel ${width}x$height exceeds JxlLimits.maxPlanePixels');
+    }
     buffer ??= Int32List(height * width);
   }
 

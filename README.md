@@ -115,6 +115,14 @@ lossy encoding is not implemented (use cjxl for that).
 Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` run the encoder in
 a background isolate.
 
+## Robustness
+
+The decode APIs treat all input as untrusted: any bytes either decode or
+throw a `JxlException` — never a `RangeError`, hang, or out-of-memory.
+This contract is fuzz-tested and enforced by a regression suite;
+`JxlLimits` caps what a crafted header can allocate (override if you
+legitimately decode very large images).
+
 ## Development
 
 ```bash

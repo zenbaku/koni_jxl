@@ -162,6 +162,10 @@ final class PrefixSymbolDistribution extends SymbolDistribution {
           throw const JxlInvalidBitstreamException(
               'level 2 repeat overflows alphabet');
         }
+        if (prev > alphabetSize) {
+          throw const JxlInvalidBitstreamException(
+              'level 2 repeat length exceeds alphabet');
+        }
         for (var j = 0; j < extra; j++) {
           level2Lengths[i + j] = prev;
         }
@@ -180,6 +184,12 @@ final class PrefixSymbolDistribution extends SymbolDistribution {
         prevZeroCount += extra;
         level2Counts[0] += extra;
       } else {
+        // A code length that cannot fit this alphabet is invalid (and would
+        // index past level2Counts, which has alphabetSize + 1 buckets).
+        if (code > alphabetSize) {
+          throw const JxlInvalidBitstreamException(
+              'prefix code length exceeds alphabet');
+        }
         level2Lengths[i] = code;
         prevRepeatCount = 0;
         prevZeroCount = 0;

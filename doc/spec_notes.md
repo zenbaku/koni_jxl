@@ -95,6 +95,23 @@ but coded 33K until LZ77 was chosen on exact costs). 16-bit input is
 supported. Remaining encoder ideas: ANS (removes the 1-bit floor),
 per-image learned trees, delta palette.
 
+## Robustness
+
+The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
+`decodeAnimation`, `JxlStreamingDecoder`) hold a hard contract: any input
+either decodes or throws a `JxlException` — never a `RangeError`,
+`StateError`, `TypeError`, out-of-memory, or hang. This is enforced by a
+mutation-fuzz campaign (`tool/fuzz_decode.dart`: bit-flips, truncations,
+garbage over diverse seeds) and a seeded regression subset in
+`test/decoder/fuzz_regression_test.dart`. `JxlLimits` bounds pre-checked
+allocations (plane pixels, channels, frames, features, ICC/extension
+bytes) so a crafted header can't force a huge allocation. Notable
+hardening found by fuzzing: quadratic TOC-permutation decode replaced
+with an O(n log n) Fenwick select (was a multi-second hang on large
+entry counts), transform channel-range and block-extent validation,
+prefix-code length bounds, and an entropy-context bounds guard covering
+every `readSymbol` caller.
+
 ## Performance status
 
 Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a

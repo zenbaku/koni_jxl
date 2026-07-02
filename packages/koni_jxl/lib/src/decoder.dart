@@ -10,6 +10,7 @@ import 'icc/icc_codec.dart';
 import 'io/bit_reader.dart';
 import 'io/container.dart';
 import 'jxl_image.dart';
+import 'jxl_limits.dart';
 import 'render/blend.dart';
 import 'render/noise.dart';
 import 'render/transpose.dart';
@@ -48,6 +49,7 @@ final class _DecoderState {
     final demuxed = demuxContainer(bytes);
     final reader = BitReader(demuxed.codestream);
     imageHeader = ImageHeader.read(reader, level: demuxed.level);
+    _checkImageSize(imageHeader);
 
     Uint8List? iccProfile;
     if (imageHeader.iccEncodedSize != null) {
@@ -64,7 +66,11 @@ final class _DecoderState {
       preview.readToc();
     }
 
+    var frameCount = 0;
     while (true) {
+      if (++frameCount > JxlLimits.maxFrames) {
+        throw const JxlInvalidBitstreamException('too many frames');
+      }
       final frame = Frame(reader, imageHeader);
       final header = frame.readFrameHeader();
       frame.readToc();
@@ -172,6 +178,15 @@ final class _DecoderState {
       tpsDenominator: animation?.tpsDenominator ?? 1,
       numLoops: animation?.numLoops ?? 0,
     );
+  }
+
+  static void _checkImageSize(ImageHeader header) {
+    final w = header.size.width;
+    final h = header.size.height;
+    if (w <= 0 || h <= 0 || h > JxlLimits.maxPlanePixels ~/ w) {
+      throw const JxlInvalidBitstreamException(
+          'image size exceeds JxlLimits.maxPlanePixels');
+    }
   }
 
   final List<JxlImage> frames = [];

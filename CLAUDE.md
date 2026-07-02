@@ -99,6 +99,16 @@ them proves less than it looks like. This machine has everything.
   change regresses these noticeably, find out why.
 - Isolate parallelism was evaluated and deferred (see spec_notes).
 
+## Robustness contract
+
+Decode surfaces must throw only `JxlException` on any input — never
+RangeError/StateError/TypeError/OOM/hang. New parsing that reads a
+count/size from the bitstream needs a bound (see `JxlLimits`) before
+allocating or looping. `tool/fuzz_decode.dart` is the campaign;
+`test/decoder/fuzz_regression_test.dart` is the CI subset — widen its
+seed range when touching parsing code. Entropy `readSymbol` already
+bounds-checks the context, so most decode-time index bugs surface there.
+
 ## Conventions
 
 - `dart format` before committing; analyzer must be clean.

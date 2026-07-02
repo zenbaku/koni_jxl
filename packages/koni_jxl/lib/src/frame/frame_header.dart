@@ -127,7 +127,7 @@ final class FrameHeader {
     } else {
       final nameLen = reader.readU32(0, 0, 0, 4, 16, 5, 48, 10);
       final buffer = List<int>.generate(nameLen, (_) => reader.readBits(8));
-      h.name = utf8.decode(buffer);
+      h.name = utf8.decode(buffer, allowMalformed: true);
     }
     h.restorationFilter = allDefault
         ? RestorationFilter.defaults()

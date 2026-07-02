@@ -290,7 +290,11 @@ final class JxlStreamingDecoder {
       final sx = frame.header.jpegUpsamplingX[c];
       final rows = floatMatrix(lfHeight >> sy, lfWidth >> sx);
       for (var g = 0; g < frame.numLfGroups; g++) {
-        final lfg = frame.lfGroups[g]!;
+        final lfg = frame.lfGroups[g];
+        if (lfg == null || lfg.lfCoeff == null) {
+          throw const JxlInvalidBitstreamException(
+              'incomplete DC sections for preview');
+        }
         final src = lfg.lfCoeff!.dequantLFCoeffAt(c);
         final pos = frame.getLFGroupLocation(g);
         final oy = (pos.y << 8) >> sy;
