@@ -47,13 +47,13 @@ Supported today:
 - ✅ Patches, reference frames, all blend modes
 - ✅ ISOBMFF container and bare codestreams; EXIF orientation
 - ✅ Embedded ICC profiles (decoded and exposed)
-- ✅ First frame of animated files
+- ✅ Animation: all frames with durations and loop count
+  (`JxlDecoder.decodeAnimation`, `JxlAnimationView` widget)
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 
 - ⏳ Splines, spot-color rendering, extra-channel blend modes
-- ⏳ Animation (all frames), progressive decode (LF frames), JPEG
-  reconstruction
+- ⏳ Progressive decode (LF frames), JPEG reconstruction
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless

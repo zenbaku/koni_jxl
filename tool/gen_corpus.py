@@ -241,6 +241,23 @@ def main():
                      ["-d", "1.0", "-e", "7", "--photon_noise_iso=3200"],
                      False, True))
 
+    # Animated fixture: 4 distinct full frames, GIF -> lossless JXL, with
+    # per-frame PPM references for the bit-exact animation gate.
+    anim_frames = []
+    for i in range(4):
+        im = Image.new("RGB", (64, 48), (i * 60, 255 - i * 60, 128))
+        d = ImageDraw.Draw(im)
+        d.rectangle([8 + i * 10, 8, 24 + i * 10, 24], fill=(255, 255, 0))
+        d.ellipse([30, 20 + i * 4, 50, 40 + i * 4], fill=(0, 0, 255))
+        anim_frames.append(im)
+        with open(GOLD / f"anim_frame_{i}.ppm", "wb") as f:
+            f.write(b"P6\n64 48\n255\n" + im.tobytes())
+    gif = SRC / "anim.gif"
+    anim_frames[0].save(gif, save_all=True, append_images=anim_frames[1:],
+                        duration=100, loop=0, disposal=1)
+    subprocess.run(["cjxl", str(gif), str(JXL / "anim_d0.jxl"),
+                    "-d", "0", "--quiet"], check=True)
+
     print(f"{len(jobs)} encode jobs...")
     for i, (src, outname, args, has_alpha, lossy) in enumerate(jobs):
         out = encode(src, outname, args)

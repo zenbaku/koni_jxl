@@ -24,7 +24,14 @@ final class JxlDecoder {
   /// Decodes [bytes] (bare codestream or ISOBMFF container).
   ///
   /// For animated inputs, decodes and returns the first visible frame.
-  static JxlImage decode(Uint8List bytes) => _DecoderState()._decode(bytes);
+  static JxlImage decode(Uint8List bytes) =>
+      _DecoderState()._decode(bytes, allFrames: false).frames.first;
+
+  /// Decodes all visible frames of [bytes].
+  ///
+  /// Still images produce a single frame with duration 0.
+  static JxlAnimation decodeAnimation(Uint8List bytes) =>
+      _DecoderState()._decode(bytes, allFrames: true);
 }
 
 final class _DecoderState {
@@ -35,7 +42,7 @@ final class _DecoderState {
   int _visibleFrames = 0;
   int _invisibleFrames = 0;
 
-  JxlImage _decode(Uint8List bytes) {
+  JxlAnimation _decode(Uint8List bytes, {required bool allFrames}) {
     final demuxed = demuxContainer(bytes);
     final reader = BitReader(demuxed.codestream);
     imageHeader = ImageHeader.read(reader, level: demuxed.level);
@@ -62,6 +69,15 @@ final class _DecoderState {
 
       if (header.lfLevel > 0 || header.flags & FrameFlags.useLfFrame != 0) {
         throw JxlUnsupportedException('lf-frames');
+      }
+      if (const bool.fromEnvironment('jxl.framedebug')) {
+        // ignore: avoid_print
+        print('frame: type=${header.type} dur=${header.duration} '
+            'x0=${header.x0} y0=${header.y0} ${header.width}x${header.height} '
+            'saveRef=${header.saveAsReference} beforeCT=${header.saveBeforeCT} '
+            'blend=(mode=${header.blendingInfo.mode} '
+            'src=${header.blendingInfo.source} '
+            'alpha=${header.blendingInfo.alphaChannel}) isLast=${header.isLast}');
       }
       frame.decodeFrame();
 
@@ -122,19 +138,51 @@ final class _DecoderState {
         _reference[header.saveAsReference] = _canvas;
       }
 
-      if (header.isLast || header.duration != 0) break;
+      if (allFrames && frame.isVisible) {
+        // Snapshot the canvas: later frames keep blending onto it, so
+        // finalize a copy (except for the last frame).
+        frames.add(_finalizeCanvas(iccProfile, copy: !header.isLast));
+        durations.add(header.duration);
+        timecodes.add(header.timecode);
+      }
+      if (allFrames ? header.isLast : header.isLast || header.duration != 0) {
+        break;
+      }
     }
 
+    if (!allFrames) {
+      frames.add(_finalizeCanvas(iccProfile, copy: false));
+      durations.add(0);
+      timecodes.add(0);
+    }
+    final animation = imageHeader.animation;
+    return JxlAnimation.internal(
+      frames: frames,
+      durations: durations,
+      timecodes: timecodes,
+      tpsNumerator: animation?.tpsNumerator ?? 1,
+      tpsDenominator: animation?.tpsDenominator ?? 1,
+      numLoops: animation?.numLoops ?? 0,
+    );
+  }
+
+  final List<JxlImage> frames = [];
+  final List<int> durations = [];
+  final List<int> timecodes = [];
+
+  JxlImage _finalizeCanvas(Uint8List? iccProfile, {required bool copy}) {
     final canvas = _canvas;
     if (canvas == null || canvas[0] == null) {
       throw const JxlInvalidBitstreamException('no visible frame decoded');
     }
+    final planes =
+        copy ? [for (final b in canvas) ImageBuffer.copy(b!)] : canvas;
     // XYB frames come out of the color transform in linear RGB; convert to
     // the image's tagged transfer function (what djxl outputs).
     if (imageHeader.xybEncoded) {
       final tf = TransferFunction.forTransfer(imageHeader.colorEncoding.tf);
       for (var c = 0; c < imageHeader.colorChannelCount && c < 3; c++) {
-        for (final row in canvas[c]!.floatRows) {
+        for (final row in planes[c]!.floatRows) {
           for (var i = 0; i < row.length; i++) {
             row[i] = tf.fromLinear(row[i]);
           }
@@ -142,7 +190,7 @@ final class _DecoderState {
       }
     }
     final oriented = [
-      for (final plane in canvas)
+      for (final plane in planes)
         transposeBuffer(plane!, imageHeader.orientation),
     ];
     return JxlImage.internal(imageHeader, oriented, iccProfile);
@@ -260,9 +308,20 @@ final class _DecoderState {
     final blendHeight = (lowerY < height ? lowerY : height) - patchStartY;
     final blendWidth = (lowerX < width ? lowerX : width) - patchStartX;
     final colors = imageHeader.colorChannelCount;
+    final fullCover = patchStartY == 0 &&
+        patchStartX == 0 &&
+        blendHeight == height &&
+        blendWidth == width;
     for (var c = 0; c < canvas.length; c++) {
       final info =
           c >= colors ? header.ecBlendingInfo[c - colors] : header.blendingInfo;
+      // The canvas outside the frame's crop is defined by the blending
+      // source reference (zeros when that slot is empty), not by whatever
+      // the canvas held before. When the reference aliases the canvas the
+      // copy is a no-op.
+      if (!fullCover && !identical(_reference[info.source], canvas)) {
+        _fillFromReference(canvas[c]!, _reference[info.source]?[c]);
+      }
       blendBuffers(
         imageHeader: imageHeader,
         canvas: canvas[c]!,
@@ -281,6 +340,37 @@ final class _DecoderState {
         info: info,
         isPatch: false,
       );
+    }
+  }
+
+  void _fillFromReference(ImageBuffer dst, ImageBuffer? src) {
+    if (src == null) {
+      if (dst.isInt) {
+        for (final row in dst.intRows) {
+          row.fillRange(0, row.length, 0);
+        }
+      } else {
+        for (final row in dst.floatRows) {
+          row.fillRange(0, row.length, 0);
+        }
+      }
+      return;
+    }
+    if (dst.isInt != src.isInt) {
+      final bits = imageHeader.bitDepth.bitsPerSample;
+      dst.castToFloat(bits);
+      src.castToFloat(bits);
+    }
+    final h = dst.height < src.height ? dst.height : src.height;
+    final w = dst.width < src.width ? dst.width : src.width;
+    if (dst.isInt) {
+      for (var y = 0; y < h; y++) {
+        dst.intRows[y].setRange(0, w, src.intRows[y]);
+      }
+    } else {
+      for (var y = 0; y < h; y++) {
+        dst.floatRows[y].setRange(0, w, src.floatRows[y]);
+      }
     }
   }
 }

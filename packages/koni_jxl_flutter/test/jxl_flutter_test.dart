@@ -45,6 +45,27 @@ void main() {
     });
   });
 
+  group('decodeJxlAnimation', () {
+    test('decodes all frames of an animated file', () async {
+      final anim = await decodeJxlAnimation(
+          File('test/assets/anim_d0.jxl').readAsBytesSync());
+      expect(anim.frames.length, 4);
+      expect(anim.isAnimated, isTrue);
+      expect(anim.numLoops, 0);
+      expect(anim.frameDurations.first, const Duration(milliseconds: 100));
+      expect(anim.frames.first.width, 64);
+      expect(anim.frames.first.height, 48);
+      anim.dispose();
+    });
+
+    test('still image yields a single frame', () async {
+      final anim = await decodeJxlAnimation(sample.readAsBytesSync());
+      expect(anim.frames.length, 1);
+      expect(anim.isAnimated, isFalse);
+      anim.dispose();
+    });
+  });
+
   group('JxlImageProvider', () {
     test('memory provider resolves an ImageInfo with correct size', () async {
       final provider = JxlImageProvider.memory(sample.readAsBytesSync());

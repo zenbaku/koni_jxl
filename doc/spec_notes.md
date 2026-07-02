@@ -99,6 +99,14 @@ single-threaded. The `jbrd` JPEG reconstruction box is ignored; pixels
 decode through the normal VarDCT path (byte-exact JPEG re-emission is out
 of scope).
 
+Animation is decoded beyond what jxlatte implements (jxlatte stops at
+the first visible frame). One spec detail matters there: for a frame
+whose crop does not cover the canvas, the area outside the crop comes
+from the blending-source reference (zeros when that slot is empty), not
+from the previous canvas. Verified against djxl: animation_newtons_cradle
+is bit-exact on all 36 frames; animation_icos4d (lossy VarDCT, cropped
+alpha-blended frames) matches within max 11/255 across all 48 frames.
+
 Deviation fixed relative to jxlatte: chroma upsampling (subsampling
 inversion) mirrors its neighbor taps at the *visible* subsampled extent,
 as libjxl's render pipeline does. jxlatte reads the padded DCT samples

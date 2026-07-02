@@ -74,3 +74,41 @@ final class JxlImage {
     return out;
   }
 }
+
+/// All visible frames of a decoded (possibly animated) JPEG XL image.
+final class JxlAnimation {
+  JxlAnimation.internal({
+    required this.frames,
+    required this.durations,
+    required this.timecodes,
+    required this.tpsNumerator,
+    required this.tpsDenominator,
+    required this.numLoops,
+  });
+
+  /// Finalized frames, in presentation order.
+  final List<JxlImage> frames;
+
+  /// Per-frame durations in ticks ([tpsNumerator] / [tpsDenominator] ticks
+  /// per second). Zero for still images.
+  final List<int> durations;
+
+  /// Per-frame timecodes (only meaningful when the stream has timecodes).
+  final List<int> timecodes;
+
+  final int tpsNumerator;
+  final int tpsDenominator;
+
+  /// Number of animation loops; 0 means loop forever.
+  final int numLoops;
+
+  bool get isAnimated => frames.length > 1;
+
+  /// Wall-clock duration of frame [index].
+  Duration frameDuration(int index) {
+    if (tpsNumerator == 0) return Duration.zero;
+    return Duration(
+        microseconds:
+            durations[index] * tpsDenominator * 1000000 ~/ tpsNumerator);
+  }
+}
