@@ -9,6 +9,7 @@ import '../vardct/lf_channel_correlation.dart';
 import 'frame.dart';
 import 'frame_flags.dart';
 import 'patches.dart';
+import 'splines.dart';
 
 /// The LfGlobal frame section: frame-wide features and the global modular
 /// stream. (VarDCT-specific parts land with M5.)
@@ -29,7 +30,7 @@ final class LfGlobal {
       }
     }
     if (header.flags & FrameFlags.splines != 0) {
-      throw JxlUnsupportedException('splines');
+      lf.splines = SplinesBundle.read(reader);
     }
     if (header.flags & FrameFlags.noise != 0) {
       if (metadata.colorChannelCount < 3) {
@@ -79,6 +80,7 @@ final class LfGlobal {
 
   final List<Patch> patches = [];
   List<double>? noiseParameters;
+  SplinesBundle? splines;
   final List<double> lfDequant = [1 / 4096, 1 / 512, 1 / 256];
   int globalScale = 0;
   int quantLF = 0;

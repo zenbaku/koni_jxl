@@ -20,6 +20,8 @@
   (native on AOT targets; emulated on the web), allocation-free weighted
   predictor with an interior fast path, lazy quant-weight and
   coefficient-order setup.
-- Not yet supported (throws `JxlUnsupportedException`): splines,
-  spot-color rendering, progressive/LF frames, JPEG reconstruction,
-  float (HDR) sample formats.
+- Splines (centripetal Catmull-Rom rendering with per-spline DCT32
+  color/sigma profiles).
+- Not yet supported (throws `JxlUnsupportedException`): spot-color
+  rendering, progressive/LF frames, JPEG reconstruction, float (HDR)
+  sample formats.

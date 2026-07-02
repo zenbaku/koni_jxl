@@ -4,6 +4,7 @@ import 'color/transfer_function.dart';
 import 'exceptions.dart';
 import 'frame/frame.dart';
 import 'frame/frame_flags.dart';
+import 'frame/splines.dart';
 import 'header/image_header.dart';
 import 'icc/icc_codec.dart';
 import 'io/bit_reader.dart';
@@ -99,6 +100,7 @@ final class _DecoderState {
         ];
       }
       _computePatches(frame);
+      renderSplines(frame);
       synthesizeNoise(frame, noiseBuffer);
       _performColorTransforms(frame);
 

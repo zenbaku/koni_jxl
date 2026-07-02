@@ -1,6 +1,8 @@
 /// Small integer math helpers shared across the decoder.
 library;
 
+import 'dart:math' as math;
+
 /// JPEG XL `UnpackSigned`: maps an unsigned value to a signed one,
 /// interleaving positives and negatives (0, -1, 1, -2, 2, ...).
 @pragma('vm:prefer-inline')
@@ -34,4 +36,38 @@ int mirrorCoordinate(int coordinate, int size) {
     coordinate = tc >= 0 ? tc : (size << 1) + tc;
   }
   return coordinate;
+}
+
+/// Error function approximation (Numerical Recipes for |z| > 1e-4,
+/// Abramowitz & Stegun otherwise), as used by jxlatte's spline renderer.
+double erf(double z) {
+  final az = z.abs();
+  double absErf;
+  if (az > 1e-4) {
+    final t = 1.0 / (az * 0.5 + 1.0);
+    final u = t *
+            (t *
+                    (t *
+                            (t *
+                                    (t *
+                                            (t *
+                                                    (t *
+                                                            (t *
+                                                                    (t * 0.17087277 -
+                                                                        0.82215223) +
+                                                                1.48851587) -
+                                                        1.13520398) +
+                                                0.27886807) -
+                                        0.18628806) +
+                                0.09678418) +
+                        0.37409196) +
+                1.00002368) -
+        1.26551223;
+    absErf = 1.0 - t * math.exp(-z * z + u);
+  } else {
+    final t = 1.0 / (az * 0.47047 + 1.0);
+    final u = t * (t * (t * 0.7478556 - 0.0958798) + 0.3480242);
+    absErf = 1.0 - u * math.exp(-z * z);
+  }
+  return z < 0 ? -absErf : absErf;
 }

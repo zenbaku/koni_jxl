@@ -44,7 +44,7 @@ Supported today:
 - ✅ Grayscale, RGB, palette (incl. delta palette), alpha, 8/16-bit
 - ✅ All modular predictors incl. the self-correcting weighted predictor
 - ✅ RCT, palette, and squeeze (responsive) transforms
-- ✅ Patches, reference frames, all blend modes
+- ✅ Patches, splines, reference frames, all blend modes
 - ✅ ISOBMFF container and bare codestreams; EXIF orientation
 - ✅ Embedded ICC profiles (decoded and exposed)
 - ✅ Animation: all frames with durations and loop count
@@ -52,7 +52,7 @@ Supported today:
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 
-- ⏳ Splines, spot-color rendering, extra-channel blend modes
+- ⏳ Spot-color rendering, extra-channel blend modes
 - ⏳ Progressive decode (LF frames), JPEG reconstruction
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 

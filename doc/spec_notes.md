@@ -107,6 +107,12 @@ from the previous canvas. Verified against djxl: animation_newtons_cradle
 is bit-exact on all 36 frames; animation_icos4d (lossy VarDCT, cropped
 alpha-blended frames) matches within max 11/255 across all 48 frames.
 
+Deviation fixed relative to jxlatte: its Spline constructor never stores
+the spline index, so jxlatte renders every spline of an image with the
+first spline's color/sigma coefficients. koni_jxl uses each spline's own
+coefficients; both animation_spline conformance cases match djxl within
+1/255 on all 60 frames.
+
 Deviation fixed relative to jxlatte: chroma upsampling (subsampling
 inversion) mirrors its neighbor taps at the *visible* subsampled extent,
 as libjxl's render pipeline does. jxlatte reads the padded DCT samples

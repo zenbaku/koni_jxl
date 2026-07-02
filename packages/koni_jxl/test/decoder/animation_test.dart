@@ -58,6 +58,28 @@ void main() {
   });
 
   group('conformance animations', () {
+    test('animation_spline: 60 frames, frame 0 within tolerance of djxl', () {
+      final input = File('${conformanceDir.path}/animation_spline/input.jxl');
+      final anim = JxlDecoder.decodeAnimation(
+          Uint8List.fromList(input.readAsBytesSync()));
+      expect(anim.frames.length, 60);
+      final refPath = '${Directory.systemTemp.path}/koni_anim_spline_ref.ppm';
+      final r =
+          Process.runSync('djxl', [input.path, refPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: r.stderr.toString());
+      final ref = PnmImage.parse(File(refPath).readAsBytesSync());
+      var mx = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(anim.frames.first.channels[c], ref.maxValue);
+        final theirs = ref.intPlanes![c];
+        for (var i = 0; i < ours.length; i++) {
+          final d = (ours[i] - theirs[i]).abs();
+          if (d > mx) mx = d;
+        }
+      }
+      expect(mx, lessThanOrEqualTo(2));
+    }, skip: haveConformance ? false : 'conformance not available');
+
     test('newtons_cradle: 36 frames, frame 0 bit-exact vs djxl', () {
       final input =
           File('${conformanceDir.path}/animation_newtons_cradle/input.jxl');
