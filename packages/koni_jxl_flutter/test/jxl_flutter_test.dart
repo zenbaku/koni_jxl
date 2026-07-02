@@ -11,6 +11,7 @@ void main() {
   final sample = File('test/assets/screentone_256_d0_e5.jxl');
   final alphaSample = File('test/assets/alpha_page_d0_e3.jxl');
   final lossySample = File('test/assets/color_cover_d1.0_e3.jxl');
+  final unsupportedSample = File('test/assets/noise.jxl');
 
   group('decodeJxlToUiImage', () {
     test('decodes a lossless grayscale page', () async {
@@ -27,11 +28,19 @@ void main() {
       image.dispose();
     });
 
-    test('propagates JxlUnsupportedException for VarDCT input', () async {
+    test('decodes a lossy (VarDCT) image', () async {
+      final image = await decodeJxlToUiImage(lossySample.readAsBytesSync());
+      expect(image.width, 1024);
+      expect(image.height, 1536);
+      image.dispose();
+    });
+
+    test('propagates JxlUnsupportedException for unsupported features',
+        () async {
       await expectLater(
-        decodeJxlToUiImage(lossySample.readAsBytesSync()),
+        decodeJxlToUiImage(unsupportedSample.readAsBytesSync()),
         throwsA(isA<JxlUnsupportedException>()
-            .having((e) => e.feature, 'feature', 'vardct')),
+            .having((e) => e.feature, 'feature', 'noise')),
       );
     });
   });
@@ -71,7 +80,8 @@ void main() {
     });
 
     test('reports decode errors through the image stream', () async {
-      final provider = JxlImageProvider.memory(lossySample.readAsBytesSync());
+      final provider =
+          JxlImageProvider.memory(unsupportedSample.readAsBytesSync());
       final completer = Completer<Object>();
       final stream = provider.resolve(ImageConfiguration.empty);
       late ImageStreamListener listener;

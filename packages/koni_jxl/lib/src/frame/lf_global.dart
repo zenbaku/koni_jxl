@@ -4,6 +4,8 @@ import '../exceptions.dart';
 import '../io/bit_reader.dart';
 import '../modular/ma_tree.dart';
 import '../modular/modular_stream.dart';
+import '../vardct/hf_block_context.dart';
+import '../vardct/lf_channel_correlation.dart';
 import 'frame.dart';
 import 'frame_flags.dart';
 import 'patches.dart';
@@ -38,7 +40,14 @@ final class LfGlobal {
       }
     }
     if (header.encoding == FrameFlags.vardct) {
-      throw JxlUnsupportedException('vardct');
+      lf.globalScale = reader.readU32(1, 11, 2049, 11, 4097, 12, 8193, 16);
+      lf.quantLF = reader.readU32(16, 0, 1, 5, 1, 8, 1, 16);
+      for (var i = 0; i < 3; i++) {
+        lf.scaledDequant[i] =
+            (1 << 16) * lf.lfDequant[i] / (lf.globalScale * lf.quantLF);
+      }
+      lf.hfBlockCtx = HfBlockContext.read(reader);
+      lf.lfChanCorr = LfChannelCorrelation.read(reader);
     }
 
     final hasGlobalTree = reader.readBool();
@@ -65,5 +74,10 @@ final class LfGlobal {
 
   final List<Patch> patches = [];
   final List<double> lfDequant = [1 / 4096, 1 / 512, 1 / 256];
+  int globalScale = 0;
+  int quantLF = 0;
+  final List<double> scaledDequant = [0, 0, 0];
+  HfBlockContext? hfBlockCtx;
+  LfChannelCorrelation lfChanCorr = const LfChannelCorrelation();
   late ModularStream globalModular;
 }

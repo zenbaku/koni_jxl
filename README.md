@@ -35,7 +35,11 @@ generated corpus and the official conformance test suite.
 Supported today:
 
 - ✅ Modular (lossless) still images — the format used by `cjxl -d 0`
-  (PNG→JXL conversions, manga/comic archives, screenshots, line art)
+  (PNG→JXL conversions, manga/comic archives, screenshots, line art) —
+  **bit-exact vs libjxl**
+- ✅ VarDCT (lossy) still images — all 27 transform types, adaptive
+  quantization, chroma-from-luma, XYB color, Gaborish + edge-preserving
+  filters (within ~1 RMSE of libjxl; see `doc/spec_notes.md`)
 - ✅ Grayscale, RGB, palette (incl. delta palette), alpha, 8/16-bit
 - ✅ All modular predictors incl. the self-correcting weighted predictor
 - ✅ RCT, palette, and squeeze (responsive) transforms
@@ -46,9 +50,9 @@ Supported today:
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 
-- ⏳ VarDCT (lossy) images — in progress (M5)
-- ⏳ Gaborish/EPF restoration filters, upsampling, noise, splines (M6)
+- ⏳ Upsampling, noise synthesis, splines, spot colors, YCbCr
 - ⏳ Animation (all frames), progressive decode, JPEG reconstruction
+- ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless
 manga page decodes in ~60 ms (effort 1 encodes) to ~530 ms (effort 7–9),

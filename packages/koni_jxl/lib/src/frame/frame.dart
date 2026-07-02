@@ -4,18 +4,28 @@ import '../io/bit_reader.dart';
 import '../modular/ma_tree.dart';
 import '../modular/modular_channel.dart';
 import '../modular/modular_stream.dart';
+import '../render/filters.dart';
 import '../util/image_buffer.dart';
 import '../util/math_helper.dart';
+import '../vardct/hf_coefficients.dart';
+import '../vardct/hf_global.dart';
+import '../vardct/hf_pass.dart';
+import '../vardct/vardct_inverter.dart';
 import 'frame_flags.dart';
 import 'frame_header.dart';
 import 'lf_global.dart';
+import 'lf_group.dart';
 import 'passes_info.dart';
 import 'toc.dart';
 
-/// Per-pass modular metadata: which not-yet-decoded global channels this
-/// pass carries (VarDCT HFPass data lands with M5).
+/// XYB channel remap: X, Y, B are stored as Y, X, (B - Y) in modular and
+/// decode order Y, X, B in VarDCT.
+const cMap = [1, 0, 2];
+
+/// Per-pass metadata: which not-yet-decoded global modular channels this
+/// pass carries, plus the VarDCT HFPass data.
 final class Pass {
-  Pass(Frame frame, int passIndex, int prevMinShift)
+  Pass(BitReader reader, Frame frame, int passIndex, int prevMinShift)
       : maxShift = passIndex > 0 ? prevMinShift : 3 {
     final PassesInfo passes = frame.header.passes;
     var n = -1;
@@ -38,15 +48,19 @@ final class Pass {
         }
       }
     }
+    hfPass = frame.header.encoding == FrameFlags.vardct
+        ? HfPass(reader, frame, passIndex)
+        : null;
   }
 
   final int maxShift;
   late final int minShift;
   late final List<ModularChannel?> replacedChannels;
+  HfPass? hfPass;
 }
 
 /// One frame of the codestream: header, TOC, and the decode orchestration
-/// across LF groups, passes and pass groups (modular path; VarDCT is M5).
+/// across LF groups, passes and pass groups (modular and VarDCT).
 final class Frame {
   Frame(this.globalReader, this.globalMetadata);
 
@@ -57,6 +71,9 @@ final class Frame {
   late Toc toc;
   late LfGlobal lfGlobal;
   MaTree? globalTree;
+  HfGlobal? hfGlobal;
+  List<Pass> passes = [];
+  List<LfGroup?> lfGroups = [];
 
   /// Frame bounds (mutable copies; upsampling adjusts them later).
   int boundsX0 = 0, boundsY0 = 0, boundsWidth = 0, boundsHeight = 0;
@@ -66,8 +83,6 @@ final class Frame {
 
   /// Per-channel frame output, sized to the padded frame size.
   late List<ImageBuffer> buffer;
-
-  List<ModularStream?> _lfGroupStreams = [];
 
   FrameHeader readFrameHeader() {
     globalReader.zeroPadToByte();
@@ -142,15 +157,51 @@ final class Frame {
           header.type == FrameFlags.skipProgressive) &&
       (header.duration != 0 || header.isLast);
 
+  ({int y, int x}) getGroupLocation(int groupID) =>
+      (y: groupID ~/ groupRowStride, x: groupID % groupRowStride);
+
+  ({int y, int x}) getLFGroupLocation(int lfGroupID) =>
+      (y: lfGroupID ~/ lfGroupRowStride, x: lfGroupID % lfGroupRowStride);
+
+  /// Position of this group within its LF group, in group units.
+  ({int y, int x}) groupPosInLFGroup(int lfGroupID, int groupID) {
+    final gr = getGroupLocation(groupID);
+    final lf = getLFGroupLocation(lfGroupID);
+    return (y: gr.y - (lf.y << 3), x: gr.x - (lf.x << 3));
+  }
+
+  LfGroup getLFGroupForGroup(int groupID) {
+    final pos = getGroupLocation(groupID);
+    return lfGroups[(pos.y >> 3) * lfGroupRowStride + (pos.x >> 3)]!;
+  }
+
+  ({int height, int width}) groupSize(int groupID) {
+    final pos = getGroupLocation(groupID);
+    final padded = paddedFrameSize;
+    final height = header.groupDim < padded.height - pos.y * header.groupDim
+        ? header.groupDim
+        : padded.height - pos.y * header.groupDim;
+    final width = header.groupDim < padded.width - pos.x * header.groupDim
+        ? header.groupDim
+        : padded.width - pos.x * header.groupDim;
+    return (height: height, width: width);
+  }
+
+  ({int height, int width}) lfGroupSize(int lfGroupID) {
+    final pos = getLFGroupLocation(lfGroupID);
+    final padded = paddedFrameSize;
+    final height = header.lfGroupDim < padded.height - pos.y * header.lfGroupDim
+        ? header.lfGroupDim
+        : padded.height - pos.y * header.lfGroupDim;
+    final width = header.lfGroupDim < padded.width - pos.x * header.lfGroupDim
+        ? header.lfGroupDim
+        : padded.width - pos.x * header.lfGroupDim;
+    return (height: height, width: width);
+  }
+
   void decodeFrame() {
-    if (header.encoding == FrameFlags.vardct) {
-      throw JxlUnsupportedException('vardct');
-    }
     if (header.doYCbCr || header.isSubsampled) {
       throw JxlUnsupportedException('ycbcr');
-    }
-    if (globalMetadata.xybEncoded) {
-      throw JxlUnsupportedException('modular-xyb');
     }
     if (globalMetadata.bitDepth.usesFloatSamples) {
       throw JxlUnsupportedException('float-samples');
@@ -163,35 +214,42 @@ final class Frame {
     if (header.upsampling != 1 || header.ecUpsampling.any((u) => u != 1)) {
       throw JxlUnsupportedException('upsampling');
     }
-    if (header.restorationFilter.gab) {
-      throw JxlUnsupportedException('gaborish');
-    }
-    if (header.restorationFilter.epfIterations > 0) {
-      throw JxlUnsupportedException('epf');
-    }
 
+    final isVarDCT = header.encoding == FrameFlags.vardct;
     lfGlobal = LfGlobal.read(toc.sectionReader(0), this);
     final padded = paddedFrameSize;
     final colors = colorChannelCount;
     final channelCount = colors + globalMetadata.extraChannels.length;
     buffer = [
       for (var c = 0; c < channelCount; c++)
-        ImageBuffer.int32(padded.height, padded.width),
+        c < colors && (globalMetadata.xybEncoded || isVarDCT)
+            ? ImageBuffer.float32(padded.height, padded.width)
+            : ImageBuffer.int32(padded.height, padded.width),
     ];
 
     _decodeLfGroups();
 
-    // The hfGlobal section (index 1 + numLfGroups) carries no bits for
-    // modular frames; Pass metadata is derived without reading.
-    final passes = <Pass>[];
+    final hfGlobalReader = toc.sectionReader(1 + numLfGroups);
+    if (isVarDCT) {
+      hfGlobal = HfGlobal(hfGlobalReader, this);
+    }
+    passes = [];
     for (var i = 0; i < header.passes.numPasses; i++) {
-      passes.add(Pass(this, i, i > 0 ? passes[i - 1].minShift : 0));
+      passes.add(
+          Pass(hfGlobalReader, this, i, i > 0 ? passes[i - 1].minShift : 0));
     }
 
-    _decodePassGroups(passes);
+    _decodePassGroups();
 
     lfGlobal.globalModular.applyTransforms();
     _copyOutModular();
+
+    if (header.restorationFilter.gab) {
+      performGabConvolution(this, colors);
+    }
+    if (header.restorationFilter.epfIterations > 0) {
+      performEdgePreservingFilter(this, colors);
+    }
   }
 
   void _decodeLfGroups() {
@@ -206,7 +264,7 @@ final class Frame {
       }
     }
 
-    _lfGroupStreams = List<ModularStream?>.filled(numLfGroups, null);
+    lfGroups = List<LfGroup?>.filled(numLfGroups, null);
     for (var lfGroupID = 0; lfGroupID < numLfGroups; lfGroupID++) {
       final reader = toc.sectionReader(1 + lfGroupID);
       final replaced = [
@@ -221,30 +279,33 @@ final class Frame {
         info.height = (info.height - info.originY).clamp(0, lfGroupHeight);
         info.width = (info.width - info.originX).clamp(0, lfGroupWidth);
       }
-      final stream = ModularStream.read(reader, modularContext,
-          streamIndex: 1 + numLfGroups + lfGroupID, channelArray: replaced);
-      stream.decodeChannels(reader);
-      _lfGroupStreams[lfGroupID] = stream;
+      lfGroups[lfGroupID] = LfGroup(reader, this, lfGroupID, replaced);
     }
 
     for (var lfGroupID = 0; lfGroupID < numLfGroups; lfGroupID++) {
       for (var j = 0; j < replacementIndices.length; j++) {
         final channel = globalModular.getChannel(replacementIndices[j]);
         channel.allocate();
-        final newChannel = _lfGroupStreams[lfGroupID]!.getChannel(j);
+        final newChannel = lfGroups[lfGroupID]!.modularLfGroup.getChannel(j);
         _copyChannelRegion(newChannel, channel);
       }
     }
   }
 
-  void _decodePassGroups(List<Pass> passes) {
+  void _decodePassGroups() {
     final numPasses = passes.length;
+    final isVarDCT = header.encoding == FrameFlags.vardct;
     final passGroups = List<List<ModularStream>>.generate(numPasses, (_) => []);
+    final hfGroups = List<List<HfCoefficients?>>.generate(
+        numPasses, (_) => List<HfCoefficients?>.filled(numGroups, null));
 
     for (var pass = 0; pass < numPasses; pass++) {
       for (var group = 0; group < numGroups; group++) {
         final reader =
             toc.sectionReader(2 + numLfGroups + pass * numGroups + group);
+        if (isVarDCT) {
+          hfGroups[pass][group] = HfCoefficients(reader, this, pass, group);
+        }
         final replaced = [
           for (final c in passes[pass].replacedChannels)
             if (c != null) ModularChannel.copy(c),
@@ -279,6 +340,18 @@ final class Frame {
         j++;
       }
     }
+
+    if (isVarDCT) {
+      final frameRows = [
+        for (var c = 0; c < 3; c++) buffer[c].floatRows(),
+      ];
+      for (var pass = 0; pass < numPasses; pass++) {
+        for (var group = 0; group < numGroups; group++) {
+          invertVarDCTGroup(hfGroups[pass][group]!,
+              pass > 0 ? hfGroups[pass - 1][group] : null, frameRows);
+        }
+      }
+    }
   }
 
   static void _copyChannelRegion(ModularChannel src, ModularChannel dest) {
@@ -292,15 +365,43 @@ final class Frame {
 
   void _copyOutModular() {
     final channels = lfGlobal.globalModular.channels;
+    final colors = colorChannelCount;
     for (var c = 0; c < channels.length; c++) {
-      final cOut = c + buffer.length - channels.length;
-      final out = buffer[cOut].intBuffer;
-      final outWidth = buffer[cOut].width;
+      final isModularColor =
+          header.encoding == FrameFlags.modular && c < colors;
+      final isModularXYB = globalMetadata.xybEncoded && isModularColor;
+      // X, Y, B is encoded as Y, X, (B - Y).
+      final cOut =
+          (isModularXYB ? cMap[c] : c) + buffer.length - channels.length;
       final src = channels[c].buffer!;
       final srcWidth = channels[c].width;
-      for (var y = 0; y < boundsHeight; y++) {
-        out.setRange(
-            y * outWidth, y * outWidth + boundsWidth, src, y * srcWidth);
+      if (isModularXYB && c == 2) {
+        final out = buffer[cOut].floatBuffer;
+        final outWidth = buffer[cOut].width;
+        final scaleFactor = lfGlobal.lfDequant[cOut];
+        final srcY = channels[0].buffer!;
+        for (var y = 0; y < boundsHeight; y++) {
+          for (var x = 0; x < boundsWidth; x++) {
+            out[y * outWidth + x] =
+                scaleFactor * (srcY[y * srcWidth + x] + src[y * srcWidth + x]);
+          }
+        }
+      } else if (buffer[cOut].isFloat) {
+        final out = buffer[cOut].floatBuffer;
+        final outWidth = buffer[cOut].width;
+        final scaleFactor = isModularXYB ? lfGlobal.lfDequant[cOut] : 1.0;
+        for (var y = 0; y < boundsHeight; y++) {
+          for (var x = 0; x < boundsWidth; x++) {
+            out[y * outWidth + x] = scaleFactor * src[y * srcWidth + x];
+          }
+        }
+      } else {
+        final out = buffer[cOut].intBuffer;
+        final outWidth = buffer[cOut].width;
+        for (var y = 0; y < boundsHeight; y++) {
+          out.setRange(
+              y * outWidth, y * outWidth + boundsWidth, src, y * srcWidth);
+        }
       }
     }
   }

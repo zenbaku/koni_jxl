@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'color/transfer_function.dart';
 import 'exceptions.dart';
 import 'frame/frame.dart';
 import 'frame/frame_flags.dart';
@@ -69,6 +70,7 @@ final class _DecoderState {
         ];
       }
       _computePatches(frame);
+      _performColorTransforms(frame);
 
       if (header.type == FrameFlags.regularFrame ||
           header.type == FrameFlags.skipProgressive) {
@@ -113,11 +115,35 @@ final class _DecoderState {
     if (canvas == null || canvas[0] == null) {
       throw const JxlInvalidBitstreamException('no visible frame decoded');
     }
+    // XYB frames come out of the color transform in linear RGB; convert to
+    // the image's tagged transfer function (what djxl outputs).
+    if (imageHeader.xybEncoded) {
+      final tf = TransferFunction.forTransfer(imageHeader.colorEncoding.tf);
+      for (var c = 0; c < imageHeader.colorChannelCount && c < 3; c++) {
+        final buf = canvas[c]!.floatBuffer;
+        for (var i = 0; i < buf.length; i++) {
+          buf[i] = tf.fromLinear(buf[i]);
+        }
+      }
+    }
     final oriented = [
       for (final plane in canvas)
         transposeBuffer(plane!, imageHeader.orientation),
     ];
     return JxlImage.internal(imageHeader, oriented, iccProfile);
+  }
+
+  /// Applies the XYB inverse (into linear RGB with the image's primaries)
+  /// in place on the frame's color channels.
+  void _performColorTransforms(Frame frame) {
+    if (!imageHeader.xybEncoded) return;
+    final bundle = imageHeader.colorEncoding;
+    final matrix =
+        imageHeader.opsinInverseMatrix.getMatrix(bundle.prim, bundle.white);
+    final rows = [
+      for (var c = 0; c < 3; c++) frame.buffer[c].floatRows(),
+    ];
+    matrix.invertXyb(rows, imageHeader.toneMapping.intensityTarget);
   }
 
   void _computePatches(Frame frame) {

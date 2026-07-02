@@ -25,3 +25,13 @@ int floorLog1p(int x) {
   final c = x.bitLength;
   return (x + 1) & x != 0 ? c - 1 : c;
 }
+
+/// Reflects an out-of-range coordinate back into [0, size).
+@pragma('vm:prefer-inline')
+int mirrorCoordinate(int coordinate, int size) {
+  while (coordinate < 0 || coordinate >= size) {
+    final tc = ~coordinate;
+    coordinate = tc >= 0 ? tc : (size << 1) + tc;
+  }
+  return coordinate;
+}

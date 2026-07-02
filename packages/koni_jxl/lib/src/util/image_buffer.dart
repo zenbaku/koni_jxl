@@ -83,4 +83,18 @@ final class ImageBuffer {
   }
 
   void castToInt(int depth) => castToIntWithMax((1 << depth) - 1);
+
+  /// Row views over the float buffer (shared storage, no copies). Rebuilt on
+  /// each call; cache locally in hot code.
+  List<Float32List> floatRows() {
+    final buf = floatBuffer;
+    return List.generate(
+        height, (y) => Float32List.sublistView(buf, y * width, (y + 1) * width),
+        growable: false);
+  }
 }
+
+/// A free-standing jagged float matrix (Java-style `float[h][w]`), used by
+/// the VarDCT block code where jxlatte uses nested arrays.
+List<Float32List> floatMatrix(int height, int width) =>
+    List.generate(height, (_) => Float32List(width), growable: false);
