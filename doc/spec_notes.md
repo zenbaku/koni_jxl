@@ -49,3 +49,11 @@ encoded with the header's *enum* transfer function. Files whose color is
 only described by an embedded ICC profile (`want_icc`) are decoded as if
 tagged sRGB; a full ICC-driven output transform is out of scope for v1
 (the raw ICC profile is exposed on `JxlImage.iccProfile`).
+
+## Performance status
+
+Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding is
+currently much slower (multi-second for multi-megapixel pages): the
+dominant costs are the naive O(N^2) large-block IDCT (the 1D transforms
+should become recursive O(N log N), as in libjxl) and the EPF inner loop.
+Tracked as the main pre-1.0 optimization work.

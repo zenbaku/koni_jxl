@@ -40,6 +40,7 @@ Supported today:
 - ✅ VarDCT (lossy) still images — all 27 transform types, adaptive
   quantization, chroma-from-luma, XYB color, Gaborish + edge-preserving
   filters (within ~1 RMSE of libjxl; see `doc/spec_notes.md`)
+- ✅ Upsampling (2x/4x/8x), noise synthesis, YCbCr + chroma subsampling
 - ✅ Grayscale, RGB, palette (incl. delta palette), alpha, 8/16-bit
 - ✅ All modular predictors incl. the self-correcting weighted predictor
 - ✅ RCT, palette, and squeeze (responsive) transforms
@@ -50,13 +51,16 @@ Supported today:
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 
-- ⏳ Upsampling, noise synthesis, splines, spot colors, YCbCr
-- ⏳ Animation (all frames), progressive decode, JPEG reconstruction
+- ⏳ Splines, spot-color rendering, extra-channel blend modes
+- ⏳ Animation (all frames), progressive decode (LF frames), JPEG
+  reconstruction
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless
 manga page decodes in ~60 ms (effort 1 encodes) to ~530 ms (effort 7–9),
-roughly 3.5× single-threaded `djxl`.
+roughly 3.5× single-threaded `djxl`. Lossy (VarDCT) decoding is currently
+much slower (seconds for large pages — the naive O(N²) IDCT and EPF are
+the planned optimization targets); prefer lossless sources for now.
 
 ## Development
 
