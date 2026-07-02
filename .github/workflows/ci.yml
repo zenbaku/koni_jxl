@@ -10,11 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dart-lang/setup-dart@v1
+      - uses: subosito/flutter-action@v2
         with:
-          sdk: stable
-      - run: dart pub get
-      - run: dart format --output=none --set-exit-code packages/koni_jxl
+          channel: stable
+      - run: flutter pub get
+      - run: dart format --output=none --set-exit-code packages/koni_jxl packages/koni_jxl_flutter
       - run: dart analyze --fatal-infos
       - run: dart test
         working-directory: packages/koni_jxl
+      - run: flutter test
+        working-directory: packages/koni_jxl_flutter
+      - run: flutter test
+        working-directory: packages/koni_jxl_flutter/example

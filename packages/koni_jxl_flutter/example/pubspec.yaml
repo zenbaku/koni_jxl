@@ -1,0 +1,24 @@
+name: koni_jxl_example
+description: Demo app for koni_jxl_flutter — pure Dart JPEG XL rendering.
+publish_to: none
+version: 0.1.0
+environment:
+  sdk: ^3.6.0
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  koni_jxl_flutter: ^0.1.0-dev
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/manga_page.jxl
+    - assets/alpha.jxl
+    - assets/palette.jxl

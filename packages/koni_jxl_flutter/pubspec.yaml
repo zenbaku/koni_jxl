@@ -1,0 +1,20 @@
+name: koni_jxl_flutter
+description: >-
+  Flutter bindings for koni_jxl: display JPEG XL (.jxl) images with a pure
+  Dart decoder — no native dependencies, all platforms.
+version: 0.1.0-dev
+repository: https://github.com/zenbaku/koni_jxl
+environment:
+  sdk: ^3.6.0
+  flutter: '>=3.22.0'
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  koni_jxl: ^0.1.0-dev
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.0.0

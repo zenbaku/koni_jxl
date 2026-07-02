@@ -4,3 +4,5 @@ environment:
   sdk: ^3.6.0
 workspace:
   - packages/koni_jxl
+  - packages/koni_jxl_flutter
+  - packages/koni_jxl_flutter/example
