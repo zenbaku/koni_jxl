@@ -222,13 +222,15 @@ ContextTree learnContextTree(Int32List props, Int32List tokens,
 
 /// Serializes the tree in the decoder's MA-tree format: a 6-context entropy
 /// stream carrying, per node in BFS order, (property+1, value) for inner
-/// nodes and (0, predictor, offset, mulLog, mulBits) for leaves.
-void serializeContextTree(BitWriter w, ContextTree tree) {
+/// nodes and (0, predictor, offset, mulLog, mulBits) for leaves. [predictor]
+/// is the decoder predictor id every leaf uses (5 = clamped gradient,
+/// 6 = self-correcting weighted).
+void serializeContextTree(BitWriter w, ContextTree tree, int predictor) {
   final tokens = EntropyWriter(6);
   for (final node in tree._nodesInOrder) {
     if (node.propIndex < 0) {
       tokens.write(1, 0); // property + 1 == 0 -> leaf
-      tokens.write(2, 5); // predictor: clamped gradient
+      tokens.write(2, predictor);
       tokens.write(3, 0); // offset
       tokens.write(4, 0); // mul_log
       tokens.write(5, 0); // mul_bits
