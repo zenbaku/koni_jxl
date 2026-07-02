@@ -162,7 +162,8 @@ final class _DecoderState {
       final bundle = imageHeader.colorEncoding;
       final matrix =
           imageHeader.opsinInverseMatrix.getMatrix(bundle.prim, bundle.white);
-      matrix.invertXyb(rows, imageHeader.toneMapping.intensityTarget);
+      matrix.invertXyb(frame.buffer[0].floatRows, frame.buffer[1].floatRows,
+          frame.buffer[2].floatRows, imageHeader.toneMapping.intensityTarget);
     }
     if (frame.header.doYCbCr) {
       final height = frame.buffer[0].height;

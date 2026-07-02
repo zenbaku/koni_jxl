@@ -44,7 +44,6 @@ final class HfCoefficients {
     final nonZeroes = Int32List(3 * 32 * 32);
     stream = EntropyStream.clone(hfPass.contextStream);
     quantizedCoeffs = [];
-    dequantHFCoeff = [];
     coeffHeight = List.filled(3, 0);
     coeffWidth = List.filled(3, 0);
     for (var c = 0; c < 3; c++) {
@@ -53,8 +52,10 @@ final class HfCoefficients {
       coeffHeight[c] = sY;
       coeffWidth[c] = sX;
       quantizedCoeffs.add(Int32List(sY * sX));
-      dequantHFCoeff.add(floatMatrix(sY, sX));
     }
+    dequantHFCoeff0 = floatMatrix(coeffHeight[0], coeffWidth[0]);
+    dequantHFCoeff1 = floatMatrix(coeffHeight[1], coeffWidth[1]);
+    dequantHFCoeff2 = floatMatrix(coeffHeight[2], coeffWidth[2]);
     final pos = frame.groupPosInLFGroup(lfg.lfGroupID, groupID);
     groupPosY = pos.y << 5;
     groupPosX = pos.x << 5;
@@ -145,8 +146,13 @@ final class HfCoefficients {
 
   /// Per channel: flat (coeffHeight x coeffWidth) arrays.
   late final List<Int32List> quantizedCoeffs;
-  late List<List<Float32List>> dequantHFCoeff;
+  late final List<Float32List> dequantHFCoeff0;
+  late final List<Float32List> dequantHFCoeff1;
+  late final List<Float32List> dequantHFCoeff2;
   late final List<int> coeffHeight;
+
+  List<Float32List> dequantHFCoeffAt(int c) =>
+      c == 0 ? dequantHFCoeff0 : (c == 1 ? dequantHFCoeff1 : dequantHFCoeff2);
   late final List<int> coeffWidth;
   late final int groupPosY;
   late final int groupPosX;
@@ -205,7 +211,8 @@ final class HfCoefficients {
       globalScale,
       globalScale * math.pow(0.8, header.bqmScale - 2.0).toDouble(),
     ];
-    final weights = frame.hfGlobal!.weights;
+    final weightsFlat = frame.hfGlobal!.weightsFlat;
+    final weightsWidth = frame.hfGlobal!.weightsWidth;
     final qbclut = [
       [-matrix.quantBias[0], 0.0, matrix.quantBias[0]],
       [-matrix.quantBias[1], 0.0, matrix.quantBias[1]],
@@ -220,7 +227,8 @@ final class HfCoefficients {
       final groupY = posY - groupPosY;
       final groupX = posX - groupPosX;
       final flip = tt.flip;
-      final w2 = weights[tt.parameterIndex];
+      final w2 = weightsFlat[tt.parameterIndex];
+      final w3w = weightsWidth[tt.parameterIndex];
       for (var c = 0; c < 3; c++) {
         final sGroupY = groupY >> header.jpegUpsamplingY[c];
         final sGroupX = groupX >> header.jpegUpsamplingX[c];
@@ -235,6 +243,7 @@ final class HfCoefficients {
         final qbc = qbclut[c];
         final qc = quantizedCoeffs[c];
         final qw = coeffWidth[c];
+        final dq = dequantHFCoeffAt(c);
         for (var y = 0; y < tt.pixelHeight; y++) {
           for (var x = 0; x < tt.pixelWidth; x++) {
             if (y < tt.dctSelectHeight && x < tt.dctSelectWidth) continue;
@@ -246,7 +255,7 @@ final class HfCoefficients {
                 : coeff - matrix.quantBiasNumerator / coeff;
             final wy = flip ? x : y;
             final wx = x ^ y ^ wy;
-            dequantHFCoeff[c][pY][pX] = quant * sfc * w3[wy][wx];
+            dq[pY][pX] = quant * sfc * w3[wy * w3w + wx];
           }
         }
       }
@@ -264,6 +273,9 @@ final class HfCoefficients {
     final bFactorHF = bFromY.buffer!;
     final xFactors = floatMatrix(xFromY.height, corrW);
     final bFactors = floatMatrix(bFromY.height, corrW);
+    final d0 = dequantHFCoeff0;
+    final d1 = dequantHFCoeff1;
+    final d2 = dequantHFCoeff2;
     for (var i = 0; i < blockIncluded.length; i++) {
       if (!blockIncluded[i]) continue;
       final posY = meta.blockY[i];
@@ -293,9 +305,9 @@ final class HfCoefficients {
             kX = xF[fx];
             kB = bF[fx];
           }
-          final dequantY = dequantHFCoeff[1][y & 0xFF][x & 0xFF];
-          dequantHFCoeff[0][y & 0xFF][x & 0xFF] += kX * dequantY;
-          dequantHFCoeff[2][y & 0xFF][x & 0xFF] += kB * dequantY;
+          final dequantY = d1[y & 0xFF][x & 0xFF];
+          d0[y & 0xFF][x & 0xFF] += kX * dequantY;
+          d2[y & 0xFF][x & 0xFF] += kB * dequantY;
         }
       }
     }
@@ -324,8 +336,8 @@ final class HfCoefficients {
         final pixelGroupX = sGroupX << 3;
         final sLfgY = posY >> header.jpegUpsamplingY[c];
         final sLfgX = posX >> header.jpegUpsamplingX[c];
-        final dqlf = lfg.lfCoeff!.dequantLFCoeff[c];
-        final dq = dequantHFCoeff[c];
+        final dqlf = lfg.lfCoeff!.dequantLFCoeffAt(c);
+        final dq = dequantHFCoeffAt(c);
         forwardDCT2D(dqlf, dq, sLfgY, sLfgX, pixelGroupY, pixelGroupX,
             tt.dctSelectHeight, tt.dctSelectWidth, scratch0, scratch1);
         for (var y = 0; y < tt.dctSelectHeight; y++) {

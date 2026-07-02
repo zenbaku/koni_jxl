@@ -38,8 +38,8 @@ void main() {
         }
       }
       final dest = floatMatrix(h, w);
-      final s0 = floatMatrix(64, 64);
-      final s1 = floatMatrix(64, 64);
+      final s0 = floatMatrix(256, 256);
+      final s1 = floatMatrix(256, 256);
       inverseDCT2D(coeffs, dest, 0, 0, 0, 0, h, w, s0, s1, false);
 
       // Naive: rows of coeffs are IDCT'd along... follow the same data flow:
@@ -74,8 +74,8 @@ void main() {
       }
       final coeffs = floatMatrix(h, w);
       final dest = floatMatrix(h, w);
-      final s0 = floatMatrix(64, 64);
-      final s1 = floatMatrix(64, 64);
+      final s0 = floatMatrix(256, 256);
+      final s1 = floatMatrix(256, 256);
       forwardDCT2D(src, coeffs, 0, 0, 0, 0, h, w, s0, s1);
       inverseDCT2D(coeffs, dest, 0, 0, 0, 0, h, w, s0, s1, false);
       for (var y = 0; y < h; y++) {

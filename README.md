@@ -57,10 +57,10 @@ Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless
-manga page decodes in ~60 ms (effort 1 encodes) to ~530 ms (effort 7–9),
-roughly 3.5× single-threaded `djxl`. Lossy (VarDCT) decoding is currently
-much slower (seconds for large pages — the naive O(N²) IDCT and EPF are
-the planned optimization targets); prefer lossless sources for now.
+manga page decodes in ~60 ms (effort 1 encodes) to ~530 ms (effort 7–9).
+Lossy (VarDCT) pages decode in ~0.6 s (color photo) to ~1.7 s (worst-case
+dense screentone at effort 7), using a recursive O(N log N) DCT with a
+fused 8×8 kernel.
 
 ## Development
 

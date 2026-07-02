@@ -74,7 +74,8 @@ final class OpsinInverseMatrix {
 
   /// Inverts XYB to linear RGB in place over the given channel rows
   /// (X, Y, B order in; R, G, B out).
-  void invertXyb(List<List<Float32List>> buffer, double intensityTarget) {
+  void invertXyb(List<Float32List> xRows, List<Float32List> yRows,
+      List<Float32List> bRows, double intensityTarget) {
     final itScale = 255.0 / intensityTarget;
     final scaledMatrix = Float32List(9);
     for (var i = 0; i < 9; i++) {
@@ -86,9 +87,6 @@ final class OpsinInverseMatrix {
     final cob0 = -_cbrt(opsinBias[0]);
     final cob1 = -_cbrt(opsinBias[1]);
     final cob2 = -_cbrt(opsinBias[2]);
-    final xRows = buffer[0];
-    final yRows = buffer[1];
-    final bRows = buffer[2];
     for (var y = 0; y < xRows.length; y++) {
       final xRow = xRows[y];
       final yRow = yRows[y];

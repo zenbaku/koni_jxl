@@ -52,8 +52,15 @@ tagged sRGB; a full ICC-driven output transform is out of scope for v1
 
 ## Performance status
 
-Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding is
-currently much slower (multi-second for multi-megapixel pages): the
-dominant costs are the naive O(N^2) large-block IDCT (the 1D transforms
-should become recursive O(N log N), as in libjxl) and the EPF inner loop.
-Tracked as the main pre-1.0 optimization work.
+Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a
+3.4-megapixel page takes ~0.6-1.7 s single-threaded (djxl: ~0.1 s): the
+inverse DCT uses Lee's O(N log N) recursion with a fused unrolled 8x8
+kernel, and the EPF runs specialized interior row kernels. Remaining gap
+vs libjxl is SIMD and threading, out of scope for pure Dart.
+
+A hard-won Dart AOT lesson encoded in the hot paths: never derive a
+`List<Float32List>` used in a hot loop from a nested
+`List<List<Float32List>>` (or similar generic container) inside the hot
+function - pass the per-channel row lists as direct parameters from a
+call site where the concrete list class is statically known. Violating
+this costs 5-20x in pixel loops.

@@ -20,13 +20,16 @@ void _invertAFV(
     int ppgX,
     int ppfY,
     int ppfX,
-    List<List<Float32List>> scratchBlock) {
-  scratchBlock[0][0][0] =
+    List<Float32List> s0,
+    List<Float32List> s1,
+    List<Float32List> s2,
+    List<Float32List> s3) {
+  s0[0][0] =
       (coeffs[ppgY][ppgX] + coeffs[ppgY + 1][ppgX] + coeffs[ppgY][ppgX + 1]) *
           4.0;
   for (var iy = 0; iy < 4; iy++) {
     for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
-      scratchBlock[0][iy][ix] = coeffs[ppgY + iy * 2][ppgX + ix * 2];
+      s0[iy][ix] = coeffs[ppgY + iy * 2][ppgX + ix * 2];
     }
   }
   final flipY = tt.type == 16 || tt.type == 17 ? 1 : 0; // AFV2, AFV3
@@ -38,46 +41,43 @@ void _invertAFV(
       for (var j = 0; j < 16; j++) {
         final jy = j >> 2;
         final jx = j & 3;
-        sample += scratchBlock[0][jy][jx] * afvBasis[j * 16 + iy * 4 + ix];
+        sample += s0[jy][jx] * afvBasis[j * 16 + iy * 4 + ix];
       }
-      scratchBlock[1][iy][ix] = sample;
+      s1[iy][ix] = sample;
     }
   }
   for (var iy = 0; iy < 4; iy++) {
     for (var ix = 0; ix < 4; ix++) {
       buffer[ppfY + flipY * 4 + iy][ppfX + flipX * 4 + ix] =
-          scratchBlock[1][flipY == 1 ? 3 - iy : iy][flipX == 1 ? 3 - ix : ix];
+          s1[flipY == 1 ? 3 - iy : iy][flipX == 1 ? 3 - ix : ix];
     }
   }
   // SPEC: watch signs here.
-  scratchBlock[0][0][0] =
+  s0[0][0] =
       coeffs[ppgY][ppgX] + coeffs[ppgY + 1][ppgX] - coeffs[ppgY][ppgX + 1];
   for (var iy = 0; iy < 4; iy++) {
     for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
-      scratchBlock[0][iy][ix] = coeffs[ppgY + iy * 2][ppgX + ix * 2 + 1];
+      s0[iy][ix] = coeffs[ppgY + iy * 2][ppgX + ix * 2 + 1];
     }
   }
-  inverseDCT2D(scratchBlock[0], scratchBlock[1], 0, 0, 0, 0, 4, 4,
-      scratchBlock[2], scratchBlock[3], false);
+  inverseDCT2D(s0, s1, 0, 0, 0, 0, 4, 4, s2, s3, false);
   for (var iy = 0; iy < 4; iy++) {
     for (var ix = 0; ix < 4; ix++) {
       // Transposed intentionally.
       buffer[ppfY + flipY * 4 + iy][ppfX + (flipX == 1 ? 0 : 4) + ix] =
-          scratchBlock[1][ix][iy];
+          s1[ix][iy];
     }
   }
-  scratchBlock[0][0][0] = coeffs[ppgY][ppgX] - coeffs[ppgY + 1][ppgX];
+  s0[0][0] = coeffs[ppgY][ppgX] - coeffs[ppgY + 1][ppgX];
   for (var iy = 0; iy < 4; iy++) {
     for (var ix = iy == 0 ? 1 : 0; ix < 8; ix++) {
-      scratchBlock[0][iy][ix] = coeffs[ppgY + 1 + iy * 2][ppgX + ix];
+      s0[iy][ix] = coeffs[ppgY + 1 + iy * 2][ppgX + ix];
     }
   }
-  inverseDCT2D(scratchBlock[0], scratchBlock[1], 0, 0, 0, 0, 4, 8,
-      scratchBlock[2], scratchBlock[3], false);
+  inverseDCT2D(s0, s1, 0, 0, 0, 0, 4, 8, s2, s3, false);
   for (var iy = 0; iy < 4; iy++) {
     for (var ix = 0; ix < 8; ix++) {
-      buffer[ppfY + (flipY == 1 ? 0 : 4) + iy][ppfX + ix] =
-          scratchBlock[1][iy][ix];
+      buffer[ppfY + (flipY == 1 ? 0 : 4) + iy][ppfX + ix] = s1[iy][ix];
     }
   }
 }
@@ -103,8 +103,17 @@ void _auxDCT2(List<Float32List> coeffs, List<Float32List> result, int pY,
 /// Accumulates previous-pass coefficients, bakes dequantized coefficients,
 /// and inverse-transforms every varblock of this group into the frame's
 /// float channel rows.
-void invertVarDCTGroup(HfCoefficients hf, HfCoefficients? prev,
-    List<List<Float32List>> frameRows, List<List<Float32List>> scratchBlock) {
+void invertVarDCTGroup(
+    HfCoefficients hf,
+    HfCoefficients? prev,
+    List<Float32List> fb0,
+    List<Float32List> fb1,
+    List<Float32List> fb2,
+    List<Float32List> s0,
+    List<Float32List> s1,
+    List<Float32List> s2,
+    List<Float32List> s3,
+    List<Float32List> s4) {
   final frame = hf.frame;
   final header = frame.header;
   final meta = hf.lfg.hfMetadata!;
@@ -144,7 +153,6 @@ void invertVarDCTGroup(HfCoefficients hf, HfCoefficients? prev,
   final groupLocY = groupLoc.y << 8;
   final groupLocX = groupLoc.x << 8;
 
-  final coeffs = hf.dequantHFCoeff;
   for (var i = 0; i < hf.blockIncluded.length; i++) {
     if (!hf.blockIncluded[i]) continue;
     final posY = meta.blockY[i];
@@ -163,90 +171,85 @@ void invertVarDCTGroup(HfCoefficients hf, HfCoefficients? prev,
       final ppgX = sGroupX << 3;
       final ppfY = ppgY + (groupLocY >> header.jpegUpsamplingY[c]);
       final ppfX = ppgX + (groupLocX >> header.jpegUpsamplingX[c]);
-      final cc = coeffs[c];
-      final fb = frameRows[c];
+      final cc = hf.dequantHFCoeffAt(c);
+      final fb = c == 0 ? fb0 : (c == 1 ? fb1 : fb2);
       switch (tt.transformMethod) {
         case TransformMethod.dct:
           inverseDCT2D(cc, fb, ppgY, ppgX, ppfY, ppfX, tt.pixelHeight,
-              tt.pixelWidth, scratchBlock[0], scratchBlock[1], false);
+              tt.pixelWidth, s0, s1, false);
         case TransformMethod.dct8x4:
           final coeff0 = cc[ppgY][ppgX];
           final coeff1 = cc[ppgY + 1][ppgX];
           final lfs = [coeff0 + coeff1, coeff0 - coeff1];
           for (var x = 0; x < 2; x++) {
-            scratchBlock[0][0][0] = lfs[x];
+            s0[0][0] = lfs[x];
             for (var iy = 0; iy < 4; iy++) {
               for (var ix = iy == 0 ? 1 : 0; ix < 8; ix++) {
-                scratchBlock[0][iy][ix] = cc[ppgY + x + iy * 2][ppgX + ix];
+                s0[iy][ix] = cc[ppgY + x + iy * 2][ppgX + ix];
               }
             }
-            inverseDCT2D(scratchBlock[0], fb, 0, 0, ppfY, ppfX + (x << 2), 4, 8,
-                scratchBlock[1], scratchBlock[2], true);
+            inverseDCT2D(
+                s0, fb, 0, 0, ppfY, ppfX + (x << 2), 4, 8, s1, s2, true);
           }
         case TransformMethod.dct4x8:
           final coeff0 = cc[ppgY][ppgX];
           final coeff1 = cc[ppgY + 1][ppgX];
           final lfs = [coeff0 + coeff1, coeff0 - coeff1];
           for (var y = 0; y < 2; y++) {
-            scratchBlock[0][0][0] = lfs[y];
+            s0[0][0] = lfs[y];
             for (var iy = 0; iy < 4; iy++) {
               for (var ix = iy == 0 ? 1 : 0; ix < 8; ix++) {
-                scratchBlock[0][iy][ix] = cc[ppgY + y + iy * 2][ppgX + ix];
+                s0[iy][ix] = cc[ppgY + y + iy * 2][ppgX + ix];
               }
             }
-            inverseDCT2D(scratchBlock[0], fb, 0, 0, ppfY + (y << 2), ppfX, 4, 8,
-                scratchBlock[1], scratchBlock[2], false);
+            inverseDCT2D(
+                s0, fb, 0, 0, ppfY + (y << 2), ppfX, 4, 8, s1, s2, false);
           }
         case TransformMethod.afv:
-          _invertAFV(cc, fb, tt, ppgY, ppgX, ppfY, ppfX, scratchBlock);
+          _invertAFV(cc, fb, tt, ppgY, ppgX, ppfY, ppfX, s0, s1, s2, s3);
         case TransformMethod.dct2:
-          _auxDCT2(cc, scratchBlock[0], ppgY, ppgX, 0, 0, 2);
-          _auxDCT2(scratchBlock[0], scratchBlock[1], 0, 0, 0, 0, 4);
-          _auxDCT2(scratchBlock[1], fb, 0, 0, ppfY, ppfX, 8);
+          _auxDCT2(cc, s0, ppgY, ppgX, 0, 0, 2);
+          _auxDCT2(s0, s1, 0, 0, 0, 0, 4);
+          _auxDCT2(s1, fb, 0, 0, ppfY, ppfX, 8);
         case TransformMethod.hornuss:
-          _auxDCT2(cc, scratchBlock[1], ppgY, ppgX, 0, 0, 2);
+          _auxDCT2(cc, s1, ppgY, ppgX, 0, 0, 2);
           for (var y = 0; y < 2; y++) {
             for (var x = 0; x < 2; x++) {
-              final blockLF = scratchBlock[1][y][x];
+              final blockLF = s1[y][x];
               var residual = 0.0;
               for (var iy = 0; iy < 4; iy++) {
                 for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
                   residual += cc[ppgY + y + iy * 2][ppgX + x + ix * 2];
                 }
               }
-              scratchBlock[0][4 * y + 1][4 * x + 1] =
-                  blockLF - residual * 0.0625;
+              s0[4 * y + 1][4 * x + 1] = blockLF - residual * 0.0625;
               for (var iy = 0; iy < 4; iy++) {
                 for (var ix = 0; ix < 4; ix++) {
                   if (ix == 1 && iy == 1) continue;
-                  scratchBlock[0][y * 4 + iy][x * 4 + ix] =
-                      cc[ppgY + y + iy * 2][ppgX + x + ix * 2] +
-                          scratchBlock[0][4 * y + 1][4 * x + 1];
+                  s0[y * 4 + iy][x * 4 + ix] = cc[ppgY + y + iy * 2]
+                          [ppgX + x + ix * 2] +
+                      s0[4 * y + 1][4 * x + 1];
                 }
               }
-              scratchBlock[0][4 * y][4 * x] = cc[ppgY + y + 2][ppgX + x + 2] +
-                  scratchBlock[0][4 * y + 1][4 * x + 1];
+              s0[4 * y][4 * x] =
+                  cc[ppgY + y + 2][ppgX + x + 2] + s0[4 * y + 1][4 * x + 1];
             }
           }
-          _layBlock(scratchBlock[0], fb, 0, 0, ppfY, ppfX, tt.pixelHeight,
-              tt.pixelWidth);
+          _layBlock(s0, fb, 0, 0, ppfY, ppfX, tt.pixelHeight, tt.pixelWidth);
         case TransformMethod.dct4:
-          _auxDCT2(cc, scratchBlock[4], ppgY, ppgX, 0, 0, 2);
+          _auxDCT2(cc, s4, ppgY, ppgX, 0, 0, 2);
           for (var y = 0; y < 2; y++) {
             for (var x = 0; x < 2; x++) {
-              scratchBlock[0][0][0] = scratchBlock[4][y][x];
+              s0[0][0] = s4[y][x];
               for (var iy = 0; iy < 4; iy++) {
                 for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
-                  scratchBlock[0][iy][ix] =
-                      cc[ppgY + y + iy * 2][ppgX + x + ix * 2];
+                  s0[iy][ix] = cc[ppgY + y + iy * 2][ppgX + x + ix * 2];
                 }
               }
-              inverseDCT2D(scratchBlock[0], scratchBlock[1], 0, 0, 0, 0, 4, 4,
-                  scratchBlock[2], scratchBlock[3], true);
+              inverseDCT2D(s0, s1, 0, 0, 0, 0, 4, 4, s2, s3, true);
               for (var iy = 0; iy < 4; iy++) {
                 for (var ix = 0; ix < 4; ix++) {
-                  fb[ppfY + 4 * y + iy][ppfX + 4 * x + ix] =
-                      scratchBlock[1][iy][ix];
+                  fb[ppfY + 4 * y + iy][ppfX + 4 * x + ix] = s1[iy][ix];
                 }
               }
             }

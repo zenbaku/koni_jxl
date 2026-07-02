@@ -318,11 +318,30 @@ final class HfGlobal {
     for (var i = 0; i < 17; i++) {
       _generateWeights(i);
     }
+    // Flatten each weight matrix; the dequant hot loop indexes these.
+    weightsFlat = List.generate(17, (_) => List<Float32List?>.filled(3, null));
+    weightsWidth = List<int>.filled(17, 0);
+    for (var i = 0; i < 17; i++) {
+      for (var ch = 0; ch < 3; ch++) {
+        final w = weights[i][ch];
+        if (w == null) continue;
+        final rows = w.length;
+        final cols = w[0].length;
+        weightsWidth[i] = cols;
+        final flat = Float32List(rows * cols);
+        for (var y = 0; y < rows; y++) {
+          flat.setRange(y * cols, (y + 1) * cols, w[y]);
+        }
+        weightsFlat[i][ch] = flat;
+      }
+    }
     numHfPresets = 1 + reader.readBits(ceilLog1p(frame.numGroups - 1));
   }
 
   late List<DctParams> params;
   late final List<List<List<Float32List>?>> weights;
+  late final List<List<Float32List?>> weightsFlat;
+  late final List<int> weightsWidth;
   late final int numHfPresets;
 
   static List<List<double>> _readDCTParams(BitReader reader) {

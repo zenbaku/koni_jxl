@@ -85,7 +85,9 @@ final class LfCoefficients {
     if (adaptiveSmoothing) {
       coeff = _adaptiveSmooth(coeff, scaledDequant);
     }
-    dequantLFCoeff = coeff;
+    dequantLFCoeff0 = List<Float32List>.of(coeff[0], growable: false);
+    dequantLFCoeff1 = List<Float32List>.of(coeff[1], growable: false);
+    dequantLFCoeff2 = List<Float32List>.of(coeff[2], growable: false);
 
     // Populate LF context indices.
     final hfctx = frame.lfGlobal.hfBlockCtx!;
@@ -97,8 +99,13 @@ final class LfCoefficients {
     }
   }
 
-  late final List<List<Float32List>> dequantLFCoeff;
+  late final List<Float32List> dequantLFCoeff0;
+  late final List<Float32List> dequantLFCoeff1;
+  late final List<Float32List> dequantLFCoeff2;
   late final Int32List lfIndex;
+
+  List<Float32List> dequantLFCoeffAt(int c) =>
+      c == 0 ? dequantLFCoeff0 : (c == 1 ? dequantLFCoeff1 : dequantLFCoeff2);
 
   static List<List<Float32List>> _adaptiveSmooth(
       List<List<Float32List>> coeff, List<double> scaledDequant) {

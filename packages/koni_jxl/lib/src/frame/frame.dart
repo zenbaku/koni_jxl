@@ -410,15 +410,27 @@ final class Frame {
     const timings = bool.fromEnvironment('jxl.timings');
     final sw2 = timings ? (Stopwatch()..start()) : null;
     if (isVarDCT) {
-      final frameRows = [
-        for (var c = 0; c < 3; c++) buffer[c].floatRows,
-      ];
-      final scratch =
-          List.generate(5, (_) => floatMatrix(256, 256), growable: false);
+      final fb0 = buffer[0].floatRows;
+      final fb1 = buffer[1].floatRows;
+      final fb2 = buffer[2].floatRows;
+      final s0 = floatMatrix(256, 256);
+      final s1 = floatMatrix(256, 256);
+      final s2 = floatMatrix(256, 256);
+      final s3 = floatMatrix(256, 256);
+      final s4 = floatMatrix(256, 256);
       for (var pass = 0; pass < numPasses; pass++) {
         for (var group = 0; group < numGroups; group++) {
-          invertVarDCTGroup(hfGroups[pass][group]!,
-              pass > 0 ? hfGroups[pass - 1][group] : null, frameRows, scratch);
+          invertVarDCTGroup(
+              hfGroups[pass][group]!,
+              pass > 0 ? hfGroups[pass - 1][group] : null,
+              fb0,
+              fb1,
+              fb2,
+              s0,
+              s1,
+              s2,
+              s3,
+              s4);
         }
       }
       if (sw2 != null) {

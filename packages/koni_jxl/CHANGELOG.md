@@ -11,6 +11,8 @@
 - VarDCT (lossy) still images decode within ~1 RMSE of libjxl: all 27
   transform types, chroma-from-luma, XYB, Gaborish + EPF filters,
   upsampling, noise synthesis, YCbCr.
+- Performance: row-based image planes, Lee-recursion DCT with fused
+  unrolled 8x8 inverse kernel, specialized edge-preserving-filter loops.
 - Not yet supported (throws `JxlUnsupportedException`): splines,
   spot-color rendering, animation, progressive/LF frames, JPEG
   reconstruction, float (HDR) sample formats.
