@@ -8,6 +8,11 @@
   reference frames, blending, alpha, 8/16-bit, EXIF orientation.
 - Animation: `JxlDecoder.decodeAnimation` decodes all visible frames
   with durations, timecodes and loop count.
+- Lossless encoding: `JxlEncoder.encodeLossless` (interleaved 8-bit
+  gray/RGB with optional alpha) and `JxlEncoder.encodeImage` (JXL
+  transcode). Modular with a fixed 7-context gradient tree, YCoCg RCT
+  and prefix codes; output verified bit-exact through this decoder and
+  djxl on every test.
 - Header-only `JxlInfo.parse`, embedded ICC profile decoding.
 - `jxl_info` and `jxl_dec` CLIs.
 - VarDCT (lossy) still images decode within ~1 RMSE of libjxl: all 27

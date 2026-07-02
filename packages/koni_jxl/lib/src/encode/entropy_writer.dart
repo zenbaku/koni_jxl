@@ -329,8 +329,104 @@ void _writeComplexPrefixCode(BitWriter w, List<int> lengths) {
   return (token, n, extra);
 }
 
-/// Buffers (context, value) tokens and serializes the whole entropy-coded
-/// stream: cluster map, hybrid configs, prefix codes, then the payload.
+/// Built entropy codes: serializes the stream header once, then emits
+/// tokens into any number of section writers (prefix codes are stateless).
+final class EntropyCodes {
+  EntropyCodes._(this.config, this._codes, this._lens, this._alphabetSizes,
+      this._histograms, this.numContexts);
+
+  final HybridIntegerConfig config;
+  final int numContexts;
+  final List<List<int>> _codes;
+  final List<List<int>> _lens;
+  final List<int> _alphabetSizes;
+  final List<List<int>> _histograms;
+
+  /// Builds histograms and prefix codes over all [contexts]/[values].
+  factory EntropyCodes.build(int numContexts, List<int> contexts,
+      List<int> values, HybridIntegerConfig config) {
+    final maxToken = List<int>.filled(numContexts, -1);
+    for (var i = 0; i < values.length; i++) {
+      final (token, _, _) = tokenizeHybrid(config, values[i]);
+      if (token > maxToken[contexts[i]]) maxToken[contexts[i]] = token;
+    }
+    final alphabetSizes = [
+      for (var c = 0; c < numContexts; c++)
+        maxToken[c] < 0 ? 1 : maxToken[c] + 1,
+    ];
+    final histograms = [
+      for (var c = 0; c < numContexts; c++)
+        List<int>.filled(alphabetSizes[c], 0),
+    ];
+    for (var i = 0; i < values.length; i++) {
+      final (token, _, _) = tokenizeHybrid(config, values[i]);
+      histograms[contexts[i]][token]++;
+    }
+    return EntropyCodes._(
+        config,
+        List.filled(numContexts, const []),
+        List.filled(numContexts, const []),
+        alphabetSizes,
+        histograms,
+        numContexts);
+  }
+
+  /// Writes the distribution header (mirror of `EntropyStream.read`).
+  void writeHeader(BitWriter w) {
+    w.writeBool(false); // lz77
+    if (numContexts > 1) {
+      w.writeBool(true); // simple cluster map
+      final nbits = ceilLog1p(numContexts - 1);
+      assert(nbits <= 3, 'simple cluster map supports up to 8 contexts');
+      w.writeBits(nbits, 2);
+      for (var i = 0; i < numContexts; i++) {
+        w.writeBits(i, nbits);
+      }
+    }
+    w.writeBool(true); // use_prefix_code
+    for (var c = 0; c < numContexts; c++) {
+      w.writeBits(config.splitExponent, ceilLog1p(15));
+      if (config.splitExponent != 15) {
+        w.writeBits(config.msbInToken, ceilLog1p(config.splitExponent));
+        w.writeBits(config.lsbInToken,
+            ceilLog1p(config.splitExponent - config.msbInToken));
+      }
+    }
+    for (var c = 0; c < numContexts; c++) {
+      final size = _alphabetSizes[c];
+      if (size == 1) {
+        w.writeBool(false);
+      } else {
+        w.writeBool(true);
+        final n = (size - 1).bitLength - 1;
+        w.writeBits(n, 4);
+        w.writeBits(size - 1 - (1 << n), n);
+      }
+    }
+    for (var c = 0; c < numContexts; c++) {
+      if (_alphabetSizes[c] == 1) {
+        _codes[c] = const [0];
+        _lens[c] = const [0];
+        continue;
+      }
+      final (cc, ll) = writePrefixCode(w, _histograms[c], _alphabetSizes[c]);
+      _codes[c] = cc;
+      _lens[c] = ll;
+    }
+  }
+
+  /// Emits one value (must be called only after [writeHeader]).
+  void writeToken(BitWriter w, int context, int value) {
+    final (token, extraBits, extra) = tokenizeHybrid(config, value);
+    w.writeBits(_codes[context][token], _lens[context][token]);
+    if (extraBits > 0) {
+      w.writeBits(extra, extraBits);
+    }
+  }
+}
+
+/// Buffers (context, value) tokens and serializes header + payload into a
+/// single writer (convenience over [EntropyCodes]).
 final class EntropyWriter {
   EntropyWriter(this.numContexts,
       {this.config = const HybridIntegerConfig(4, 1, 0)});
@@ -348,85 +444,10 @@ final class EntropyWriter {
   }
 
   void finalize(BitWriter w) {
-    // Identity cluster map (one cluster per context).
-    w.writeBool(false); // lz77
-    if (numContexts > 1) {
-      w.writeBool(true); // simple cluster map
-      final nbits = ceilLog1p(numContexts - 1);
-      assert(nbits <= 3, 'simple cluster map supports up to 8 contexts');
-      w.writeBits(nbits, 2);
-      for (var i = 0; i < numContexts; i++) {
-        w.writeBits(i, nbits);
-      }
-    }
-    w.writeBool(true); // use_prefix_code
-
-    // Hybrid configs (log alphabet size is implicitly 15 for prefix codes).
-    for (var c = 0; c < numContexts; c++) {
-      w.writeBits(config.splitExponent, ceilLog1p(15));
-      if (config.splitExponent != 15) {
-        w.writeBits(config.msbInToken, ceilLog1p(config.splitExponent));
-        w.writeBits(config.lsbInToken,
-            ceilLog1p(config.splitExponent - config.msbInToken));
-      }
-    }
-
-    // Tokenize and build per-context histograms.
-    final tokens = List<(int, int, int)>.filled(_values.length, (0, 0, 0));
-    final maxToken = List<int>.filled(numContexts, -1);
+    final codes = EntropyCodes.build(numContexts, _contexts, _values, config);
+    codes.writeHeader(w);
     for (var i = 0; i < _values.length; i++) {
-      final t = tokenizeHybrid(config, _values[i]);
-      tokens[i] = t;
-      final ctx = _contexts[i];
-      if (t.$1 > maxToken[ctx]) maxToken[ctx] = t.$1;
-    }
-    final alphabetSizes = [
-      for (var c = 0; c < numContexts; c++) maxToken[c] + 1,
-    ];
-    final histograms = [
-      for (var c = 0; c < numContexts; c++)
-        List<int>.filled(alphabetSizes[c] < 1 ? 1 : alphabetSizes[c], 0),
-    ];
-    for (var i = 0; i < _values.length; i++) {
-      histograms[_contexts[i]][tokens[i].$1]++;
-    }
-
-    // Alphabet sizes.
-    for (var c = 0; c < numContexts; c++) {
-      final size = alphabetSizes[c] < 1 ? 1 : alphabetSizes[c];
-      if (size == 1) {
-        w.writeBool(false);
-      } else {
-        w.writeBool(true);
-        final n = (size - 1).bitLength - 1;
-        w.writeBits(n, 4);
-        w.writeBits(size - 1 - (1 << n), n);
-      }
-    }
-
-    // Prefix codes.
-    final codes = List<List<int>>.filled(numContexts, const []);
-    final lens = List<List<int>>.filled(numContexts, const []);
-    for (var c = 0; c < numContexts; c++) {
-      final size = alphabetSizes[c] < 1 ? 1 : alphabetSizes[c];
-      if (size == 1) {
-        codes[c] = const [0];
-        lens[c] = const [0];
-        continue;
-      }
-      final (cc, ll) = writePrefixCode(w, histograms[c], size);
-      codes[c] = cc;
-      lens[c] = ll;
-    }
-
-    // Payload.
-    for (var i = 0; i < _values.length; i++) {
-      final ctx = _contexts[i];
-      final (token, extraBits, extra) = tokens[i];
-      w.writeBits(codes[ctx][token], lens[ctx][token]);
-      if (extraBits > 0) {
-        w.writeBits(extra, extraBits);
-      }
+      codes.writeToken(w, _contexts[i], _values[i]);
     }
   }
 }

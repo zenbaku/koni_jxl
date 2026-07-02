@@ -93,6 +93,24 @@ large DCTs, dequantization, XYB inverse, gaborish and EPF filters.
 Flutter Web (dart2js) emulates SIMD and decodes lossy images noticeably
 slower.
 
+## Encoding (new)
+
+`JxlEncoder` provides pure-Dart **lossless encoding** (modular, prefix
+codes, fixed gradient-context tree, YCoCg RCT for color):
+
+```dart
+final jxl = JxlEncoder.encodeLossless(rgbaBytes,
+    width: w, height: h, hasAlpha: true);
+final again = JxlEncoder.encodeImage(decodedImage);  // JXL -> JXL transcode
+```
+
+Every encoded file is gated bit-exact through **both** this package's
+decoder and djxl. On real manga pages the output is smaller than
+`cjxl -e1`/`-e2` (93–98%) at ~0.3 s/page; highly repetitive synthetic
+content compresses worse than higher-effort cjxl (LZ77 and palette
+support are future work). 8-bit gray/RGB with optional alpha; 16-bit and
+lossy encoding are not yet supported.
+
 ## Development
 
 ```bash

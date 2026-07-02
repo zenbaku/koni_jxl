@@ -7,11 +7,14 @@ animation and splines).
 
 ## Layout
 
-- `packages/koni_jxl` — decoder core, zero runtime deps.
+- `packages/koni_jxl` — decoder + lossless encoder core, zero runtime
+  deps.
   `lib/src/`: `io/` (BitReader, container), `entropy/` (prefix + ANS +
   LZ77 + hybrid-uint), `modular/` (lossless: MA trees, predictors,
   RCT/palette/squeeze), `vardct/` (lossy: DCTs, dequant, CfL, orders),
-  `frame/` (frame loop, TOC, LfGlobal, patches, splines), `render/`
+  `frame/` (frame loop, TOC, LfGlobal, patches, splines), `encode/`
+  (headers/entropy/modular writers — every writer mirrors a reader in
+  this repo; when touching one, keep them in lockstep), `render/`
   (blend, filters, noise, upsample, transpose), `color/` (XYB, transfer
   functions), `util/` (ImageBuffer = row-based planes, math).
 - `packages/koni_jxl_flutter` — `JxlImageProvider`, `decodeJxlToUiImage`,
@@ -55,6 +58,8 @@ them proves less than it looks like. This machine has everything.
 2. **Gate everything against djxl**: bit-exact compares for lossless,
    `rmse < 2.0` and `max < 48` (8-bit) for lossy. Never relax the
    lossless bit-exactness gates.
+   Encoder gates are round-trips: our encode must decode bit-exact
+   through BOTH our decoder and djxl.
 3. **When output differs from djxl, run jxlatte itself** before
    debugging (`javac -d out $(find java -name '*.java')`, main class
    `com.traneptora.jxlatte.JXLatte`). Identical deviation → inherited;

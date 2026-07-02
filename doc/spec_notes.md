@@ -77,6 +77,17 @@ default cjxl output may interleave LF sections per 2048-row stripe
 (observed: an e7 encode with its second LF group at 95% of the file).
 Modular images have no DC image and stream straight to complete.
 
+## Encoder
+
+The lossless encoder emits: explicit image metadata (the all-default
+header implies XYB), a modular frame with a frame-level global MA tree
+(7 gradient-activity contexts over properties 11 and 10, all leaves
+clamped-gradient), YCoCg RCT (type 6) for color, prefix-coded residuals
+(no LZ77 yet), one section per 256x256 group with the histograms shared
+via the LfGlobal tree stream. Sizes on real manga pages beat cjxl -e1/-e2
+slightly; synthetic repetitive content (screentone tiles) needs LZ77 to
+be competitive — planned, along with palette and 16-bit input.
+
 ## Performance status
 
 Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a
