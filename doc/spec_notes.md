@@ -96,10 +96,15 @@ supported. Remaining encoder ideas:
 per-image learned trees, delta palette. ANS (rANS) IS now implemented as a
 fourth per-image candidate: it spends fractional bits (no 1-bit-per-symbol
 prefix floor) and is chosen by size estimate when it beats plain/LZ77
-prefix, but it cannot carry LZ77 matches, so LZ77 still wins on very
-repetitive content. Real manga page: 91% of cjxl -e1 (was 93%);
-16-color palette art: 63% (was 112%). All ANS output is bit-exact through
-this decoder and djxl.
+prefix, it can carry LZ77 matches too (length symbols at 224+ in the pixel
+clusters, distances in the extra cluster). The encoder builds four
+candidates — {plain, LZ77} x {prefix, ANS} — and, for every candidate
+whose size ESTIMATE is within 3% of the best, assembles the full
+codestream and keeps the smallest ACTUAL output (estimates can't resolve
+sub-percent differences between near-tied modes, e.g. unified ANS+LZ77
+beating LZ77-prefix by ~0.1% on a color page). Real manga page: 91% of
+cjxl -e1 (was 93%); 16-color palette art: 63% (was 112%). All output is
+bit-exact through this decoder and djxl.
 
 ## Robustness
 

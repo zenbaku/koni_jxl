@@ -344,99 +344,123 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   }
   final plainCodes =
       EntropyCodes.build(_numContexts, allContexts, allValues, _config);
-  // Three candidates: plain prefix, LZ77 prefix, and plain ANS. ANS spends
-  // fractional bits (no 1-bit-per-symbol floor) but can't carry LZ77 here.
-  final lzEst = lzCodes.estimatedBits();
+  // Four candidates: {plain, LZ77} x {prefix, ANS}. ANS spends fractional
+  // bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs. Unifying
+  // them lets an image get both wins when the estimator says so.
   final plainEst = plainCodes.estimatedBits();
-  final ansEst =
+  final lzEst = lzCodes.estimatedBits();
+  final plainAnsEst =
       plainCodes.ansViable ? plainCodes.ansEstimatedBits() : double.infinity;
-  final useAns = ansEst < plainEst && ansEst < lzEst;
-  final useLz77 = !useAns && lzEst < plainEst;
-  if (const bool.fromEnvironment('jxl.encdebug')) {
-    // ignore: avoid_print
-    print('palette=${palette?.length} rct=$useRct '
-        'mode=${useAns ? "ans" : (useLz77 ? "lz" : "prefix")} '
-        'lzEst=${(lzEst / 8192).round()}K plainEst=${(plainEst / 8192).round()}K '
-        'ansEst=${ansEst.isFinite ? (ansEst / 8192).round() : "-"}K');
-  }
-  final residualCodes = useLz77 ? lzCodes : plainCodes;
+  final lzAnsEst =
+      lzCodes.ansViable ? lzCodes.ansEstimatedBits() : double.infinity;
+  final best =
+      [plainEst, lzEst, plainAnsEst, lzAnsEst].reduce((a, b) => a < b ? a : b);
 
-  void writeSectionPayload(BitWriter w, int s) {
-    if (useAns) {
-      residualCodes.encodeAnsSection(w, sectionContexts[s], sectionValues[s]);
-    } else if (useLz77) {
-      residualCodes.writeOps(w, sectionOps[s]);
-    } else {
-      for (var i = 0; i < sectionValues[s].length; i++) {
-        residualCodes.writeToken(w, sectionContexts[s][i], sectionValues[s][i]);
+  // Assembles the full codestream for one entropy mode. Cheap enough to run
+  // for each close candidate and keep the smallest actual output — estimates
+  // can't resolve sub-percent differences between near-tied modes.
+  Uint8List assemble(EntropyCodes codes, bool ans, bool lz) {
+    void writeSectionPayload(BitWriter w, int s) {
+      if (ans && lz) {
+        codes.encodeAnsLz77Section(w, sectionOps[s]);
+      } else if (ans) {
+        codes.encodeAnsSection(w, sectionContexts[s], sectionValues[s]);
+      } else if (lz) {
+        codes.writeOps(w, sectionOps[s]);
+      } else {
+        for (var i = 0; i < sectionValues[s].length; i++) {
+          codes.writeToken(w, sectionContexts[s][i], sectionValues[s][i]);
+        }
       }
     }
-  }
 
-  // --- LfGlobal section ---
-  final lfGlobal = BitWriter();
-  lfGlobal.writeBool(true); // default lfDequant
-  lfGlobal.writeBool(true); // has_global_tree
-  _writeFixedTree(lfGlobal);
-  // Residual distributions follow the tree (read inside MaTree.read).
-  if (useAns) {
-    residualCodes.writeAnsHeader(lfGlobal);
-  } else {
-    residualCodes.writeHeader(lfGlobal);
-  }
-  // Global modular stream header.
-  lfGlobal.writeBool(true); // use_global_tree
-  lfGlobal.writeBool(true); // default wp_params
-  if (palette != null) {
-    lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
-    lfGlobal.writeBits(1, 2); // transform: palette
-    lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
-    lfGlobal.writeU32(3, 1, 0, 3, 0, 4, 0, 1, 13); // num_c = 3
-    lfGlobal.writeU32(
-        palette.length, 0, 8, 256, 10, 1280, 12, 5376, 16); // nb_colors
-    lfGlobal.writeU32(0, 0, 0, 1, 8, 257, 10, 1281, 16); // nb_deltas = 0
-    lfGlobal.writeBits(0, 4); // d_pred
-  } else if (useRct) {
-    lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
-    lfGlobal.writeBits(0, 2); // transform: RCT
-    lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
-    lfGlobal.writeU32(6, 6, 0, 0, 2, 2, 4, 10, 6); // rct_type = 6 (YCoCg)
-  } else {
-    lfGlobal.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 0
-  }
-  writeSectionPayload(lfGlobal, 0);
-
-  // --- Assemble the codestream ---
-  final out = BitWriter();
-  writeImageHeader(out, setup);
-  writeFrameHeader(out, setup);
-  if (singleSection) {
-    // One section: LfGlobal, (empty) LF group, (empty) HfGlobal and the
-    // pass group are read sequentially from the same bit stream. With the
-    // channels in the global stream, nothing follows LfGlobal.
-    final body = lfGlobal.toBytes();
-    writeToc(out, [body.length]);
-    out.writeBytes(body);
-  } else {
-    Uint8List writeGroupSection(int s) {
-      final w = BitWriter();
-      w.writeBool(true); // use_global_tree
-      w.writeBool(true); // default wp_params
-      w.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms
-      writeSectionPayload(w, s);
-      return w.toBytes();
+    final lfGlobal = BitWriter();
+    lfGlobal.writeBool(true); // default lfDequant
+    lfGlobal.writeBool(true); // has_global_tree
+    _writeFixedTree(lfGlobal);
+    if (ans) {
+      codes.writeAnsHeader(lfGlobal);
+    } else {
+      codes.writeHeader(lfGlobal);
     }
+    lfGlobal.writeBool(true); // use_global_tree
+    lfGlobal.writeBool(true); // default wp_params
+    if (palette != null) {
+      lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
+      lfGlobal.writeBits(1, 2); // transform: palette
+      lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
+      lfGlobal.writeU32(3, 1, 0, 3, 0, 4, 0, 1, 13); // num_c = 3
+      lfGlobal.writeU32(
+          palette.length, 0, 8, 256, 10, 1280, 12, 5376, 16); // nb_colors
+      lfGlobal.writeU32(0, 0, 0, 1, 8, 257, 10, 1281, 16); // nb_deltas = 0
+      lfGlobal.writeBits(0, 4); // d_pred
+    } else if (useRct) {
+      lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
+      lfGlobal.writeBits(0, 2); // transform: RCT
+      lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
+      lfGlobal.writeU32(6, 6, 0, 0, 2, 2, 4, 10, 6); // rct_type = 6 (YCoCg)
+    } else {
+      lfGlobal.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 0
+    }
+    writeSectionPayload(lfGlobal, 0);
 
-    final sections = <Uint8List>[
-      lfGlobal.toBytes(),
-      for (var i = 0; i < numLfGroups; i++) Uint8List(0), // LF groups
-      Uint8List(0), // HfGlobal + passes (nothing for modular)
-      for (var g = 0; g < numGroups; g++) writeGroupSection(1 + g),
-    ];
-    writeToc(out, [for (final s in sections) s.length]);
-    for (final s in sections) {
-      out.writeBytes(s);
+    final out = BitWriter();
+    writeImageHeader(out, setup);
+    writeFrameHeader(out, setup);
+    if (singleSection) {
+      final body = lfGlobal.toBytes();
+      writeToc(out, [body.length]);
+      out.writeBytes(body);
+    } else {
+      Uint8List writeGroupSection(int s) {
+        final w = BitWriter();
+        w.writeBool(true); // use_global_tree
+        w.writeBool(true); // default wp_params
+        w.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms
+        writeSectionPayload(w, s);
+        return w.toBytes();
+      }
+
+      final sections = <Uint8List>[
+        lfGlobal.toBytes(),
+        for (var i = 0; i < numLfGroups; i++) Uint8List(0),
+        Uint8List(0),
+        for (var g = 0; g < numGroups; g++) writeGroupSection(1 + g),
+      ];
+      writeToc(out, [for (final s in sections) s.length]);
+      for (final s in sections) {
+        out.writeBytes(s);
+      }
+    }
+    return out.toBytes();
+  }
+
+  // Candidates within 3% of the best estimate get assembled for real; the
+  // smallest actual output wins. This captures near-tie wins (e.g. unified
+  // ANS+LZ77 beating LZ77 by a fraction of a percent) that estimates miss.
+  final candidates = <(EntropyCodes, bool, bool, double)>[
+    (plainCodes, false, false, plainEst),
+    (lzCodes, false, true, lzEst),
+    if (plainCodes.ansViable) (plainCodes, true, false, plainAnsEst),
+    if (lzCodes.ansViable) (lzCodes, true, true, lzAnsEst),
+  ];
+  final threshold = best * 1.03;
+  Uint8List? bestBytes;
+  var bestMode = '';
+  for (final (codes, ans, lz, est) in candidates) {
+    if (est > threshold) continue;
+    final bytes = assemble(codes, ans, lz);
+    if (bestBytes == null || bytes.length < bestBytes.length) {
+      bestBytes = bytes;
+      bestMode = '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}';
     }
   }
-  return out.toBytes();
+  if (const bool.fromEnvironment('jxl.encdebug')) {
+    String k(double v) => v.isFinite ? '${(v / 8192).round()}K' : '-';
+    // ignore: avoid_print
+    print('palette=${palette?.length} rct=$useRct chose=$bestMode '
+        'plain=${k(plainEst)} lz=${k(lzEst)} '
+        'plainAns=${k(plainAnsEst)} lzAns=${k(lzAnsEst)}');
+  }
+  return bestBytes ?? assemble(plainCodes, false, false);
 }

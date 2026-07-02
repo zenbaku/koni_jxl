@@ -509,7 +509,6 @@ final class EntropyCodes {
   /// Whether every cluster's token alphabet fits in 2^8 = 256 symbols, the
   /// most an ANS distribution can address (logAlphabetSize <= 8).
   bool get ansViable {
-    if (usesLz77) return false;
     for (final size in _alphabetSizes) {
       if (size > 256) return false;
     }
@@ -556,7 +555,20 @@ final class EntropyCodes {
   void writeAnsHeader(BitWriter w) {
     _ansLog = _ansLogAlphabetSize;
     final clusters = _numClusters;
-    w.writeBool(false); // lz77
+    w.writeBool(usesLz77);
+    if (usesLz77) {
+      w.writeU32(lz77MinSymbol, 224, 0, 512, 0, 4096, 0, 8, 15);
+      w.writeU32(lz77MinLength, 3, 0, 4, 0, 5, 2, 9, 8);
+      w.writeBits(lz77LengthConfig.splitExponent, ceilLog1p(8));
+      if (lz77LengthConfig.splitExponent != 8) {
+        w.writeBits(lz77LengthConfig.msbInToken,
+            ceilLog1p(lz77LengthConfig.splitExponent));
+        w.writeBits(
+            lz77LengthConfig.lsbInToken,
+            ceilLog1p(
+                lz77LengthConfig.splitExponent - lz77LengthConfig.msbInToken));
+      }
+    }
     if (clusters > 1) {
       w.writeBool(true); // simple cluster map
       final nbits = ceilLog1p(clusters - 1);
@@ -595,6 +607,28 @@ final class EntropyCodes {
     for (var i = 0; i < values.length; i++) {
       final (token, nbits, extra) = tokenizeHybrid(config, values[i]);
       enc.add(contexts[i], token, extra: extra, extraBits: nbits);
+    }
+    enc.finish(w);
+  }
+
+  /// Encodes one LZ77 op stream as a fresh rANS stream. A match emits a
+  /// length symbol (in its pixel cluster, offset by [lz77MinSymbol]) then a
+  /// distance symbol (in the distance cluster), each with its raw extra
+  /// bits — the exact read order in EntropyStream.readSymbol.
+  void encodeAnsLz77Section(BitWriter w, Lz77Ops ops) {
+    final enc = AnsEncoder(_ansTables!);
+    for (var i = 0; i < ops.kinds.length; i++) {
+      if (ops.kinds[i] == 0) {
+        final (token, nbits, extra) = tokenizeHybrid(config, ops.a[i]);
+        enc.add(ops.ctxs[i], token, extra: extra, extraBits: nbits);
+      } else {
+        final (lt, lnbits, lextra) =
+            tokenizeHybrid(lz77LengthConfig, ops.a[i] - lz77MinLength);
+        enc.add(ops.ctxs[i], lz77MinSymbol + lt,
+            extra: lextra, extraBits: lnbits);
+        final (dt, dnbits, dextra) = tokenizeHybrid(config, ops.b[i] + 119);
+        enc.add(numContexts, dt, extra: dextra, extraBits: dnbits);
+      }
     }
     enc.finish(w);
   }
