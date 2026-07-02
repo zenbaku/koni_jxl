@@ -6,7 +6,21 @@ import 'util/image_buffer.dart';
 /// A decoded JPEG XL image: per-channel planes (already oriented) plus the
 /// image metadata.
 final class JxlImage {
-  JxlImage.internal(this._header, this.channels, this.iccProfile);
+  JxlImage.internal(this._header, this.channels, this.iccProfile)
+      : isPreview = false,
+        _widthOverride = null,
+        _heightOverride = null;
+
+  JxlImage.preview(this._header, this.channels, this.iccProfile,
+      int previewWidth, int previewHeight)
+      : isPreview = true,
+        _widthOverride = previewWidth,
+        _heightOverride = previewHeight;
+
+  /// True for reduced-resolution previews from [JxlStreamingDecoder].
+  final bool isPreview;
+  final int? _widthOverride;
+  final int? _heightOverride;
 
   final ImageHeader _header;
 
@@ -16,8 +30,8 @@ final class JxlImage {
   /// The decompressed ICC profile embedded in the codestream, if any.
   final Uint8List? iccProfile;
 
-  int get width => _header.orientedSize.width;
-  int get height => _header.orientedSize.height;
+  int get width => _widthOverride ?? _header.orientedSize.width;
+  int get height => _heightOverride ?? _header.orientedSize.height;
   bool get isGrayscale => _header.isGrayscale;
   bool get hasAlpha => _header.hasAlpha;
   int get bitsPerSample => _header.bitDepth.bitsPerSample;

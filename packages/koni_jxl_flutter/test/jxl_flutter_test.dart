@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/painting.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -63,6 +64,45 @@ void main() {
       expect(anim.frames.length, 1);
       expect(anim.isAnimated, isFalse);
       anim.dispose();
+    });
+  });
+
+  group('decodeJxlProgressive', () {
+    Stream<List<int>> chunked(Uint8List bytes, int size) async* {
+      for (var off = 0; off < bytes.length; off += size) {
+        yield bytes.sublist(
+            off, off + size > bytes.length ? bytes.length : off + size);
+      }
+    }
+
+    test('VarDCT stream emits preview then final', () async {
+      final bytes = lossySample.readAsBytesSync();
+      final images = await decodeJxlProgressive(chunked(bytes, 1024)).toList();
+      expect(images.length, 2);
+      expect(images[0].width, (images[1].width + 7) ~/ 8);
+      expect(images[0].height, (images[1].height + 7) ~/ 8);
+      expect(images[1].width, 1024);
+      expect(images[1].height, 1536);
+      for (final i in images) {
+        i.dispose();
+      }
+    });
+
+    test('lossless stream emits only the final image', () async {
+      final bytes = sample.readAsBytesSync();
+      final images = await decodeJxlProgressive(chunked(bytes, 997)).toList();
+      expect(images.length, 1);
+      expect(images.single.width, 256);
+      images.single.dispose();
+    });
+
+    test('truncated stream reports an error', () async {
+      final bytes = lossySample.readAsBytesSync();
+      await expectLater(
+        decodeJxlProgressive(chunked(bytes.sublist(0, bytes.length ~/ 2), 1024))
+            .toList(),
+        throwsStateError,
+      );
     });
   });
 

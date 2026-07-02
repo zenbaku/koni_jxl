@@ -23,5 +23,8 @@
 - Splines (centripetal Catmull-Rom rendering with per-spline DCT32
   color/sigma profiles).
 - Progressive files: LF frames (progressive DC) and multi-pass AC.
+- Streaming: `JxlStreamingDecoder` decodes incrementally arriving bytes —
+  header info, buffering progress, a 1:8 DC preview once the DC sections
+  (or a progressive-DC LF frame) are available, and the final image.
 - Not yet supported (throws `JxlUnsupportedException`): spot-color
   rendering, JPEG reconstruction, float (HDR) sample formats.

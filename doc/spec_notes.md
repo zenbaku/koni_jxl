@@ -62,6 +62,21 @@ djxl by a smooth per-channel tone curve: its color is described only by
 an embedded ICC profile, which koni_jxl decodes as sRGB (the documented
 ICC limitation, verified as a monotonic +-1-tight value mapping).
 
+## Streaming / progressive display
+
+`JxlStreamingDecoder` probes headers and frame tables of contents over
+the buffered prefix (tolerating truncation everywhere) and reports what
+is decodable. The 1:8 preview comes from either the dequantized LF
+sections of the first regular VarDCT frame or, for progressive-DC files,
+from a fully-buffered level-1 LF frame (including chained level-2
+frames). Previews of subsampled chroma use nearest-neighbor doubling;
+extra channels are rendered opaque. How early the preview becomes
+available is a property of the encoder's section order: cjxl
+--progressive_dc files reach it after a few percent of the bytes, while
+default cjxl output may interleave LF sections per 2048-row stripe
+(observed: an e7 encode with its second LF group at 95% of the file).
+Modular images have no DC image and stream straight to complete.
+
 ## Performance status
 
 Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a

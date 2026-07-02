@@ -15,7 +15,8 @@ animation and splines).
   (blend, filters, noise, upsample, transpose), `color/` (XYB, transfer
   functions), `util/` (ImageBuffer = row-based planes, math).
 - `packages/koni_jxl_flutter` — `JxlImageProvider`, `decodeJxlToUiImage`,
-  `decodeJxlAnimation`, `JxlAnimationView`; `example/` gallery app.
+  `decodeJxlAnimation`/`JxlAnimationView`, `decodeJxlProgressive`/
+  `JxlProgressiveImage`; `example/` gallery app.
 - `doc/spec_notes.md` — **the deviations ledger.** Every known difference
   vs libjxl or vs jxlatte lives here. Update it whenever behavior
   deviates or a deviation is fixed.

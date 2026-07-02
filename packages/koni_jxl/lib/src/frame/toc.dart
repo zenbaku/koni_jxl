@@ -36,7 +36,8 @@ List<int> readPermutation(
 /// The frame's table of contents: section lengths (in file order), the
 /// optional permutation, and the section payload bytes.
 final class Toc {
-  factory Toc.read(BitReader reader, int tocEntries) {
+  factory Toc.read(BitReader reader, int tocEntries,
+      {bool allowTruncated = false}) {
     List<int>? permutation;
     if (reader.readBool()) {
       final tocStream = EntropyStream.read(reader, 8);
@@ -60,14 +61,32 @@ final class Toc {
     // past it so the next frame can be read.
     final data = reader.remainingBytes();
     if (data.length < total) {
-      throw const JxlTruncatedException('frame sections extend past input');
+      if (!allowTruncated) {
+        throw const JxlTruncatedException('frame sections extend past input');
+      }
+      // Streaming probe: keep whatever payload is present; the reader is
+      // left un-advanced (the walk stops at this frame).
+      return Toc._(lengths, permutation, starts, data, data.length, total);
     }
     reader.skipBits(total << 3);
-    return Toc._(
-        lengths, permutation, starts, Uint8List.sublistView(data, 0, total));
+    return Toc._(lengths, permutation, starts,
+        Uint8List.sublistView(data, 0, total), total, total);
   }
 
-  Toc._(this.lengths, this.permutation, this._starts, this._data);
+  Toc._(this.lengths, this.permutation, this._starts, this._data,
+      this.availableBytes, this.totalBytes);
+
+  /// Payload bytes actually present (== [totalBytes] unless truncated).
+  final int availableBytes;
+
+  /// Total payload bytes the TOC declares.
+  final int totalBytes;
+
+  /// Whether logical section [index] lies fully within the available bytes.
+  bool sectionAvailable(int index) {
+    final i = lengths.length <= 1 ? 0 : (permutation?[index] ?? index);
+    return _starts[i] + lengths[i] <= availableBytes;
+  }
 
   final List<int> lengths;
   final List<int>? permutation;

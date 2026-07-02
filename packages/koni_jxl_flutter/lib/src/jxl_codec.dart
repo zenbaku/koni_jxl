@@ -89,3 +89,59 @@ Future<JxlUiAnimation> decodeJxlAnimation(Uint8List bytes) async {
     numLoops,
   );
 }
+
+Future<ui.Image> _rgbaToUiImage(Uint8List pixels, int width, int height) async {
+  final buffer = await ui.ImmutableBuffer.fromUint8List(pixels);
+  final descriptor = ui.ImageDescriptor.raw(
+    buffer,
+    width: width,
+    height: height,
+    pixelFormat: ui.PixelFormat.rgba8888,
+  );
+  final codec = await descriptor.instantiateCodec();
+  final frame = await codec.getNextFrame();
+  codec.dispose();
+  descriptor.dispose();
+  buffer.dispose();
+  return frame.image;
+}
+
+/// Progressively decodes a JPEG XL byte stream.
+///
+/// Emits at most two images: a 1:8 DC preview as soon as the stream
+/// contains the DC sections (VarDCT images; progressive-DC files preview
+/// after a few percent of the bytes), then the final image when the
+/// stream completes. Pixel decoding runs in background isolates; only
+/// cheap header/TOC probing happens on the calling isolate.
+Stream<ui.Image> decodeJxlProgressive(Stream<List<int>> chunks) async* {
+  final session = JxlStreamingDecoder();
+  final buffer = BytesBuilder(copy: true);
+  var previewEmitted = false;
+  await for (final chunk in chunks) {
+    session.addBytes(chunk);
+    buffer.add(chunk);
+    if (!previewEmitted && session.state == JxlStreamState.dcReady) {
+      previewEmitted = true;
+      final snapshot = buffer.toBytes();
+      final decoded = await Isolate.run(() {
+        final d = JxlStreamingDecoder()..addBytes(snapshot);
+        final p = d.decodePreview();
+        if (p == null) return null;
+        return (p.toRgba8(), p.width, p.height);
+      });
+      if (decoded != null) {
+        yield await _rgbaToUiImage(decoded.$1, decoded.$2, decoded.$3);
+      }
+    }
+  }
+  if (session.state != JxlStreamState.complete) {
+    throw StateError('JXL stream ended before the file was complete '
+        '(${(session.progress * 100).toStringAsFixed(0)}% received)');
+  }
+  final bytes = buffer.takeBytes();
+  final (pixels, width, height) = await Isolate.run(() {
+    final image = JxlDecoder.decode(bytes);
+    return (image.toRgba8(), image.width, image.height);
+  });
+  yield await _rgbaToUiImage(pixels, width, height);
+}

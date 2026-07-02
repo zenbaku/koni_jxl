@@ -5,3 +5,4 @@ export 'src/decoder.dart' show JxlDecoder;
 export 'src/exceptions.dart';
 export 'src/jxl_image.dart' show JxlAnimation, JxlImage;
 export 'src/jxl_info.dart' show JxlInfo;
+export 'src/streaming.dart' show JxlStreamState, JxlStreamingDecoder;

@@ -99,15 +99,17 @@ final class Frame {
     return header;
   }
 
-  void readToc() {
-    final int tocEntries;
+  void readToc({bool allowTruncated = false}) {
+    toc = Toc.read(globalReader, tocEntryCount, allowTruncated: allowTruncated);
+  }
+
+  /// Number of TOC entries for this frame's structure.
+  int get tocEntryCount {
     if (numGroups == 1 && header.passes.numPasses == 1) {
-      tocEntries = 1;
-    } else {
-      // lfGlobal + one per LF group + hfGlobal + one per pass per group.
-      tocEntries = 1 + numLfGroups + 1 + numGroups * header.passes.numPasses;
+      return 1;
     }
-    toc = Toc.read(globalReader, tocEntries);
+    // lfGlobal + one per LF group + hfGlobal + one per pass per group.
+    return 1 + numLfGroups + 1 + numGroups * header.passes.numPasses;
   }
 
   /// Number of color channels in the frame representation (not the output).
@@ -202,6 +204,13 @@ final class Frame {
   /// The LF frame's channel buffers when this frame uses one
   /// (`FrameFlags.useLfFrame`).
   List<ImageBuffer>? lfFrame;
+
+  /// Streaming preview: decodes only LfGlobal and the LF groups (the DC
+  /// image for VarDCT frames). Requires those TOC sections to be present.
+  void decodeLfOnly() {
+    lfGlobal = LfGlobal.read(toc.sectionReader(0), this);
+    _decodeLfGroups();
+  }
 
   void decodeFrame({List<ImageBuffer>? lfFrame}) {
     this.lfFrame = lfFrame;

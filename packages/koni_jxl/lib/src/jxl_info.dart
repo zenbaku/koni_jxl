@@ -21,6 +21,9 @@ final class JxlInfo {
 
   JxlInfo._(this._header, this.isContainer);
 
+  /// Internal: wraps an already-parsed header (streaming decoder).
+  JxlInfo.internal(this._header, this.isContainer);
+
   final ImageHeader _header;
 
   /// Whether the file used the ISOBMFF container format.

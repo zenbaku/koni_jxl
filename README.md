@@ -15,6 +15,9 @@ runs on: Android, iOS, macOS, Windows, Linux.
 import 'package:koni_jxl_flutter/koni_jxl_flutter.dart';
 
 Image(image: JxlImageProvider.asset('assets/page.jxl'))
+
+// Progressive display straight from a network byte stream:
+JxlProgressiveImage(httpResponse.stream)
 ```
 
 ## Quick start (pure Dart)
@@ -28,6 +31,12 @@ final rgba = image.toRgba8();               // interleaved RGBA bytes
 
 final anim = JxlDecoder.decodeAnimation(bytes);   // all frames
 final delay = anim.frameDuration(0);              // per-frame Duration
+
+final session = JxlStreamingDecoder();            // progressive display
+session.addBytes(chunk);                          // as bytes arrive...
+if (session.state == JxlStreamState.dcReady) {
+  final blurry = session.decodePreview();         // 1:8 DC preview
+}
 ```
 
 ## Status
@@ -65,6 +74,9 @@ Supported today:
 - ✅ Splines (both spline conformance cases within 1/255 of djxl)
 - ✅ Progressive DC (LF frames), multi-pass AC — files from
   `cjxl --progressive_dc` decode within lossy tolerance of djxl
+- ✅ Streaming decode: `JxlStreamingDecoder` turns partial bytes into a
+  1:8 preview (blurry-then-sharp progressive display);
+  `JxlProgressiveImage` renders an http byte stream directly
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 

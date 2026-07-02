@@ -110,3 +110,78 @@ DemuxedStream demuxContainer(Uint8List data) {
   }
   return DemuxedStream._(codestream, level, true);
 }
+
+/// Extracts as much of the codestream as [data] (a growing prefix of a JXL
+/// file) currently contains. Never throws on truncation inside boxes; a
+/// buffer too short to identify the signature throws [JxlTruncatedException]
+/// and non-JXL data throws [JxlInvalidBitstreamException].
+Uint8List demuxContainerPartial(Uint8List data) {
+  if (data.length >= 2 && data[0] == 0xFF && data[1] == 0x0A) {
+    return data;
+  }
+  if (data.length < 12) {
+    throw const JxlTruncatedException('input shorter than any JXL signature');
+  }
+  for (var i = 0; i < 12; i++) {
+    if (data[i] != _containerSignature[i]) {
+      throw const JxlInvalidBitstreamException('not a JPEG XL file');
+    }
+  }
+  final byteData = ByteData.sublistView(data);
+  final parts = <Uint8List>[];
+  var offset = 12;
+  while (offset < data.length) {
+    if (offset + 8 > data.length) break;
+    final size32 = byteData.getUint32(offset);
+    final tag = String.fromCharCodes(data, offset + 4, offset + 8);
+    var payloadStart = offset + 8;
+    final int payloadEnd;
+    if (size32 == 1) {
+      if (offset + 16 > data.length) break;
+      payloadStart = offset + 16;
+      payloadEnd = offset + byteData.getUint64(offset + 8);
+    } else if (size32 == 0) {
+      payloadEnd = data.length; // extends to end of file / stream so far
+    } else {
+      payloadEnd = offset + size32;
+    }
+    if (payloadEnd < payloadStart) {
+      throw const JxlInvalidBitstreamException('illegal box size');
+    }
+    final isCodestream = tag == 'jxlc' || tag == 'jxlp';
+    if (payloadEnd > data.length) {
+      // Truncated box: a codestream box still contributes its prefix.
+      if (isCodestream) {
+        var start = payloadStart;
+        if (tag == 'jxlp') start += 4;
+        if (start < data.length) {
+          parts.add(Uint8List.sublistView(data, start));
+        }
+      }
+      break;
+    }
+    if (isCodestream) {
+      var start = payloadStart;
+      if (tag == 'jxlp') {
+        if (payloadEnd - payloadStart < 4) {
+          throw const JxlInvalidBitstreamException('jxlp box too small');
+        }
+        start += 4;
+      }
+      parts.add(Uint8List.sublistView(data, start, payloadEnd));
+    }
+    offset = payloadEnd;
+  }
+  if (parts.isEmpty) {
+    throw const JxlTruncatedException('no codestream bytes yet');
+  }
+  if (parts.length == 1) return parts[0];
+  final total = parts.fold(0, (sum, p) => sum + p.length);
+  final codestream = Uint8List(total);
+  var pos = 0;
+  for (final part in parts) {
+    codestream.setAll(pos, part);
+    pos += part.length;
+  }
+  return codestream;
+}
