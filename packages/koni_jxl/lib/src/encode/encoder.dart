@@ -132,21 +132,25 @@ void _tileResiduals(
     int tw,
     int th,
     List<int> valuesOut,
+    List<int>? maxErrOut,
     List<int> trainProps,
     List<int> trainTokens,
     int stride,
     List<int> strideState,
-    bool useWp) {
+    bool useWp,
+    List<int> properties) {
   final tile = Int32List(tw * th);
   for (var y = 0; y < th; y++) {
     tile.setRange(y * tw, y * tw + tw, plane, (oy + y) * imageWidth + ox);
   }
   Int32List? wpRes;
+  Int32List? wpErr;
   if (useWp) {
     wpRes = Int32List(tw * th);
-    wpTileResiduals(tile, tw, th, wpRes);
+    wpErr = Int32List(tw * th);
+    wpTileResiduals(tile, tw, th, wpRes, wpErr);
   }
-  final props = Int32List(treeProperties.length);
+  final props = Int32List(properties.length);
   var counter = strideState[0];
   for (var y = 0; y < th; y++) {
     for (var x = 0; x < tw; x++) {
@@ -154,6 +158,7 @@ void _tileResiduals(
       final int value;
       if (useWp) {
         value = _packSigned(wpRes![o]);
+        maxErrOut!.add(wpErr![o]);
       } else {
         final w = x > 0
             ? tile[o - 1]
@@ -174,7 +179,7 @@ void _tileResiduals(
       }
       valuesOut.add(value);
       if (counter == 0) {
-        computePropsAt(tile, tw, th, y, x, props);
+        computeProps(tile, tw, th, y, x, properties, wpErr?[o] ?? 0, props);
         for (var pi = 0; pi < props.length; pi++) {
           trainProps.add(props[pi]);
         }
@@ -187,17 +192,20 @@ void _tileResiduals(
   strideState[0] = counter;
 }
 
-/// Pass B over a tile: assigns each pixel a context by walking [tree].
+/// Pass B over a tile: assigns each pixel a context by walking [tree]. The
+/// per-pixel max-error (property 15) is read from [maxErrIn] (filled by Pass
+/// A in the same order) so the weighted predictor isn't recomputed.
 void _tileContexts(Int32List plane, int imageWidth, int ox, int oy, int tw,
-    int th, ContextTree tree, List<int> contextsOut) {
+    int th, ContextTree tree, List<int> contextsOut, List<int>? maxErrIn) {
   final tile = Int32List(tw * th);
   for (var y = 0; y < th; y++) {
     tile.setRange(y * tw, y * tw + tw, plane, (oy + y) * imageWidth + ox);
   }
-  final props = Int32List(treeProperties.length);
+  final props = Int32List(tree.properties.length);
   for (var y = 0; y < th; y++) {
     for (var x = 0; x < tw; x++) {
-      computePropsAt(tile, tw, th, y, x, props);
+      final me = maxErrIn != null ? maxErrIn[contextsOut.length] : 0;
+      computeProps(tile, tw, th, y, x, tree.properties, me, props);
       contextsOut.add(contextFor(tree, props));
     }
   }
@@ -297,38 +305,69 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // gradient on line art; the encoder tries both and keeps the smaller.
   (Uint8List, String) bestForPredictor(bool useWp) {
     final predictor = useWp ? 6 : 5;
+    final properties = useWp ? wpProperties : gradProperties;
     final strideState = [0];
     final trainProps = <int>[];
     final trainTokens = <int>[];
 
     // Pass A: residuals per group (and the palette meta channel) plus a
-    // strided training set for the context tree.
+    // strided training set for the context tree. For WP, the max-error
+    // (property 15) is captured here so Pass B needn't recompute it.
     final metaValues = <int>[];
+    final metaMaxErr = useWp ? <int>[] : null;
     if (pal != null) {
-      _tileResiduals(pal, palette!.length, 0, 0, palette.length, 3, metaValues,
-          trainProps, trainTokens, stride, strideState, useWp);
+      _tileResiduals(
+          pal,
+          palette!.length,
+          0,
+          0,
+          palette.length,
+          3,
+          metaValues,
+          metaMaxErr,
+          trainProps,
+          trainTokens,
+          stride,
+          strideState,
+          useWp,
+          properties);
     }
     final groupValues = List<List<int>>.generate(numGroups, (_) => []);
+    final groupMaxErr =
+        useWp ? List<List<int>>.generate(numGroups, (_) => []) : null;
     for (var g = 0; g < numGroups; g++) {
       final ox = (g % groupsX) * groupDim;
       final oy = (g ~/ groupsX) * groupDim;
       final tw = (width - ox).clamp(0, groupDim);
       final th = (height - oy).clamp(0, groupDim);
       for (final plane in planes) {
-        _tileResiduals(plane, width, ox, oy, tw, th, groupValues[g], trainProps,
-            trainTokens, stride, strideState, useWp);
+        _tileResiduals(
+            plane,
+            width,
+            ox,
+            oy,
+            tw,
+            th,
+            groupValues[g],
+            groupMaxErr?[g],
+            trainProps,
+            trainTokens,
+            stride,
+            strideState,
+            useWp,
+            properties);
       }
     }
 
     // Learn the context tree, then Pass B: assign each pixel a context.
-    final tree = learnContextTree(
-        Int32List.fromList(trainProps), Int32List.fromList(trainTokens));
+    final tree = learnContextTree(Int32List.fromList(trainProps),
+        Int32List.fromList(trainTokens), properties);
     final numContexts = tree.contexts;
 
     final metaContexts = <int>[];
     if (pal != null) {
-      _tileContexts(
-          pal, palette!.length, 0, 0, palette.length, 3, tree, metaContexts);
+      _tileContexts(pal, palette!.length, 0, 0, palette.length, 3, tree,
+          metaContexts, metaMaxErr);
     }
     final groupContexts = List<List<int>>.generate(numGroups, (_) => []);
     for (var g = 0; g < numGroups; g++) {
@@ -337,7 +376,8 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       final tw = (width - ox).clamp(0, groupDim);
       final th = (height - oy).clamp(0, groupDim);
       for (final plane in planes) {
-        _tileContexts(plane, width, ox, oy, tw, th, tree, groupContexts[g]);
+        _tileContexts(plane, width, ox, oy, tw, th, tree, groupContexts[g],
+            groupMaxErr?[g]);
       }
     }
 

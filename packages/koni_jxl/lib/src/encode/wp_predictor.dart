@@ -43,8 +43,10 @@ int _clamp4(int v, int a, int b, int c) {
 }
 
 /// Fills [residuals] (length tw*th) with `value - weightedPrediction` for the
-/// tile, in raster order.
-void wpTileResiduals(Int32List tile, int tw, int th, Int32List residuals) {
+/// tile, in raster order. When [maxErrors] is given, also records each
+/// pixel's WP max-error (decoder property 15) for context modeling.
+void wpTileResiduals(Int32List tile, int tw, int th, Int32List residuals,
+    [Int32List? maxErrors]) {
   final err0 = Int32List(tw * th);
   final err1 = Int32List(tw * th);
   final err2 = Int32List(tw * th);
@@ -130,6 +132,13 @@ void wpTileResiduals(Int32List tile, int tw, int th, Int32List residuals) {
       var pred = (s * _oneL24OverKP1[wSum - 1]) >> 24;
       if (((tN ^ tW) | (tN ^ tNW)) <= 0) {
         pred = _clamp4(pred, w3, n3, ne3);
+      }
+      if (maxErrors != null) {
+        var maxError = tW;
+        if (tN.abs() > maxError.abs()) maxError = tN;
+        if (tNW.abs() > maxError.abs()) maxError = tNW;
+        if (tNE.abs() > maxError.abs()) maxError = tNE;
+        maxErrors[o] = maxError;
       }
       final trueValue = tile[o];
       residuals[o] = trueValue - ((pred + 3) >> 3);

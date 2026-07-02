@@ -105,7 +105,12 @@ sub-percent differences between near-tied modes, e.g. unified ANS+LZ77
 beating LZ77-prefix by ~0.1% on a color page). With the per-image learned
 context tree (the biggest single lever, matching cjxl's e2->e3 jump where
 learned trees and the weighted predictor turn on), real manga pages now
-land near cjxl -e3: a B/W page at ~99% of cjxl -e3, a color page at ~81%.
+land near cjxl -e3: a B/W page at ~98% of cjxl -e3, a color page at ~81%.
+The encoder tries both predictors (clamped gradient and self-correcting
+weighted) and both property sets, keeping the smallest actual output; the
+weighted predictor's property 15 (max-error) is included in its tree
+candidates, which is what makes WP win on color/tonal content (one piece
+color page -4%, B/W page flips to WP).
 All output is bit-exact through this decoder and djxl.
 
 ## Robustness

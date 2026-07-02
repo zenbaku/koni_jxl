@@ -9,22 +9,29 @@ import 'entropy_writer.dart';
 /// residual histograms far better than a fixed handful.
 ///
 /// The tree tests decoder property values (`_property` cases) against
-/// thresholds; leaves are contexts. All leaves use the clamped-gradient
-/// predictor (5); the residual is computed by the caller.
+/// thresholds; leaves are contexts. The predictor is chosen by the caller;
+/// property 15 (the weighted predictor's max-error) is only meaningful when
+/// the leaves use predictor 6, so the property set is predictor-dependent.
 
-/// Decoder property ids this learner may split on (mirrors `_property`):
+/// Property set for the clamped-gradient predictor (mirrors `_property`):
 /// 4 = |N|, 5 = |W|, 6 = N, 7 = W, 10 = W-NW, 11 = NW-N, 12 = N-NE,
 /// 13 = N-NN, 14 = W-WW.
-const treeProperties = [4, 5, 6, 7, 10, 11, 12, 13, 14];
+const gradProperties = [4, 5, 6, 7, 10, 11, 12, 13, 14];
+
+/// Property set for the weighted predictor: the gradient set plus 15
+/// (max-error), which is where WP's advantage lives.
+const wpProperties = [4, 5, 6, 7, 10, 11, 12, 13, 14, 15];
 
 /// Candidate split thresholds (the decoder walk is `property > value`).
 const _thresholds = [
   -64, -32, -16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16, 32, 64, 128, //
 ];
 
-/// Computes [treeProperties] for pixel (y, x) of a tile into [out] (length
-/// treeProperties.length), mirroring the decoder's `_property`.
-void _propsAt(Int32List tile, int tw, int th, int y, int x, Int32List out) {
+/// Computes [properties] for pixel (y, x) of a tile into [out] (same length),
+/// mirroring the decoder's `_property`. Property 15 (WP max-error) is not
+/// derivable from the tile, so its value is supplied as [maxError].
+void computeProps(Int32List tile, int tw, int th, int y, int x,
+    List<int> properties, int maxError, Int32List out) {
   final o = y * tw + x;
   final n = y > 0
       ? tile[o - tw]
@@ -42,15 +49,21 @@ void _propsAt(Int32List tile, int tw, int th, int y, int x, Int32List out) {
   final ne = x + 1 < tw && y > 0 ? tile[o - tw + 1] : n;
   final nn = y > 1 ? tile[o - 2 * tw] : n;
   final ww = x > 1 ? tile[o - 2] : w;
-  out[0] = n.abs(); // 4
-  out[1] = w.abs(); // 5
-  out[2] = n; // 6
-  out[3] = w; // 7
-  out[4] = w - nw; // 10
-  out[5] = nw - n; // 11
-  out[6] = n - ne; // 12
-  out[7] = n - nn; // 13
-  out[8] = w - ww; // 14
+  for (var i = 0; i < properties.length; i++) {
+    out[i] = switch (properties[i]) {
+      4 => n.abs(),
+      5 => w.abs(),
+      6 => n,
+      7 => w,
+      10 => w - nw,
+      11 => nw - n,
+      12 => n - ne,
+      13 => n - nn,
+      14 => w - ww,
+      15 => maxError,
+      _ => 0,
+    };
+  }
 }
 
 double _log2(double x) => math.log(x) * 1.4426950408889634;
@@ -70,11 +83,15 @@ final class _Node {
 
 /// A learned tree ready to serialize and to assign contexts with.
 final class ContextTree {
-  ContextTree._(this._root, this.numContexts, this._nodesInOrder);
+  ContextTree._(
+      this._root, this.numContexts, this._nodesInOrder, this.properties);
 
   final _Node _root;
   final int numContexts;
   final List<_Node> _nodesInOrder; // BFS order for serialization
+
+  /// The decoder property ids this tree splits on (index order).
+  final List<int> properties;
 
   /// Number of distinct contexts (tree leaves).
   int get contexts => numContexts;
@@ -93,9 +110,10 @@ double _countsEntropy(List<int> counts, int total) {
 /// Learns a tree from (properties, token) training samples. [props] is
 /// flat: sample s uses props[s*P .. s*P+P). Splits stop at [maxContexts]
 /// leaves or when a split saves fewer than [minGainBits] bits.
-ContextTree learnContextTree(Int32List props, Int32List tokens,
+ContextTree learnContextTree(
+    Int32List props, Int32List tokens, List<int> properties,
     {int maxContexts = 64, double minGainBits = 96}) {
-  final p = treeProperties.length;
+  final p = properties.length;
   final n = tokens.length;
   var maxToken = 0;
   for (final t in tokens) {
@@ -217,7 +235,7 @@ ContextTree learnContextTree(Int32List props, Int32List tokens,
       queue.add(node.right!);
     }
   }
-  return ContextTree._(root, nextContext, ordered);
+  return ContextTree._(root, nextContext, ordered, properties);
 }
 
 /// Serializes the tree in the decoder's MA-tree format: a 6-context entropy
@@ -235,7 +253,7 @@ void serializeContextTree(BitWriter w, ContextTree tree, int predictor) {
       tokens.write(4, 0); // mul_log
       tokens.write(5, 0); // mul_bits
     } else {
-      tokens.write(1, treeProperties[node.propIndex] + 1);
+      tokens.write(1, tree.properties[node.propIndex] + 1);
       tokens.write(0, _packSigned(node.value));
     }
   }
@@ -251,10 +269,4 @@ int contextFor(ContextTree tree, Int32List propsAt) {
     node = propsAt[node.propIndex] > node.value ? node.left! : node.right!;
   }
   return node.context;
-}
-
-/// Computes the property vector for pixel (y, x) into [out].
-void computePropsAt(
-    Int32List tile, int tw, int th, int y, int x, Int32List out) {
-  _propsAt(tile, tw, th, y, x, out);
 }
