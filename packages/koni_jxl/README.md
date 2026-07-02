@@ -1,34 +1,80 @@
 # koni_jxl
 
-Pure Dart JPEG XL (`.jxl`) image decoder. Zero native dependencies, zero
-runtime package dependencies — works on every Dart platform.
+A pure-Dart **JPEG XL (`.jxl`) codec** — decode and losslessly encode,
+with **zero native dependencies** and zero runtime package dependencies.
+Works on every platform Dart runs on: Android, iOS, macOS, Windows,
+Linux, and (with reduced lossy speed) the web.
+
+Correctness is verified **bit-exact against libjxl's `djxl`** on a
+generated corpus, the official conformance suite, and real-world
+JPEG-transcoded manga chapters.
 
 ```dart
 import 'package:koni_jxl/koni_jxl.dart';
 
-// Header-only parse (cheap):
+// Cheap header-only inspection (reads a few hundred bytes):
 final info = JxlInfo.parse(bytes);
 print('${info.width}x${info.height}, ${info.bitsPerSample}-bit');
 
-// Full decode:
+// Full decode to interleaved RGBA (sRGB, EXIF-oriented):
 final image = JxlDecoder.decode(bytes);
-final rgba = image.toRgba8(); // interleaved RGBA, sRGB, oriented
+final rgba = image.toRgba8();
 
-// Unsupported features throw JxlUnsupportedException with a stable
-// feature id ('vardct', 'animation', ...) so you can fall back per-file.
+// All frames of an animation:
+final anim = JxlDecoder.decodeAnimation(bytes);
+
+// Lossless encode from raw RGBA:
+final jxl = JxlEncoder.encodeLossless(rgba,
+    width: image.width, height: image.height, hasAlpha: true);
 ```
 
-Currently decodes modular (lossless) still images bit-exactly — see the
-[repository README](https://github.com/zenbaku/koni_jxl) for the feature
-matrix and roadmap (VarDCT/lossy support is in progress).
+For Flutter widgets (`JxlImageProvider`, animation and progressive
+playback, background-isolate encode), use
+[`koni_jxl_flutter`](https://pub.dev/packages/koni_jxl_flutter).
 
-For Flutter, use
-[`koni_jxl_flutter`](https://pub.dev/packages/koni_jxl_flutter) which adds
-an `ImageProvider` with background-isolate decoding.
+## Features
 
-Includes two CLIs:
+**Decoding**
+
+- Modular (lossless) still images — **bit-exact vs libjxl**
+- VarDCT (lossy) still images — within ~1 RMSE of libjxl
+- Animation (all frames, durations, loop count)
+- Splines, progressive DC (LF) frames, multi-pass AC
+- Streaming decode with a 1:8 DC preview
+  (`JxlStreamingDecoder`) for blurry-then-sharp display
+- Grayscale/RGB, palette, alpha, 8/16-bit, EXIF orientation
+- Embedded ICC profiles; header-only `JxlInfo.parse`
+
+**Encoding** (lossless)
+
+- `JxlEncoder.encodeLossless` / `encodeLossless16` from raw pixels
+- `JxlEncoder.encodeImage` for JXL→JXL transcodes
+- Per-image LZ77 / palette / YCoCg RCT selection; every output is
+  verified bit-exact through this decoder **and** `djxl`
+
+**Robustness** — all decode surfaces throw only `JxlException` on
+malformed input (mutation-fuzz verified); `JxlLimits` caps
+header-driven allocations.
+
+Not yet supported (decoding throws `JxlUnsupportedException` with a
+stable feature id): spot-color rendering, JPEG bitstream reconstruction,
+and float (HDR) sample formats. Encoding is lossless-only.
+
+## Performance
+
+Apple Silicon, AOT, single-threaded: a 1536×2200 lossless page decodes
+in ~60–410 ms; typical lossy pages in ~0.3–0.5 s, using Float32x4 SIMD
+across the lossy pipeline (native on AOT targets; emulated on the web).
+
+## Command-line tools
 
 ```bash
-dart run koni_jxl:jxl_info image.jxl        # header info
-dart run koni_jxl:jxl_dec image.jxl out.ppm # decode to PNM/PAM
+dart run koni_jxl:jxl_info image.jxl         # header info
+dart run koni_jxl:jxl_dec  image.jxl out.ppm # decode to PNM/PAM
+dart run koni_jxl:jxl_enc  in.ppm  out.jxl   # lossless encode
 ```
+
+## License
+
+MIT. Ported from [jxlatte](https://github.com/Traneptora/jxlatte) (MIT);
+see `NOTICE` in the [repository](https://github.com/zenbaku/koni_jxl).

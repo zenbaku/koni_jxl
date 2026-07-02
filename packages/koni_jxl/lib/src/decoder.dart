@@ -19,10 +19,13 @@ import 'util/image_buffer.dart';
 
 /// Decodes JPEG XL images to raw pixels.
 ///
-/// Currently supported: still images with modular (lossless) encoding,
-/// including patches, reference frames and blending. Unsupported features
-/// throw [JxlUnsupportedException] naming the feature.
+/// Handles lossless (Modular) and lossy (VarDCT) still images, animation,
+/// splines, patches, reference frames and blending. Features that are not
+/// yet implemented throw [JxlUnsupportedException] with the feature name;
+/// malformed input throws another [JxlException] subtype.
 final class JxlDecoder {
+  const JxlDecoder._();
+
   /// Decodes [bytes] (bare codestream or ISOBMFF container).
   ///
   /// For animated inputs, decodes and returns the first visible frame.

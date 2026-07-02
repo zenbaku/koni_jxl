@@ -91,6 +91,7 @@ final class JxlImage {
 
 /// All visible frames of a decoded (possibly animated) JPEG XL image.
 final class JxlAnimation {
+  /// Internal: constructed by the decoder. Use [JxlDecoder.decodeAnimation].
   JxlAnimation.internal({
     required this.frames,
     required this.durations,
@@ -110,12 +111,16 @@ final class JxlAnimation {
   /// Per-frame timecodes (only meaningful when the stream has timecodes).
   final List<int> timecodes;
 
+  /// Numerator of the animation tick rate (ticks per second).
   final int tpsNumerator;
+
+  /// Denominator of the animation tick rate (ticks per second).
   final int tpsDenominator;
 
   /// Number of animation loops; 0 means loop forever.
   final int numLoops;
 
+  /// Whether this image has more than one frame.
   bool get isAnimated => frames.length > 1;
 
   /// Wall-clock duration of frame [index].
