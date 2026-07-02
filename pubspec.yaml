@@ -1,0 +1,6 @@
+name: _koni_jxl_workspace
+publish_to: none
+environment:
+  sdk: ^3.6.0
+workspace:
+  - packages/koni_jxl

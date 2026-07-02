@@ -1,0 +1,27 @@
+/// Small integer math helpers shared across the decoder.
+library;
+
+/// JPEG XL `UnpackSigned`: maps an unsigned value to a signed one,
+/// interleaving positives and negatives (0, -1, 1, -2, 2, ...).
+@pragma('vm:prefer-inline')
+int unpackSigned(int value) =>
+    (value & 1) == 0 ? value >> 1 : -(value >> 1) - 1;
+
+@pragma('vm:prefer-inline')
+int ceilDiv(int numerator, int denominator) =>
+    (numerator + denominator - 1) ~/ denominator;
+
+/// ceil(log2(x + 1)); the bit length of x.
+@pragma('vm:prefer-inline')
+int ceilLog1p(int x) => x.bitLength;
+
+/// ceil(log2(x)) for x >= 1.
+@pragma('vm:prefer-inline')
+int ceilLog2(int x) => (x - 1).bitLength;
+
+/// floor(log2(x + 1)).
+@pragma('vm:prefer-inline')
+int floorLog1p(int x) {
+  final c = x.bitLength;
+  return (x + 1) & x != 0 ? c - 1 : c;
+}

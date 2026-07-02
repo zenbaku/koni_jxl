@@ -1,0 +1,13 @@
+name: koni_jxl
+description: >-
+  Pure Dart JPEG XL (JXL) image decoder. Decodes .jxl files to raw pixels with
+  zero native dependencies — works on every Dart and Flutter platform.
+version: 0.1.0-dev
+repository: https://github.com/zenbaku/koni_jxl
+environment:
+  sdk: ^3.6.0
+resolution: workspace
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0
