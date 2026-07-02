@@ -70,24 +70,28 @@ void main(List<String> args) {
 Int32List _asInts(ImageBuffer plane, int maxValue) {
   final n = plane.height * plane.width;
   final out = Int32List(n);
+  var i = 0;
   if (plane.isInt) {
-    final buf = plane.intBuffer;
-    for (var i = 0; i < n; i++) {
-      out[i] = buf[i] < 0
-          ? 0
-          : buf[i] > maxValue
-              ? maxValue
-              : buf[i];
+    for (final row in plane.intRows) {
+      for (var x = 0; x < plane.width; x++) {
+        final v = row[x];
+        out[i++] = v < 0
+            ? 0
+            : v > maxValue
+                ? maxValue
+                : v;
+      }
     }
   } else {
-    final buf = plane.floatBuffer;
-    for (var i = 0; i < n; i++) {
-      final v = (buf[i] * maxValue + 0.5).truncate();
-      out[i] = v < 0
-          ? 0
-          : v > maxValue
-              ? maxValue
-              : v;
+    for (final row in plane.floatRows) {
+      for (var x = 0; x < plane.width; x++) {
+        final v = (row[x] * maxValue + 0.5).truncate();
+        out[i++] = v < 0
+            ? 0
+            : v > maxValue
+                ? maxValue
+                : v;
+      }
     }
   }
   return out;

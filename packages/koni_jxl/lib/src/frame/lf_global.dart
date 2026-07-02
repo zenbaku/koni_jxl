@@ -32,7 +32,12 @@ final class LfGlobal {
       throw JxlUnsupportedException('splines');
     }
     if (header.flags & FrameFlags.noise != 0) {
-      throw JxlUnsupportedException('noise');
+      if (metadata.colorChannelCount < 3) {
+        throw const JxlInvalidBitstreamException(
+            'cannot do noise in grayscale');
+      }
+      lf.noiseParameters =
+          List.generate(8, (_) => reader.readBits(10) / 1024.0);
     }
     if (!reader.readBool()) {
       for (var i = 0; i < 3; i++) {
@@ -73,6 +78,7 @@ final class LfGlobal {
   LfGlobal._();
 
   final List<Patch> patches = [];
+  List<double>? noiseParameters;
   final List<double> lfDequant = [1 / 4096, 1 / 512, 1 / 256];
   int globalScale = 0;
   int quantLF = 0;

@@ -200,10 +200,10 @@ final class HfCoefficients {
     final matrix = frame.globalMetadata.opsinInverseMatrix;
     final header = frame.header;
     final globalScale = 65536.0 / frame.lfGlobal.globalScale;
-    final scaleFactor = [
-      globalScale * math.pow(0.8, header.xqmScale - 2.0),
+    final scaleFactor = <double>[
+      globalScale * math.pow(0.8, header.xqmScale - 2.0).toDouble(),
       globalScale,
-      globalScale * math.pow(0.8, header.bqmScale - 2.0),
+      globalScale * math.pow(0.8, header.bqmScale - 2.0).toDouble(),
     ];
     final weights = frame.hfGlobal!.weights;
     final qbclut = [

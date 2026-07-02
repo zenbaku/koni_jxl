@@ -1,6 +1,5 @@
 import 'dart:typed_data';
 
-import '../util/image_buffer.dart';
 import 'afv_basis.dart';
 import 'dct.dart';
 import 'hf_coefficients.dart';
@@ -105,7 +104,7 @@ void _auxDCT2(List<Float32List> coeffs, List<Float32List> result, int pY,
 /// and inverse-transforms every varblock of this group into the frame's
 /// float channel rows.
 void invertVarDCTGroup(HfCoefficients hf, HfCoefficients? prev,
-    List<List<Float32List>> frameRows) {
+    List<List<Float32List>> frameRows, List<List<Float32List>> scratchBlock) {
   final frame = hf.frame;
   final header = frame.header;
   final meta = hf.lfg.hfMetadata!;
@@ -146,8 +145,6 @@ void invertVarDCTGroup(HfCoefficients hf, HfCoefficients? prev,
   final groupLocX = groupLoc.x << 8;
 
   final coeffs = hf.dequantHFCoeff;
-  final scratchBlock =
-      List.generate(5, (_) => floatMatrix(256, 256), growable: false);
   for (var i = 0; i < hf.blockIncluded.length; i++) {
     if (!hf.blockIncluded[i]) continue;
     final posY = meta.blockY[i];

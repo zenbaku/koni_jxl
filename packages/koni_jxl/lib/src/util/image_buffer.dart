@@ -1,64 +1,71 @@
 import 'dart:typed_data';
 
-/// A single image plane, either integer or float samples, stored flat with
-/// row stride == width (replaces jxlatte's nested `int[y][x]` arrays).
+/// A single image plane, either integer or float samples.
+///
+/// Storage is row-based: each row is an independent typed list. This keeps
+/// hot loops monomorphic (typed-data *views* are a different internal class
+/// than real typed lists and wreck AOT inlining/bounds-check elimination).
 final class ImageBuffer {
   ImageBuffer.int32(this.height, this.width)
-      : _intBuffer = Int32List(height * width),
-        _floatBuffer = null;
+      : _intRows =
+            List.generate(height, (_) => Int32List(width), growable: false),
+        _floatRows = null;
 
   ImageBuffer.float32(this.height, this.width)
-      : _intBuffer = null,
-        _floatBuffer = Float32List(height * width);
+      : _intRows = null,
+        _floatRows =
+            List.generate(height, (_) => Float32List(width), growable: false);
 
   ImageBuffer.copy(ImageBuffer other, {bool copyData = true})
       : height = other.height,
         width = other.width,
-        _intBuffer = switch (other._intBuffer) {
+        _intRows = switch (other._intRows) {
           null => null,
-          final b => copyData
-              ? Int32List.fromList(b)
-              : Int32List(other.height * other.width),
+          final rows => List.generate(
+              other.height,
+              (y) => copyData
+                  ? Int32List.fromList(rows[y])
+                  : Int32List(other.width),
+              growable: false),
         },
-        _floatBuffer = switch (other._floatBuffer) {
+        _floatRows = switch (other._floatRows) {
           null => null,
-          final b => copyData
-              ? Float32List.fromList(b)
-              : Float32List(other.height * other.width),
+          final rows => List.generate(
+              other.height,
+              (y) => copyData
+                  ? Float32List.fromList(rows[y])
+                  : Float32List(other.width),
+              growable: false),
         };
-
-  ImageBuffer.fromInt(this.height, this.width, Int32List buffer)
-      : _intBuffer = buffer,
-        _floatBuffer = null;
-
-  ImageBuffer.fromFloat(this.height, this.width, Float32List buffer)
-      : _intBuffer = null,
-        _floatBuffer = buffer;
 
   final int height;
   final int width;
-  Int32List? _intBuffer;
-  Float32List? _floatBuffer;
+  List<Int32List>? _intRows;
+  List<Float32List>? _floatRows;
 
-  bool get isInt => _intBuffer != null;
-  bool get isFloat => _floatBuffer != null;
+  bool get isInt => _intRows != null;
+  bool get isFloat => _floatRows != null;
 
-  Int32List get intBuffer => _intBuffer!;
-  Float32List get floatBuffer => _floatBuffer!;
+  List<Int32List> get intRows => _intRows!;
+  List<Float32List> get floatRows => _floatRows!;
 
   /// Converts integer samples to floats in [0, 1] by dividing by [maxValue].
   /// No-op if already float.
   void castToFloatWithMax(int maxValue) {
-    final ints = _intBuffer;
+    final ints = _intRows;
     if (ints == null) return;
     assert(maxValue >= 1);
-    final floats = Float32List(height * width);
     final scale = 1.0 / maxValue;
-    for (var i = 0; i < ints.length; i++) {
-      floats[i] = ints[i] * scale;
-    }
-    _floatBuffer = floats;
-    _intBuffer = null;
+    final floats = List.generate(height, (y) {
+      final src = ints[y];
+      final row = Float32List(width);
+      for (var x = 0; x < width; x++) {
+        row[x] = src[x] * scale;
+      }
+      return row;
+    }, growable: false);
+    _floatRows = floats;
+    _intRows = null;
   }
 
   void castToFloat(int depth) => castToFloatWithMax((1 << depth) - 1);
@@ -66,32 +73,27 @@ final class ImageBuffer {
   /// Converts float samples in [0, 1] to integers 0..[maxValue], rounding
   /// and clamping. No-op if already int.
   void castToIntWithMax(int maxValue) {
-    final floats = _floatBuffer;
+    final floats = _floatRows;
     if (floats == null) return;
     assert(maxValue >= 1);
-    final ints = Int32List(height * width);
-    for (var i = 0; i < floats.length; i++) {
-      final v = (floats[i] * maxValue + 0.5).truncate();
-      ints[i] = v < 0
-          ? 0
-          : v > maxValue
-              ? maxValue
-              : v;
-    }
-    _intBuffer = ints;
-    _floatBuffer = null;
+    final ints = List.generate(height, (y) {
+      final src = floats[y];
+      final row = Int32List(width);
+      for (var x = 0; x < width; x++) {
+        final v = (src[x] * maxValue + 0.5).truncate();
+        row[x] = v < 0
+            ? 0
+            : v > maxValue
+                ? maxValue
+                : v;
+      }
+      return row;
+    }, growable: false);
+    _intRows = ints;
+    _floatRows = null;
   }
 
   void castToInt(int depth) => castToIntWithMax((1 << depth) - 1);
-
-  /// Row views over the float buffer (shared storage, no copies). Rebuilt on
-  /// each call; cache locally in hot code.
-  List<Float32List> floatRows() {
-    final buf = floatBuffer;
-    return List.generate(
-        height, (y) => Float32List.sublistView(buf, y * width, (y + 1) * width),
-        growable: false);
-  }
 }
 
 /// A free-standing jagged float matrix (Java-style `float[h][w]`), used by

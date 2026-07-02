@@ -11,7 +11,7 @@ void main() {
   final sample = File('test/assets/screentone_256_d0_e5.jxl');
   final alphaSample = File('test/assets/alpha_page_d0_e3.jxl');
   final lossySample = File('test/assets/color_cover_d1.0_e3.jxl');
-  final unsupportedSample = File('test/assets/noise.jxl');
+  final unsupportedSample = File('test/assets/float_samples.jxl');
 
   group('decodeJxlToUiImage', () {
     test('decodes a lossless grayscale page', () async {
@@ -40,7 +40,7 @@ void main() {
       await expectLater(
         decodeJxlToUiImage(unsupportedSample.readAsBytesSync()),
         throwsA(isA<JxlUnsupportedException>()
-            .having((e) => e.feature, 'feature', 'noise')),
+            .having((e) => e.feature, 'feature', 'float-samples')),
       );
     });
   });

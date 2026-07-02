@@ -10,7 +10,9 @@ import 'io/bit_reader.dart';
 import 'io/container.dart';
 import 'jxl_image.dart';
 import 'render/blend.dart';
+import 'render/noise.dart';
 import 'render/transpose.dart';
+import 'render/upsample.dart';
 import 'util/image_buffer.dart';
 
 /// Decodes JPEG XL images to raw pixels.
@@ -30,6 +32,8 @@ final class _DecoderState {
   final List<List<ImageBuffer?>?> _reference =
       List<List<ImageBuffer?>?>.filled(4, null);
   List<ImageBuffer?>? _canvas;
+  int _visibleFrames = 0;
+  int _invisibleFrames = 0;
 
   JxlImage _decode(Uint8List bytes) {
     final demuxed = demuxContainer(bytes);
@@ -64,12 +68,22 @@ final class _DecoderState {
       final save = (header.saveAsReference != 0 || header.duration == 0) &&
           !header.isLast &&
           header.type != FrameFlags.lfFrame;
+      if (frame.isVisible) {
+        _visibleFrames++;
+        _invisibleFrames = 0;
+      } else {
+        _invisibleFrames++;
+      }
+      upsampleFrame(frame);
+      final noiseBuffer =
+          initializeNoise(frame, (_visibleFrames << 32) | _invisibleFrames);
       if (save && header.saveBeforeCT) {
         _reference[header.saveAsReference] = [
           for (final b in frame.buffer) ImageBuffer.copy(b),
         ];
       }
       _computePatches(frame);
+      synthesizeNoise(frame, noiseBuffer);
       _performColorTransforms(frame);
 
       if (header.type == FrameFlags.regularFrame ||
@@ -120,9 +134,10 @@ final class _DecoderState {
     if (imageHeader.xybEncoded) {
       final tf = TransferFunction.forTransfer(imageHeader.colorEncoding.tf);
       for (var c = 0; c < imageHeader.colorChannelCount && c < 3; c++) {
-        final buf = canvas[c]!.floatBuffer;
-        for (var i = 0; i < buf.length; i++) {
-          buf[i] = tf.fromLinear(buf[i]);
+        for (final row in canvas[c]!.floatRows) {
+          for (var i = 0; i < row.length; i++) {
+            row[i] = tf.fromLinear(row[i]);
+          }
         }
       }
     }
@@ -134,16 +149,39 @@ final class _DecoderState {
   }
 
   /// Applies the XYB inverse (into linear RGB with the image's primaries)
-  /// in place on the frame's color channels.
+  /// and/or the YCbCr transform in place on the frame's color channels.
   void _performColorTransforms(Frame frame) {
-    if (!imageHeader.xybEncoded) return;
-    final bundle = imageHeader.colorEncoding;
-    final matrix =
-        imageHeader.opsinInverseMatrix.getMatrix(bundle.prim, bundle.white);
+    if (!imageHeader.xybEncoded && !frame.header.doYCbCr) return;
+    for (var c = 0; c < 3; c++) {
+      frame.buffer[c].castToFloat(imageHeader.bitDepth.bitsPerSample);
+    }
     final rows = [
-      for (var c = 0; c < 3; c++) frame.buffer[c].floatRows(),
+      for (var c = 0; c < 3; c++) frame.buffer[c].floatRows,
     ];
-    matrix.invertXyb(rows, imageHeader.toneMapping.intensityTarget);
+    if (imageHeader.xybEncoded) {
+      final bundle = imageHeader.colorEncoding;
+      final matrix =
+          imageHeader.opsinInverseMatrix.getMatrix(bundle.prim, bundle.white);
+      matrix.invertXyb(rows, imageHeader.toneMapping.intensityTarget);
+    }
+    if (frame.header.doYCbCr) {
+      final height = frame.buffer[0].height;
+      final width = frame.buffer[0].width;
+      for (var y = 0; y < height; y++) {
+        final cbRow = rows[0][y];
+        final yRow = rows[1][y];
+        final crRow = rows[2][y];
+        for (var x = 0; x < width; x++) {
+          final cb = cbRow[x];
+          final yh = yRow[x] + 0.50196078431372549019;
+          final cr = crRow[x];
+          cbRow[x] = yh + 1.402 * cr;
+          yRow[x] =
+              yh - 0.34413628620102214650 * cb - 0.71413628620102214650 * cr;
+          crRow[x] = yh + 1.772 * cb;
+        }
+      }
+    }
   }
 
   void _computePatches(Frame frame) {

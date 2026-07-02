@@ -30,9 +30,7 @@ void main() {
         .whereType<File>()
         .where((f) =>
             f.path.endsWith('.jxl') &&
-            RegExp(r'_d0\.5_|_d1\.0_|_d2\.0_').hasMatch(f.path) &&
-            // Noise synthesis is not implemented yet (M6).
-            !f.path.contains('noise'))
+            RegExp(r'_d0\.5_|_d1\.0_|_d2\.0_').hasMatch(f.path))
         .toList()
       ..sort((a, b) => a.path.compareTo(b.path));
     test('corpus coverage', () {

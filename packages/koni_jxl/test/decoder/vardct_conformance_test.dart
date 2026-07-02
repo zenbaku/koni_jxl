@@ -24,6 +24,10 @@ const cases = [
   'bike',
   'alpha_nonpremultiplied',
   'alpha_premultiplied',
+  'noise',
+  'cafe',
+  'bench_oriented_brg',
+  'upsampling',
 ];
 
 void main() {

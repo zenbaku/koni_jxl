@@ -200,9 +200,6 @@ final class Frame {
   }
 
   void decodeFrame() {
-    if (header.doYCbCr || header.isSubsampled) {
-      throw JxlUnsupportedException('ycbcr');
-    }
     if (globalMetadata.bitDepth.usesFloatSamples) {
       throw JxlUnsupportedException('float-samples');
     }
@@ -211,23 +208,38 @@ final class Frame {
         throw JxlUnsupportedException('float-samples');
       }
     }
-    if (header.upsampling != 1 || header.ecUpsampling.any((u) => u != 1)) {
-      throw JxlUnsupportedException('upsampling');
+
+    const timings = bool.fromEnvironment('jxl.timings');
+    final sw = timings ? (Stopwatch()..start()) : null;
+    void mark(String label) {
+      if (sw != null) {
+        // ignore: avoid_print
+        print('  $label: ${sw.elapsedMilliseconds} ms');
+        sw.reset();
+      }
     }
 
     final isVarDCT = header.encoding == FrameFlags.vardct;
     lfGlobal = LfGlobal.read(toc.sectionReader(0), this);
+    mark('lfGlobal');
     final padded = paddedFrameSize;
     final colors = colorChannelCount;
     final channelCount = colors + globalMetadata.extraChannels.length;
     buffer = [
       for (var c = 0; c < channelCount; c++)
         c < colors && (globalMetadata.xybEncoded || isVarDCT)
-            ? ImageBuffer.float32(padded.height, padded.width)
+            ? ImageBuffer.float32(
+                c < 3
+                    ? padded.height >> header.jpegUpsamplingY[c]
+                    : padded.height,
+                c < 3
+                    ? padded.width >> header.jpegUpsamplingX[c]
+                    : padded.width)
             : ImageBuffer.int32(padded.height, padded.width),
     ];
 
     _decodeLfGroups();
+    mark('lfGroups');
 
     final hfGlobalReader = toc.sectionReader(1 + numLfGroups);
     if (isVarDCT) {
@@ -239,16 +251,70 @@ final class Frame {
           Pass(hfGlobalReader, this, i, i > 0 ? passes[i - 1].minShift : 0));
     }
 
+    mark('hfGlobal+passes');
     _decodePassGroups();
+    mark('passGroups');
 
     lfGlobal.globalModular.applyTransforms();
     _copyOutModular();
+    mark('transforms+copyOut');
 
+    _invertSubsampling();
     if (header.restorationFilter.gab) {
       performGabConvolution(this, colors);
+      mark('gaborish');
     }
     if (header.restorationFilter.epfIterations > 0) {
       performEdgePreservingFilter(this, colors);
+      mark('epf');
+    }
+  }
+
+  /// Inverts JPEG-style chroma subsampling by repeatedly doubling the
+  /// subsampled color planes with a [0.25, 0.75] filter.
+  void _invertSubsampling() {
+    for (var c = 0; c < 3; c++) {
+      var xShift = header.jpegUpsamplingX[c];
+      while (xShift-- > 0) {
+        final old = buffer[c]
+          ..castToFloat(globalMetadata.bitDepth.bitsPerSample);
+        final oldRows = old.floatRows;
+        final newBuffer = ImageBuffer.float32(old.height, old.width * 2);
+        final newRows = newBuffer.floatRows;
+        for (var y = 0; y < old.height; y++) {
+          final oldRow = oldRows[y];
+          final newRow = newRows[y];
+          for (var x = 0; x < oldRow.length; x++) {
+            final b75 = 0.75 * oldRow[x];
+            newRow[2 * x] = b75 + 0.25 * oldRow[x == 0 ? 0 : x - 1];
+            newRow[2 * x + 1] = b75 +
+                0.25 *
+                    oldRow[x + 1 == oldRow.length ? oldRow.length - 1 : x + 1];
+          }
+        }
+        buffer[c] = newBuffer;
+      }
+      var yShift = header.jpegUpsamplingY[c];
+      while (yShift-- > 0) {
+        final old = buffer[c]
+          ..castToFloat(globalMetadata.bitDepth.bitsPerSample);
+        final oldRows = old.floatRows;
+        final newBuffer = ImageBuffer.float32(old.height * 2, old.width);
+        final newRows = newBuffer.floatRows;
+        for (var y = 0; y < old.height; y++) {
+          final oldRow = oldRows[y];
+          final prevRow = oldRows[y == 0 ? 0 : y - 1];
+          final nextRow = oldRows[y + 1 == old.height ? old.height - 1 : y + 1];
+          final first = newRows[2 * y];
+          final second = newRows[2 * y + 1];
+          for (var x = 0; x < oldRow.length; x++) {
+            final b75 = 0.75 * oldRow[x];
+            first[x] = b75 + 0.25 * prevRow[x];
+            second[x] = b75 + 0.25 * nextRow[x];
+          }
+        }
+        buffer[c] = newBuffer;
+      }
     }
   }
 
@@ -341,15 +407,23 @@ final class Frame {
       }
     }
 
+    const timings = bool.fromEnvironment('jxl.timings');
+    final sw2 = timings ? (Stopwatch()..start()) : null;
     if (isVarDCT) {
       final frameRows = [
-        for (var c = 0; c < 3; c++) buffer[c].floatRows(),
+        for (var c = 0; c < 3; c++) buffer[c].floatRows,
       ];
+      final scratch =
+          List.generate(5, (_) => floatMatrix(256, 256), growable: false);
       for (var pass = 0; pass < numPasses; pass++) {
         for (var group = 0; group < numGroups; group++) {
           invertVarDCTGroup(hfGroups[pass][group]!,
-              pass > 0 ? hfGroups[pass - 1][group] : null, frameRows);
+              pass > 0 ? hfGroups[pass - 1][group] : null, frameRows, scratch);
         }
+      }
+      if (sw2 != null) {
+        // ignore: avoid_print
+        print('  vardct inversion: ${sw2.elapsedMilliseconds} ms');
       }
     }
   }
@@ -376,31 +450,29 @@ final class Frame {
       final src = channels[c].buffer!;
       final srcWidth = channels[c].width;
       if (isModularXYB && c == 2) {
-        final out = buffer[cOut].floatBuffer;
-        final outWidth = buffer[cOut].width;
+        final out = buffer[cOut].floatRows;
         final scaleFactor = lfGlobal.lfDequant[cOut];
         final srcY = channels[0].buffer!;
         for (var y = 0; y < boundsHeight; y++) {
+          final row = out[y];
           for (var x = 0; x < boundsWidth; x++) {
-            out[y * outWidth + x] =
+            row[x] =
                 scaleFactor * (srcY[y * srcWidth + x] + src[y * srcWidth + x]);
           }
         }
       } else if (buffer[cOut].isFloat) {
-        final out = buffer[cOut].floatBuffer;
-        final outWidth = buffer[cOut].width;
+        final out = buffer[cOut].floatRows;
         final scaleFactor = isModularXYB ? lfGlobal.lfDequant[cOut] : 1.0;
         for (var y = 0; y < boundsHeight; y++) {
+          final row = out[y];
           for (var x = 0; x < boundsWidth; x++) {
-            out[y * outWidth + x] = scaleFactor * src[y * srcWidth + x];
+            row[x] = scaleFactor * src[y * srcWidth + x];
           }
         }
       } else {
-        final out = buffer[cOut].intBuffer;
-        final outWidth = buffer[cOut].width;
+        final out = buffer[cOut].intRows;
         for (var y = 0; y < boundsHeight; y++) {
-          out.setRange(
-              y * outWidth, y * outWidth + boundsWidth, src, y * srcWidth);
+          out[y].setRange(0, boundsWidth, src, y * srcWidth);
         }
       }
     }

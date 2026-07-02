@@ -25,9 +25,9 @@ void performGabConvolution(Frame frame, int colors) {
     frame.buffer[c].castToFloat(frame.globalMetadata.bitDepth.bitsPerSample);
     final height = frame.buffer[c].height;
     final width = frame.buffer[c].width;
-    final rows = frame.buffer[c].floatRows();
+    final rows = frame.buffer[c].floatRows;
     final newBuffer = ImageBuffer.float32(height, width);
-    final newRows = newBuffer.floatRows();
+    final newRows = newBuffer.floatRows;
     for (var y = 0; y < height; y++) {
       final north = y == 0 ? 0 : y - 1;
       final south = y + 1 == height ? height - 1 : y + 1;
@@ -49,16 +49,13 @@ void performGabConvolution(Frame frame, int colors) {
   }
 }
 
-// (dy, dx) offsets.
-const _epfCross = [
-  (0, 0), (-1, 0), (1, 0), (0, -1), (0, 1), //
-];
+// (dy, dx) offsets, as parallel flat arrays (records are too slow in the
+// per-pixel loops).
+const _epfCrossDy = [0, -1, 1, 0, 0];
+const _epfCrossDx = [0, 0, 0, -1, 1];
 
-const _epfDoubleCross = [
-  (0, 0), (-1, 0), (1, 0), (0, -1), (0, 1), //
-  (1, -1), (1, 1), (-1, 1), (-1, -1), //
-  (-2, 0), (2, 0), (0, 2), (0, -2),
-];
+const _epfDoubleCrossDy = [0, -1, 1, 0, 0, 1, 1, -1, -1, -2, 2, 0, 0];
+const _epfDoubleCrossDx = [0, 0, 0, -1, 1, -1, 1, 1, -1, 0, 0, 2, -2];
 
 /// Edge-preserving filter: up to three weighted-average passes over the
 /// color channels, guided by per-block sigma.
@@ -107,10 +104,10 @@ void performEdgePreservingFilter(Frame frame, int colors) {
     if (i == 0 && rf.epfIterations < 3) continue;
     if (i == 2 && rf.epfIterations < 2) break;
     final inputRows = [
-      for (var c = 0; c < colors; c++) frame.buffer[c].floatRows(),
+      for (var c = 0; c < colors; c++) frame.buffer[c].floatRows,
     ];
     final outputRows = [
-      for (var c = 0; c < colors; c++) outputBuffer[c].floatRows(),
+      for (var c = 0; c < colors; c++) outputBuffer[c].floatRows,
     ];
     final double sigmaScale;
     if (i == 0) {
@@ -120,10 +117,25 @@ void performEdgePreservingFilter(Frame frame, int colors) {
     } else {
       sigmaScale = stepMultiplier;
     }
-    final crossList = i == 0 ? _epfDoubleCross : _epfCross;
+    final crossDy = i == 0 ? _epfDoubleCrossDy : _epfCrossDy;
+    final crossDx = i == 0 ? _epfDoubleCrossDx : _epfCrossDx;
+    final crossCount = crossDy.length;
     final sumChannels = Float32List(colors);
-    for (var y = 0; y < padded.height; y++) {
-      for (var x = 0; x < padded.width; x++) {
+    // For grayscale, the three spec distance channels read the same plane,
+    // so their scales fold into one factor.
+    final distChannels = colors == 1 ? 1 : 3;
+    final scale0 = colors == 1
+        ? rf.epfChannelScale[0] + rf.epfChannelScale[1] + rf.epfChannelScale[2]
+        : rf.epfChannelScale[0];
+    final scale1 = rf.epfChannelScale[1];
+    final scale2 = rf.epfChannelScale[2];
+    final height = padded.height;
+    final width = padded.width;
+    // Inside this margin, no coordinate mirroring can trigger.
+    const margin = 3;
+    for (var y = 0; y < height; y++) {
+      final interiorY = y >= margin && y + margin < height;
+      for (var x = 0; x < width; x++) {
         final double s;
         if (inverseSigma != null) {
           s = inverseSigma[y >> 3][x >> 3];
@@ -136,19 +148,43 @@ void performEdgePreservingFilter(Frame frame, int colors) {
           }
           continue;
         }
+        final interior = interiorY && x >= margin && x + margin < width;
         var sumWeights = 0.0;
         sumChannels.fillRange(0, colors, 0);
-        for (final (cy, cx) in crossList) {
-          final dist = i == 2
-              ? _epfDistance2(inputRows, colors, rf.epfChannelScale, y, x, cy,
-                  cx, padded.height, padded.width)
-              : _epfDistance1(inputRows, colors, rf.epfChannelScale, y, x, cy,
-                  cx, padded.height, padded.width);
+        for (var k = 0; k < crossCount; k++) {
+          final cy = crossDy[k];
+          final cx = crossDx[k];
+          var dist = 0.0;
+          if (interior) {
+            for (var c = 0; c < distChannels; c++) {
+              final buffC = inputRows[c];
+              final scale = c == 0 ? scale0 : (c == 1 ? scale1 : scale2);
+              if (i == 2) {
+                dist += (buffC[y][x] - buffC[y + cy][x + cx]).abs() * scale;
+              } else {
+                var channelDist = 0.0;
+                for (var e = 0; e < 5; e++) {
+                  final ey = _epfCrossDy[e];
+                  final ex = _epfCrossDx[e];
+                  channelDist +=
+                      (buffC[y + ey][x + ex] - buffC[y + cy + ey][x + cx + ex])
+                          .abs();
+                }
+                dist += channelDist * scale;
+              }
+            }
+          } else {
+            dist = i == 2
+                ? _epfDistance2(inputRows, colors, rf.epfChannelScale, y, x, cy,
+                    cx, height, width)
+                : _epfDistance1(inputRows, colors, rf.epfChannelScale, y, x, cy,
+                    cx, height, width);
+          }
           final weight =
               _epfWeight(rf.epfBorderSadMul, sigmaScale, dist, s, y, x);
           sumWeights += weight;
-          final mY = mirrorCoordinate(y + cy, padded.height);
-          final mX = mirrorCoordinate(x + cx, padded.width);
+          final mY = interior ? y + cy : mirrorCoordinate(y + cy, height);
+          final mX = interior ? x + cx : mirrorCoordinate(x + cx, width);
           for (var c = 0; c < colors; c++) {
             sumChannels[c] += inputRows[c][mY][mX] * weight;
           }
@@ -181,7 +217,9 @@ double _epfDistance1(
     final i = colors == 1 ? 0 : c;
     final buffC = buffer[i];
     final scale = channelScale[c];
-    for (final (cy, cx) in _epfCross) {
+    for (var e = 0; e < 5; e++) {
+      final cy = _epfCrossDy[e];
+      final cx = _epfCrossDx[e];
       final pY = mirrorCoordinate(basePosY + cy, height);
       final pX = mirrorCoordinate(basePosX + cx, width);
       final dY = mirrorCoordinate(basePosY + dCrossY + cy, height);

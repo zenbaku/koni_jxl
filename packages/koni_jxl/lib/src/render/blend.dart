@@ -20,20 +20,16 @@ double _clamp01(double v) => v < 0
 void _copyToCanvas(ImageBuffer canvas, int patchY, int patchX, int frameY,
     int frameX, int height, int width, ImageBuffer frame) {
   if (canvas.isInt) {
-    final c = canvas.intBuffer;
-    final f = frame.intBuffer;
+    final c = canvas.intRows;
+    final f = frame.intRows;
     for (var y = 0; y < height; y++) {
-      final destStart = (y + patchY) * canvas.width + patchX;
-      final srcStart = (y + frameY) * frame.width + frameX;
-      c.setRange(destStart, destStart + width, f, srcStart);
+      c[y + patchY].setRange(patchX, patchX + width, f[y + frameY], frameX);
     }
   } else {
-    final c = canvas.floatBuffer;
-    final f = frame.floatBuffer;
+    final c = canvas.floatRows;
+    final f = frame.floatRows;
     for (var y = 0; y < height; y++) {
-      final destStart = (y + patchY) * canvas.width + patchX;
-      final srcStart = (y + frameY) * frame.width + frameX;
-      c.setRange(destStart, destStart + width, f, srcStart);
+      c[y + patchY].setRange(patchX, patchX + width, f[y + frameY], frameX);
     }
   }
 }
@@ -51,25 +47,23 @@ void _blendAdd(
     int height,
     int width) {
   if (frame.isInt) {
-    final cb = canvas.intBuffer;
-    final fb = frame.intBuffer;
-    final rb = ref.intBuffer;
+    final cb = canvas.intRows;
+    final fb = frame.intRows;
+    final rb = ref.intRows;
     for (var y = 0; y < height; y++) {
       for (var x = 0; x < width; x++) {
-        cb[(y + patchY) * canvas.width + x + patchX] =
-            rb[(y + refY) * ref.width + x + refX] +
-                fb[(y + frameY) * frame.width + x + frameX];
+        cb[y + patchY][x + patchX] =
+            rb[y + refY][x + refX] + fb[y + frameY][x + frameX];
       }
     }
   } else {
-    final cb = canvas.floatBuffer;
-    final fb = frame.floatBuffer;
-    final rb = ref.floatBuffer;
+    final cb = canvas.floatRows;
+    final fb = frame.floatRows;
+    final rb = ref.floatRows;
     for (var y = 0; y < height; y++) {
       for (var x = 0; x < width; x++) {
-        cb[(y + patchY) * canvas.width + x + patchX] =
-            rb[(y + refY) * ref.width + x + refX] +
-                fb[(y + frameY) * frame.width + x + frameX];
+        cb[y + patchY][x + patchX] =
+            rb[y + refY][x + refX] + fb[y + frameY][x + frameX];
       }
     }
   }
@@ -88,15 +82,14 @@ void _blendMult(
     int height,
     int width,
     bool clamp) {
-  final cb = canvas.floatBuffer;
-  final fb = frame.floatBuffer;
-  final rb = ref.floatBuffer;
+  final cb = canvas.floatRows;
+  final fb = frame.floatRows;
+  final rb = ref.floatRows;
   for (var y = 0; y < height; y++) {
     for (var x = 0; x < width; x++) {
-      var newSample = fb[(y + frameY) * frame.width + x + frameX];
+      var newSample = fb[y + frameY][x + frameX];
       if (clamp) newSample = _clamp01(newSample);
-      cb[(y + patchY) * canvas.width + x + patchX] =
-          newSample * rb[(y + refY) * ref.width + x + refX];
+      cb[y + patchY][x + patchX] = newSample * rb[y + refY][x + refX];
     }
   }
 }
@@ -124,30 +117,33 @@ void _blendBlend(
         height, width);
     return;
   }
-  final oaf = isAlpha ? null : refAlpha!.floatBuffer;
-  final naf = isAlpha ? null : frameAlpha!.floatBuffer;
-  final rf = ref.floatBuffer;
-  final ff = frame.floatBuffer;
-  final cf = canvas.floatBuffer;
+  final oaf = isAlpha ? null : refAlpha!.floatRows;
+  final naf = isAlpha ? null : frameAlpha!.floatRows;
+  final rf = ref.floatRows;
+  final ff = frame.floatRows;
+  final cf = canvas.floatRows;
   for (var y = 0; y < height; y++) {
     for (var x = 0; x < width; x++) {
-      final fo = (y + frameY) * frame.width + x + frameX;
-      final ro = (y + refY) * ref.width + x + refX;
-      final co = (y + patchY) * canvas.width + x + patchX;
-      final oldSample = rf[ro];
-      final newSample = ff[fo];
-      final oldAlpha = isAlpha ? oldSample : oaf![ro];
-      var newAlpha = isAlpha ? newSample : naf![fo];
+      final fy2 = y + frameY;
+      final fx2 = x + frameX;
+      final ry2 = y + refY;
+      final rx2 = x + refX;
+      final oldSample = rf[ry2][rx2];
+      final newSample = ff[fy2][fx2];
+      final oldAlpha = isAlpha ? oldSample : oaf![ry2][rx2];
+      var newAlpha = isAlpha ? newSample : naf![fy2][fx2];
       if (clamp) newAlpha = _clamp01(newAlpha);
+      final double result;
       if (isAlpha) {
-        cf[co] = oldAlpha + newAlpha * (1 - oldAlpha);
+        result = oldAlpha + newAlpha * (1 - oldAlpha);
       } else if (premult) {
-        cf[co] = newSample + oldSample * (1 - newAlpha);
+        result = newSample + oldSample * (1 - newAlpha);
       } else {
-        cf[co] =
+        result =
             (newSample * newAlpha + oldSample * oldAlpha * (1 - newAlpha)) /
                 (oldAlpha + newAlpha * (1 - oldAlpha));
       }
+      cf[y + patchY][x + patchX] = result;
     }
   }
 }
@@ -178,18 +174,16 @@ void _blendMulAdd(
     _copyToCanvas(canvas, patchY, patchX, frameY, frameX, height, width, ref);
     return;
   }
-  final naf = frameAlpha!.floatBuffer;
-  final rf = ref.floatBuffer;
-  final ff = frame.floatBuffer;
-  final cf = canvas.floatBuffer;
+  final naf = frameAlpha!.floatRows;
+  final rf = ref.floatRows;
+  final ff = frame.floatRows;
+  final cf = canvas.floatRows;
   for (var y = 0; y < height; y++) {
     for (var x = 0; x < width; x++) {
-      final fo = (y + frameY) * frame.width + x + frameX;
-      final ro = (y + refY) * ref.width + x + refX;
-      final co = (y + patchY) * canvas.width + x + patchX;
-      var newAlpha = naf[fo];
+      var newAlpha = naf[y + frameY][x + frameX];
       if (clamp) newAlpha = _clamp01(newAlpha);
-      cf[co] = rf[ro] + newAlpha * ff[fo];
+      cf[y + patchY][x + patchX] =
+          rf[y + refY][x + refX] + newAlpha * ff[y + frameY][x + frameX];
     }
   }
 }

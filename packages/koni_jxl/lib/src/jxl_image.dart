@@ -46,9 +46,9 @@ final class JxlImage {
       return (v * 255 + (max >> 1)) ~/ max;
     }
 
-    int sample(ImageBuffer plane, int i, int max) {
-      if (plane.isInt) return scaleInt(plane.intBuffer[i], max);
-      final f = plane.floatBuffer[i];
+    int sample(ImageBuffer plane, int y, int x, int max) {
+      if (plane.isInt) return scaleInt(plane.intRows[y][x], max);
+      final f = plane.floatRows[y][x];
       final v = (f * 255 + 0.5).floor();
       return v < 0
           ? 0
@@ -60,14 +60,16 @@ final class JxlImage {
     final r = channels[0];
     final g = channels[colors > 1 ? 1 : 0];
     final b = channels[colors > 1 ? 2 : 0];
-    final n = w * h;
-    for (var i = 0; i < n; i++) {
-      final o = i << 2;
-      out[o] = sample(r, i, maxValue);
-      out[o + 1] = sample(g, i, maxValue);
-      out[o + 2] = sample(b, i, maxValue);
-      out[o + 3] =
-          alphaChannel != null ? sample(alphaChannel, i, alphaMax) : 255;
+    var o = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        out[o] = sample(r, y, x, maxValue);
+        out[o + 1] = sample(g, y, x, maxValue);
+        out[o + 2] = sample(b, y, x, maxValue);
+        out[o + 3] =
+            alphaChannel != null ? sample(alphaChannel, y, x, alphaMax) : 255;
+        o += 4;
+      }
     }
     return out;
   }

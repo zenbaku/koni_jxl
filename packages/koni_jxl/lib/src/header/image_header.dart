@@ -246,6 +246,43 @@ final class ImageHeader {
   SizeDim get orientedSize =>
       orientation > 4 ? (width: size.height, height: size.width) : size;
 
+  List<List<List<Float32List>>>? _upWeights;
+
+  /// Upsampling weights: `upWeights[l][ky * k + kx]` is a 5x5 kernel,
+  /// where k = 2 << l.
+  List<List<List<Float32List>>> get upWeights {
+    final cached = _upWeights;
+    if (cached != null) return cached;
+    final result = <List<List<Float32List>>>[];
+    for (var l = 0; l < 3; l++) {
+      final k = 1 << (l + 1);
+      final upKWeights = switch (k) {
+        2 => up2Weights,
+        4 => up4Weights,
+        _ => up8Weights,
+      };
+      final level = <List<Float32List>>[];
+      for (var ky = 0; ky < k; ky++) {
+        for (var kx = 0; kx < k; kx++) {
+          final kernel = List.generate(5, (_) => Float32List(5));
+          for (var iy = 0; iy < 5; iy++) {
+            for (var ix = 0; ix < 5; ix++) {
+              final j = ky < k ~/ 2 ? iy + 5 * ky : (4 - iy) + 5 * (k - 1 - ky);
+              final i = kx < k ~/ 2 ? ix + 5 * kx : (4 - ix) + 5 * (k - 1 - kx);
+              final x = i < j ? j : i;
+              final y = x ^ j ^ i;
+              final index = 5 * k * y ~/ 2 - y * (y - 1) ~/ 2 + x - y;
+              kernel[iy][ix] = upKWeights[index];
+            }
+          }
+          level.add(kernel);
+        }
+      }
+      result.add(level);
+    }
+    return _upWeights = result;
+  }
+
   bool get isGrayscale => colorEncoding.colorEncoding == ColorFlags.ceGray;
 
   int get colorChannelCount => isGrayscale ? 1 : 3;
