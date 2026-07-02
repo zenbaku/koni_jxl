@@ -92,8 +92,14 @@ Huffman-code-length size estimates — Shannon entropy is NOT a safe
 proxy: prefix codes pay a 1-bit-per-symbol floor that dominates
 highly skewed histograms (a 16-color image estimated 1K by entropy
 but coded 33K until LZ77 was chosen on exact costs). 16-bit input is
-supported. Remaining encoder ideas: ANS (removes the 1-bit floor),
-per-image learned trees, delta palette.
+supported. Remaining encoder ideas:
+per-image learned trees, delta palette. ANS (rANS) IS now implemented as a
+fourth per-image candidate: it spends fractional bits (no 1-bit-per-symbol
+prefix floor) and is chosen by size estimate when it beats plain/LZ77
+prefix, but it cannot carry LZ77 matches, so LZ77 still wins on very
+repetitive content. Real manga page: 91% of cjxl -e1 (was 93%);
+16-color palette art: 63% (was 112%). All ANS output is bit-exact through
+this decoder and djxl.
 
 ## Robustness
 

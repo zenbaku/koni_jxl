@@ -29,7 +29,7 @@ verified against libjxl (`djxl`) and the official conformance suite.
 - **Lossless** — `JxlEncoder.encodeLossless` / `encodeLossless16`
   (interleaved 8/16-bit gray/RGB with optional alpha) and
   `encodeImage` (JXL→JXL transcode). Modular with a fixed gradient-context
-  tree and per-image choice of LZ77 / palette / YCoCg RCT by exact
+  tree and per-image choice of LZ77 / ANS / palette / YCoCg RCT by exact
   coded-size estimation. Every output is verified bit-exact through this
   decoder **and** `djxl` in tests.
 

@@ -344,18 +344,27 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   }
   final plainCodes =
       EntropyCodes.build(_numContexts, allContexts, allValues, _config);
-  // Pick whichever encoding the histograms say is smaller.
-  final useLz77 = lzCodes.estimatedBits() < plainCodes.estimatedBits();
+  // Three candidates: plain prefix, LZ77 prefix, and plain ANS. ANS spends
+  // fractional bits (no 1-bit-per-symbol floor) but can't carry LZ77 here.
+  final lzEst = lzCodes.estimatedBits();
+  final plainEst = plainCodes.estimatedBits();
+  final ansEst =
+      plainCodes.ansViable ? plainCodes.ansEstimatedBits() : double.infinity;
+  final useAns = ansEst < plainEst && ansEst < lzEst;
+  final useLz77 = !useAns && lzEst < plainEst;
   if (const bool.fromEnvironment('jxl.encdebug')) {
     // ignore: avoid_print
-    print('palette=${palette?.length} rct=$useRct lz=$useLz77 '
-        'lzEst=${(lzCodes.estimatedBits() / 8192).round()}K '
-        'plainEst=${(plainCodes.estimatedBits() / 8192).round()}K');
+    print('palette=${palette?.length} rct=$useRct '
+        'mode=${useAns ? "ans" : (useLz77 ? "lz" : "prefix")} '
+        'lzEst=${(lzEst / 8192).round()}K plainEst=${(plainEst / 8192).round()}K '
+        'ansEst=${ansEst.isFinite ? (ansEst / 8192).round() : "-"}K');
   }
   final residualCodes = useLz77 ? lzCodes : plainCodes;
 
   void writeSectionPayload(BitWriter w, int s) {
-    if (useLz77) {
+    if (useAns) {
+      residualCodes.encodeAnsSection(w, sectionContexts[s], sectionValues[s]);
+    } else if (useLz77) {
       residualCodes.writeOps(w, sectionOps[s]);
     } else {
       for (var i = 0; i < sectionValues[s].length; i++) {
@@ -370,7 +379,11 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   lfGlobal.writeBool(true); // has_global_tree
   _writeFixedTree(lfGlobal);
   // Residual distributions follow the tree (read inside MaTree.read).
-  residualCodes.writeHeader(lfGlobal);
+  if (useAns) {
+    residualCodes.writeAnsHeader(lfGlobal);
+  } else {
+    residualCodes.writeHeader(lfGlobal);
+  }
   // Global modular stream header.
   lfGlobal.writeBool(true); // use_global_tree
   lfGlobal.writeBool(true); // default wp_params

@@ -1,6 +1,9 @@
+import 'dart:math' as math;
+
 import '../entropy/hybrid_uint.dart';
 import '../io/bit_writer.dart';
 import '../util/math_helper.dart';
+import 'ans_writer.dart';
 
 /// Entropy encoding (prefix-code variant): the exact mirror of
 /// `EntropyStream.read` with `use_prefix_code = 1` and no LZ77.
@@ -499,6 +502,101 @@ final class EntropyCodes {
       bits += 8.0 * hist.length.clamp(4, 64) + 40;
     }
     return bits;
+  }
+
+  // --- ANS (rANS) mode ---
+
+  /// Whether every cluster's token alphabet fits in 2^8 = 256 symbols, the
+  /// most an ANS distribution can address (logAlphabetSize <= 8).
+  bool get ansViable {
+    if (usesLz77) return false;
+    for (final size in _alphabetSizes) {
+      if (size > 256) return false;
+    }
+    return true;
+  }
+
+  int get _ansLogAlphabetSize {
+    var maxSize = 1;
+    for (final size in _alphabetSizes) {
+      if (size > maxSize) maxSize = size;
+    }
+    var log = 5;
+    while ((1 << log) < maxSize) {
+      log++;
+    }
+    return log;
+  }
+
+  /// Coded-size estimate for the ANS path: fractional bits per token
+  /// (the whole point of ANS) plus the extra bits and a header estimate.
+  double ansEstimatedBits() {
+    var bits = _extraBits;
+    for (final hist in _histograms) {
+      var total = 0;
+      for (final count in hist) {
+        total += count;
+      }
+      if (total == 0) continue;
+      final freqs = normalizeFrequencies(hist, hist.length);
+      for (var s = 0; s < hist.length; s++) {
+        if (hist[s] > 0) {
+          bits += hist[s] * (math.log(4096 / freqs[s]) / math.ln2);
+        }
+      }
+      bits += 12.0 * hist.length + 40; // distribution header
+    }
+    return bits;
+  }
+
+  List<AnsAliasTable>? _ansTables;
+  int _ansLog = 8;
+
+  /// Writes the ANS distribution header and prepares the alias tables.
+  void writeAnsHeader(BitWriter w) {
+    _ansLog = _ansLogAlphabetSize;
+    final clusters = _numClusters;
+    w.writeBool(false); // lz77
+    if (clusters > 1) {
+      w.writeBool(true); // simple cluster map
+      final nbits = ceilLog1p(clusters - 1);
+      assert(nbits <= 3);
+      w.writeBits(nbits, 2);
+      for (var i = 0; i < clusters; i++) {
+        w.writeBits(i, nbits);
+      }
+    }
+    w.writeBool(false); // use_prefix_code = false (ANS)
+    w.writeBits(_ansLog - 5, 2);
+    for (var c = 0; c < clusters; c++) {
+      w.writeBits(config.splitExponent, ceilLog1p(_ansLog));
+      if (config.splitExponent != _ansLog) {
+        w.writeBits(config.msbInToken, ceilLog1p(config.splitExponent));
+        w.writeBits(config.lsbInToken,
+            ceilLog1p(config.splitExponent - config.msbInToken));
+      }
+    }
+    _ansTables = [];
+    for (var c = 0; c < clusters; c++) {
+      final declared = _histograms[c].length < 3 ? 3 : _histograms[c].length;
+      final counts = List<int>.filled(declared, 0);
+      for (var s = 0; s < _histograms[c].length; s++) {
+        counts[s] = _histograms[c][s];
+      }
+      final freqs = normalizeFrequencies(counts, declared);
+      writeAnsDistribution(w, freqs);
+      _ansTables!.add(AnsAliasTable(freqs, _ansLog));
+    }
+  }
+
+  /// Encodes one section as a fresh rANS stream over the shared tables.
+  void encodeAnsSection(BitWriter w, List<int> contexts, List<int> values) {
+    final enc = AnsEncoder(_ansTables!);
+    for (var i = 0; i < values.length; i++) {
+      final (token, nbits, extra) = tokenizeHybrid(config, values[i]);
+      enc.add(contexts[i], token, extra: extra, extraBits: nbits);
+    }
+    enc.finish(w);
   }
 
   void _finishHistograms(int clusters) {

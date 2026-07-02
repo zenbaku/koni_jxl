@@ -107,8 +107,8 @@ final again = JxlEncoder.encodeImage(decodedImage);  // JXL -> JXL transcode
 Every encoded file is gated bit-exact through **both** this package's
 decoder and djxl. The encoder picks per image between LZ77, palette
 (≤256 colors) and YCoCg RCT by exact coded-size estimates. Sizes vs
-`cjxl -e1` on the benchmark set: real manga page 93%, color cover 78%,
-16-color art 112%, synthetic screentone **7%** (LZ77 dominates there).
+`cjxl -e1` on the benchmark set: real manga page 91%, color cover 78%,
+16-color art 63%, synthetic screentone **7%** (LZ77 dominates there).
 ~0.3–1 s/page single-threaded. 8/16-bit gray/RGB with optional alpha;
 lossy encoding is not implemented (use cjxl for that).
 
