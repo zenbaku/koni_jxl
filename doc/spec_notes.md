@@ -53,16 +53,18 @@ tagged sRGB; a full ICC-driven output transform is out of scope for v1
 ## Performance status
 
 Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a
-3.4-megapixel page takes ~0.5-0.9 s single-threaded (djxl: ~0.1 s); a
+3.4-megapixel page takes ~0.4-0.65 s single-threaded (djxl: ~0.1 s); a
 real-world JPEG-transcoded manga page decodes in ~0.3 s. The float
 pipeline uses dart:typed_data Float32x4 SIMD (native NEON/SSE under AOT):
 the fused 8x8 inverse DCT (in-register transposes), coefficient
 dequantization (float-arithmetic lane masks; Int32x4 select boxes in
-AOT), and the XYB opsin inverse. Larger DCTs use Lee's O(N log N)
-recursion with unrolled 2/4/8-point kernels; the EPF runs specialized
-scalar interior kernels (vectorizing it is the main remaining
-opportunity, along with gaborish). Weight matrices and coefficient
-orders are generated lazily per transform type actually used.
+AOT), the XYB opsin inverse, gaborish, and the EPF interior (8-pixel
+groups so the per-block sigma and border-lane pattern are constant per
+group; +-1 neighbors via shuffle + lane insert, +-2 via one shuffleMix).
+Larger DCTs use Lee's O(N log N) recursion with unrolled 2/4/8-point
+kernels. Weight matrices and coefficient orders are generated lazily per
+transform type actually used. On a 3.4MP page the EPF pass runs in
+~57 ms and gaborish in ~34 ms.
 
 Note for Flutter Web: dart2js emulates Float32x4 in software, so lossy
 decoding is substantially slower there; AOT targets (Android/iOS/desktop)

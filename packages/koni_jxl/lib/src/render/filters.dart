@@ -29,6 +29,13 @@ void performGabConvolution(Frame frame, int colors) {
     final rows = frame.buffer[c].floatRows;
     final newBuffer = ImageBuffer.float32(height, width);
     final newRows = newBuffer.floatRows;
+    final rowsV = rowVectorViews(rows);
+    final newRowsV = rowVectorViews(newRows);
+    final w4 = width >> 2;
+    final useVec = w4 >= 3;
+    final vBase = Float32x4.splat(normGabBase[c]);
+    final vAdj = Float32x4.splat(normGabAdj[c]);
+    final vDiag = Float32x4.splat(normGabDiag[c]);
     for (var y = 0; y < height; y++) {
       final north = y == 0 ? 0 : y - 1;
       final south = y + 1 == height ? height - 1 : y + 1;
@@ -36,7 +43,34 @@ void performGabConvolution(Frame frame, int colors) {
       final buffN = rows[north];
       final buffS = rows[south];
       final out = newRows[y];
+      if (useVec) {
+        final vC = rowsV[y];
+        final vN = rowsV[north];
+        final vS = rowsV[south];
+        final vOut = newRowsV[y];
+        for (var j = 1; j < w4 - 1; j++) {
+          final c0 = vC[j];
+          final p0 = vC[j - 1];
+          final n0 = vC[j + 1];
+          final cN = vN[j];
+          final pN = vN[j - 1];
+          final nN = vN[j + 1];
+          final cS = vS[j];
+          final pS = vS[j - 1];
+          final nS = vS[j + 1];
+          final wC = c0.shuffle(Float32x4.xxyz).withX(p0.w);
+          final eC = c0.shuffle(Float32x4.yzww).withW(n0.x);
+          final wN = cN.shuffle(Float32x4.xxyz).withX(pN.w);
+          final eN = cN.shuffle(Float32x4.yzww).withW(nN.x);
+          final wS = cS.shuffle(Float32x4.xxyz).withX(pS.w);
+          final eS = cS.shuffle(Float32x4.yzww).withW(nS.x);
+          vOut[j] = vBase * c0 +
+              vAdj * (wC + eC + cN + cS) +
+              vDiag * (wN + eN + wS + eS);
+        }
+      }
       for (var x = 0; x < width; x++) {
+        if (useVec && x == 4) x = (w4 - 1) << 2;
         final west = x == 0 ? 0 : x - 1;
         final east = x + 1 == width ? width - 1 : x + 1;
         final adj = buffR[west] + buffR[east] + buffN[x] + buffS[x];
@@ -267,6 +301,16 @@ void _epfPassGray(
   final borderSadMul = rf.epfBorderSadMul;
   final sumChannels = Float32List(1);
   final pass2 = i == 2;
+  final inV = rowVectorViews(input);
+  final outV = rowVectorViews(output);
+  final vScaleSum = Float32x4.splat(scaleSum);
+  final vOne = Float32x4.splat(1.0);
+  final vZero = Float32x4.zero();
+  final patLo = Float32x4(borderSadMul, 1, 1, 1);
+  final patHi = Float32x4(1, 1, 1, borderSadMul);
+  final patAll = Float32x4.splat(borderSadMul);
+  final vecEnd = width >= 24 ? (width - 12) & ~7 : 8;
+  final hasVec = vecEnd > 8;
   // A constant sigma row keeps the hot loop free of null checks for the
   // modular case.
   Float32List? constSigmaRow;
@@ -338,8 +382,132 @@ void _epfPassGray(
     final out = output[y];
     final modY = y & 7;
     final borderY = modY == 0 || modY == 7;
+    if (hasVec) {
+      final vM1 = inV[y - 1];
+      final v0 = inV[y];
+      final vP1 = inV[y + 1];
+      final vOut = outV[y];
+      if (pass2) {
+        for (var gx = 8; gx < vecEnd; gx += 8) {
+          final s = sigmaRow[gx >> 3];
+          final vi = gx >> 2;
+          if (s.isNaN || s > 1 / 0.3) {
+            vOut[vi] = v0[vi];
+            vOut[vi + 1] = v0[vi + 1];
+            continue;
+          }
+          final base = sigmaScale * s;
+          for (var h = 0; h < 2; h++) {
+            final j = vi + h;
+            final mul = borderY
+                ? patAll.scale(base)
+                : (h == 0 ? patLo.scale(base) : patHi.scale(base));
+            final c0 = v0[j];
+            final p0 = v0[j - 1];
+            final n0 = v0[j + 1];
+            final cN = vM1[j];
+            final cS = vP1[j];
+            final w0 = c0.shuffle(Float32x4.xxyz).withX(p0.w);
+            final e0 = c0.shuffle(Float32x4.yzww).withW(n0.x);
+            var sumW = vOne;
+            var sum = c0;
+            var w = (vOne - (c0 - cN).abs() * vScaleSum * mul).max(vZero);
+            sumW += w;
+            sum += cN * w;
+            w = (vOne - (c0 - cS).abs() * vScaleSum * mul).max(vZero);
+            sumW += w;
+            sum += cS * w;
+            w = (vOne - (c0 - w0).abs() * vScaleSum * mul).max(vZero);
+            sumW += w;
+            sum += w0 * w;
+            w = (vOne - (c0 - e0).abs() * vScaleSum * mul).max(vZero);
+            sumW += w;
+            sum += e0 * w;
+            vOut[j] = sum / sumW;
+          }
+        }
+      } else {
+        final vM2 = inV[y - 2];
+        final vP2 = inV[y + 2];
+        for (var gx = 8; gx < vecEnd; gx += 8) {
+          final s = sigmaRow[gx >> 3];
+          final vi = gx >> 2;
+          if (s.isNaN || s > 1 / 0.3) {
+            vOut[vi] = v0[vi];
+            vOut[vi + 1] = v0[vi + 1];
+            continue;
+          }
+          final base = sigmaScale * s;
+          for (var h = 0; h < 2; h++) {
+            final j = vi + h;
+            final mul = borderY
+                ? patAll.scale(base)
+                : (h == 0 ? patLo.scale(base) : patHi.scale(base));
+            final c0 = v0[j];
+            final p0 = v0[j - 1];
+            final n0 = v0[j + 1];
+            final cN = vM1[j];
+            final pN = vM1[j - 1];
+            final nN = vM1[j + 1];
+            final cS = vP1[j];
+            final pS = vP1[j - 1];
+            final nS = vP1[j + 1];
+            final cN2 = vM2[j];
+            final cS2 = vP2[j];
+            final w0 = c0.shuffle(Float32x4.xxyz).withX(p0.w);
+            final e0 = c0.shuffle(Float32x4.yzww).withW(n0.x);
+            final wN = cN.shuffle(Float32x4.xxyz).withX(pN.w);
+            final eN = cN.shuffle(Float32x4.yzww).withW(nN.x);
+            final wS = cS.shuffle(Float32x4.xxyz).withX(pS.w);
+            final eS = cS.shuffle(Float32x4.yzww).withW(nS.x);
+            final w20 = p0.shuffleMix(c0, Float32x4.zwxy);
+            final e20 = c0.shuffleMix(n0, Float32x4.zwxy);
+            final distN = ((c0 - cN).abs() +
+                    (cN - cN2).abs() +
+                    (cS - c0).abs() +
+                    (w0 - wN).abs() +
+                    (e0 - eN).abs()) *
+                vScaleSum;
+            final distS = ((c0 - cS).abs() +
+                    (cN - c0).abs() +
+                    (cS - cS2).abs() +
+                    (w0 - wS).abs() +
+                    (e0 - eS).abs()) *
+                vScaleSum;
+            final distW = ((c0 - w0).abs() +
+                    (cN - wN).abs() +
+                    (cS - wS).abs() +
+                    (w0 - w20).abs() +
+                    (e0 - c0).abs()) *
+                vScaleSum;
+            final distE = ((c0 - e0).abs() +
+                    (cN - eN).abs() +
+                    (cS - eS).abs() +
+                    (w0 - c0).abs() +
+                    (e0 - e20).abs()) *
+                vScaleSum;
+            var sumW = vOne;
+            var sum = c0;
+            var w = (vOne - distN * mul).max(vZero);
+            sumW += w;
+            sum += cN * w;
+            w = (vOne - distS * mul).max(vZero);
+            sumW += w;
+            sum += cS * w;
+            w = (vOne - distW * mul).max(vZero);
+            sumW += w;
+            sum += w0 * w;
+            w = (vOne - distE * mul).max(vZero);
+            sumW += w;
+            sum += e0 * w;
+            vOut[j] = sum / sumW;
+          }
+        }
+      }
+    }
     if (pass2) {
       for (var x = 2; x < xEnd; x++) {
+        if (hasVec && x == 8) x = vecEnd;
         final s = sigmaRow[x >> 3];
         if (s.isNaN || s > 1 / 0.3) {
           out[x] = r0[x];
@@ -381,6 +549,7 @@ void _epfPassGray(
       continue;
     }
     for (var x = 2; x < xEnd; x++) {
+      if (hasVec && x == 8) x = vecEnd;
       final s = sigmaRow[x >> 3];
       if (s.isNaN || s > 1 / 0.3) {
         out[x] = r0[x];
@@ -469,6 +638,22 @@ void _epfPassColor(
   final borderSadMul = rf.epfBorderSadMul;
   final sumChannels = Float32List(colors);
   final pass2 = i == 2;
+  final inV0 = rowVectorViews(in0);
+  final inV1 = rowVectorViews(in1);
+  final inV2 = rowVectorViews(in2);
+  final outV0 = rowVectorViews(out0);
+  final outV1 = rowVectorViews(out1);
+  final outV2 = rowVectorViews(out2);
+  final vs0 = Float32x4.splat(s0);
+  final vs1 = Float32x4.splat(s1);
+  final vs2 = Float32x4.splat(s2);
+  final vOne = Float32x4.splat(1.0);
+  final vZero = Float32x4.zero();
+  final patLo = Float32x4(borderSadMul, 1, 1, 1);
+  final patHi = Float32x4(1, 1, 1, borderSadMul);
+  final patAll = Float32x4.splat(borderSadMul);
+  final vecEnd = width >= 24 ? (width - 12) & ~7 : 8;
+  final hasVec = vecEnd > 8;
   for (var y = 0; y < height; y++) {
     if (y < 2 || y + 2 >= height) {
       for (var x = 0; x < width; x++) {
@@ -521,7 +706,287 @@ void _epfPassColor(
     final modY = y & 7;
     final borderY = modY == 0 || modY == 7;
     final sigmaRow = inverseSigma?[y >> 3];
+    if (hasVec) {
+      final vAM1 = inV0[y - 1];
+      final vA0 = inV0[y];
+      final vAP1 = inV0[y + 1];
+      final vBM1 = inV1[y - 1];
+      final vB0 = inV1[y];
+      final vBP1 = inV1[y + 1];
+      final vQM1 = inV2[y - 1];
+      final vQ0 = inV2[y];
+      final vQP1 = inV2[y + 1];
+      final vOutA = outV0[y];
+      final vOutB = outV1[y];
+      final vOutQ = outV2[y];
+      if (pass2) {
+        for (var gx = 8; gx < vecEnd; gx += 8) {
+          final s = sigmaRow != null ? sigmaRow[gx >> 3] : invModularSigma;
+          final vi = gx >> 2;
+          if (s.isNaN || s > 1 / 0.3) {
+            vOutA[vi] = vA0[vi];
+            vOutA[vi + 1] = vA0[vi + 1];
+            vOutB[vi] = vB0[vi];
+            vOutB[vi + 1] = vB0[vi + 1];
+            vOutQ[vi] = vQ0[vi];
+            vOutQ[vi + 1] = vQ0[vi + 1];
+            continue;
+          }
+          final base = sigmaScale * s;
+          for (var h = 0; h < 2; h++) {
+            final j = vi + h;
+            final mul = borderY
+                ? patAll.scale(base)
+                : (h == 0 ? patLo.scale(base) : patHi.scale(base));
+            final cA = vA0[j];
+            final pA = vA0[j - 1];
+            final nA = vA0[j + 1];
+            final cAN = vAM1[j];
+            final cAS = vAP1[j];
+            final wA = cA.shuffle(Float32x4.xxyz).withX(pA.w);
+            final eA = cA.shuffle(Float32x4.yzww).withW(nA.x);
+            final cB = vB0[j];
+            final pB = vB0[j - 1];
+            final nB = vB0[j + 1];
+            final cBN = vBM1[j];
+            final cBS = vBP1[j];
+            final wB = cB.shuffle(Float32x4.xxyz).withX(pB.w);
+            final eB = cB.shuffle(Float32x4.yzww).withW(nB.x);
+            final cQ = vQ0[j];
+            final pQ = vQ0[j - 1];
+            final nQ = vQ0[j + 1];
+            final cQN = vQM1[j];
+            final cQS = vQP1[j];
+            final wQ = cQ.shuffle(Float32x4.xxyz).withX(pQ.w);
+            final eQ = cQ.shuffle(Float32x4.yzww).withW(nQ.x);
+            var sumW = vOne;
+            var sumA = cA;
+            var sumB = cB;
+            var sumQ = cQ;
+            final distN = (cA - cAN).abs() * vs0 +
+                (cB - cBN).abs() * vs1 +
+                (cQ - cQN).abs() * vs2;
+            var w = (vOne - distN * mul).max(vZero);
+            sumW += w;
+            sumA += cAN * w;
+            sumB += cBN * w;
+            sumQ += cQN * w;
+            final distS = (cA - cAS).abs() * vs0 +
+                (cB - cBS).abs() * vs1 +
+                (cQ - cQS).abs() * vs2;
+            w = (vOne - distS * mul).max(vZero);
+            sumW += w;
+            sumA += cAS * w;
+            sumB += cBS * w;
+            sumQ += cQS * w;
+            final distW = (cA - wA).abs() * vs0 +
+                (cB - wB).abs() * vs1 +
+                (cQ - wQ).abs() * vs2;
+            w = (vOne - distW * mul).max(vZero);
+            sumW += w;
+            sumA += wA * w;
+            sumB += wB * w;
+            sumQ += wQ * w;
+            final distE = (cA - eA).abs() * vs0 +
+                (cB - eB).abs() * vs1 +
+                (cQ - eQ).abs() * vs2;
+            w = (vOne - distE * mul).max(vZero);
+            sumW += w;
+            sumA += eA * w;
+            sumB += eB * w;
+            sumQ += eQ * w;
+            vOutA[j] = sumA / sumW;
+            vOutB[j] = sumB / sumW;
+            vOutQ[j] = sumQ / sumW;
+          }
+        }
+      } else {
+        final vAM2 = inV0[y - 2];
+        final vAP2 = inV0[y + 2];
+        final vBM2 = inV1[y - 2];
+        final vBP2 = inV1[y + 2];
+        final vQM2 = inV2[y - 2];
+        final vQP2 = inV2[y + 2];
+        for (var gx = 8; gx < vecEnd; gx += 8) {
+          final s = sigmaRow != null ? sigmaRow[gx >> 3] : invModularSigma;
+          final vi = gx >> 2;
+          if (s.isNaN || s > 1 / 0.3) {
+            vOutA[vi] = vA0[vi];
+            vOutA[vi + 1] = vA0[vi + 1];
+            vOutB[vi] = vB0[vi];
+            vOutB[vi + 1] = vB0[vi + 1];
+            vOutQ[vi] = vQ0[vi];
+            vOutQ[vi + 1] = vQ0[vi + 1];
+            continue;
+          }
+          final base = sigmaScale * s;
+          for (var h = 0; h < 2; h++) {
+            final j = vi + h;
+            final mul = borderY
+                ? patAll.scale(base)
+                : (h == 0 ? patLo.scale(base) : patHi.scale(base));
+            final cA = vA0[j];
+            final pA = vA0[j - 1];
+            final nA = vA0[j + 1];
+            final cAN = vAM1[j];
+            final cAS = vAP1[j];
+            final pAN = vAM1[j - 1];
+            final nAN = vAM1[j + 1];
+            final pAS = vAP1[j - 1];
+            final nAS = vAP1[j + 1];
+            final cAM2 = vAM2[j];
+            final cAP2 = vAP2[j];
+            final wA = cA.shuffle(Float32x4.xxyz).withX(pA.w);
+            final eA = cA.shuffle(Float32x4.yzww).withW(nA.x);
+            final wAN = cAN.shuffle(Float32x4.xxyz).withX(pAN.w);
+            final eAN = cAN.shuffle(Float32x4.yzww).withW(nAN.x);
+            final wAS = cAS.shuffle(Float32x4.xxyz).withX(pAS.w);
+            final eAS = cAS.shuffle(Float32x4.yzww).withW(nAS.x);
+            final w2A = pA.shuffleMix(cA, Float32x4.zwxy);
+            final e2A = cA.shuffleMix(nA, Float32x4.zwxy);
+            final cB = vB0[j];
+            final pB = vB0[j - 1];
+            final nB = vB0[j + 1];
+            final cBN = vBM1[j];
+            final cBS = vBP1[j];
+            final pBN = vBM1[j - 1];
+            final nBN = vBM1[j + 1];
+            final pBS = vBP1[j - 1];
+            final nBS = vBP1[j + 1];
+            final cBM2 = vBM2[j];
+            final cBP2 = vBP2[j];
+            final wB = cB.shuffle(Float32x4.xxyz).withX(pB.w);
+            final eB = cB.shuffle(Float32x4.yzww).withW(nB.x);
+            final wBN = cBN.shuffle(Float32x4.xxyz).withX(pBN.w);
+            final eBN = cBN.shuffle(Float32x4.yzww).withW(nBN.x);
+            final wBS = cBS.shuffle(Float32x4.xxyz).withX(pBS.w);
+            final eBS = cBS.shuffle(Float32x4.yzww).withW(nBS.x);
+            final w2B = pB.shuffleMix(cB, Float32x4.zwxy);
+            final e2B = cB.shuffleMix(nB, Float32x4.zwxy);
+            final cQ = vQ0[j];
+            final pQ = vQ0[j - 1];
+            final nQ = vQ0[j + 1];
+            final cQN = vQM1[j];
+            final cQS = vQP1[j];
+            final pQN = vQM1[j - 1];
+            final nQN = vQM1[j + 1];
+            final pQS = vQP1[j - 1];
+            final nQS = vQP1[j + 1];
+            final cQM2 = vQM2[j];
+            final cQP2 = vQP2[j];
+            final wQ = cQ.shuffle(Float32x4.xxyz).withX(pQ.w);
+            final eQ = cQ.shuffle(Float32x4.yzww).withW(nQ.x);
+            final wQN = cQN.shuffle(Float32x4.xxyz).withX(pQN.w);
+            final eQN = cQN.shuffle(Float32x4.yzww).withW(nQN.x);
+            final wQS = cQS.shuffle(Float32x4.xxyz).withX(pQS.w);
+            final eQS = cQS.shuffle(Float32x4.yzww).withW(nQS.x);
+            final w2Q = pQ.shuffleMix(cQ, Float32x4.zwxy);
+            final e2Q = cQ.shuffleMix(nQ, Float32x4.zwxy);
+            var sumW = vOne;
+            var sumA = cA;
+            var sumB = cB;
+            var sumQ = cQ;
+            final distN = ((cA - cAN).abs() +
+                        (cAN - cAM2).abs() +
+                        (cAS - cA).abs() +
+                        (wA - wAN).abs() +
+                        (eA - eAN).abs()) *
+                    vs0 +
+                ((cB - cBN).abs() +
+                        (cBN - cBM2).abs() +
+                        (cBS - cB).abs() +
+                        (wB - wBN).abs() +
+                        (eB - eBN).abs()) *
+                    vs1 +
+                ((cQ - cQN).abs() +
+                        (cQN - cQM2).abs() +
+                        (cQS - cQ).abs() +
+                        (wQ - wQN).abs() +
+                        (eQ - eQN).abs()) *
+                    vs2;
+            var w = (vOne - distN * mul).max(vZero);
+            sumW += w;
+            sumA += cAN * w;
+            sumB += cBN * w;
+            sumQ += cQN * w;
+            final distS = ((cA - cAS).abs() +
+                        (cAN - cA).abs() +
+                        (cAS - cAP2).abs() +
+                        (wA - wAS).abs() +
+                        (eA - eAS).abs()) *
+                    vs0 +
+                ((cB - cBS).abs() +
+                        (cBN - cB).abs() +
+                        (cBS - cBP2).abs() +
+                        (wB - wBS).abs() +
+                        (eB - eBS).abs()) *
+                    vs1 +
+                ((cQ - cQS).abs() +
+                        (cQN - cQ).abs() +
+                        (cQS - cQP2).abs() +
+                        (wQ - wQS).abs() +
+                        (eQ - eQS).abs()) *
+                    vs2;
+            w = (vOne - distS * mul).max(vZero);
+            sumW += w;
+            sumA += cAS * w;
+            sumB += cBS * w;
+            sumQ += cQS * w;
+            final distW = ((cA - wA).abs() +
+                        (cAN - wAN).abs() +
+                        (cAS - wAS).abs() +
+                        (wA - w2A).abs() +
+                        (eA - cA).abs()) *
+                    vs0 +
+                ((cB - wB).abs() +
+                        (cBN - wBN).abs() +
+                        (cBS - wBS).abs() +
+                        (wB - w2B).abs() +
+                        (eB - cB).abs()) *
+                    vs1 +
+                ((cQ - wQ).abs() +
+                        (cQN - wQN).abs() +
+                        (cQS - wQS).abs() +
+                        (wQ - w2Q).abs() +
+                        (eQ - cQ).abs()) *
+                    vs2;
+            w = (vOne - distW * mul).max(vZero);
+            sumW += w;
+            sumA += wA * w;
+            sumB += wB * w;
+            sumQ += wQ * w;
+            final distE = ((cA - eA).abs() +
+                        (cAN - eAN).abs() +
+                        (cAS - eAS).abs() +
+                        (wA - cA).abs() +
+                        (eA - e2A).abs()) *
+                    vs0 +
+                ((cB - eB).abs() +
+                        (cBN - eBN).abs() +
+                        (cBS - eBS).abs() +
+                        (wB - cB).abs() +
+                        (eB - e2B).abs()) *
+                    vs1 +
+                ((cQ - eQ).abs() +
+                        (cQN - eQN).abs() +
+                        (cQS - eQS).abs() +
+                        (wQ - cQ).abs() +
+                        (eQ - e2Q).abs()) *
+                    vs2;
+            w = (vOne - distE * mul).max(vZero);
+            sumW += w;
+            sumA += eA * w;
+            sumB += eB * w;
+            sumQ += eQ * w;
+            vOutA[j] = sumA / sumW;
+            vOutB[j] = sumB / sumW;
+            vOutQ[j] = sumQ / sumW;
+          }
+        }
+      }
+    }
     for (var x = 0; x < width; x++) {
+      if (hasVec && x == 8) x = vecEnd;
       final s = sigmaRow != null ? sigmaRow[x >> 3] : invModularSigma;
       if (s.isNaN || s > 1 / 0.3) {
         oa[x] = a0[x];
