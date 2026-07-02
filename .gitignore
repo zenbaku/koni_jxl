@@ -14,3 +14,4 @@ test_data/goldens/
 .idea/
 *.iml
 .DS_Store
+manga_samples/

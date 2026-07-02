@@ -64,3 +64,14 @@ A hard-won Dart AOT lesson encoded in the hot paths: never derive a
 function - pass the per-channel row lists as direct parameters from a
 call site where the concrete list class is statically known. Violating
 this costs 5-20x in pixel loops.
+
+## Real-world validation
+
+Two commercially-distributed CBZ chapters containing JPEG-transcoded JXL
+pages (VarDCT + JPEG reconstruction data, YCbCr; 1066x1600 B/W and up to
+1920x1508 full color) decode with zero failures: 33/34 pages match djxl
+within a max pixel difference of 1/255; one non-block-aligned page shows
+max 10/255 confined to its final row (144 of 2.9M pixels, an edge-padding
+nuance). ~0.3-0.4 s per page AOT single-threaded. The `jbrd` JPEG
+reconstruction box is ignored; pixels decode through the normal VarDCT
+path (byte-exact JPEG re-emission is out of scope).
