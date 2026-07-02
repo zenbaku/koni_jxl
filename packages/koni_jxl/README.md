@@ -49,7 +49,8 @@ playback, background-isolate encode), use
 
 - `JxlEncoder.encodeLossless` / `encodeLossless16` from raw pixels
 - `JxlEncoder.encodeImage` for JXL→JXL transcodes
-- Per-image LZ77 / ANS / palette / YCoCg RCT selection; every output is
+- Per-image learned context tree, palette / YCoCg RCT, and the smallest
+  of four entropy modes ({plain, LZ77} x {prefix, ANS}); every output is
   verified bit-exact through this decoder **and** `djxl`
 
 **Robustness** — all decode surfaces throw only `JxlException` on

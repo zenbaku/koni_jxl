@@ -569,15 +569,7 @@ final class EntropyCodes {
                 lz77LengthConfig.splitExponent - lz77LengthConfig.msbInToken));
       }
     }
-    if (clusters > 1) {
-      w.writeBool(true); // simple cluster map
-      final nbits = ceilLog1p(clusters - 1);
-      assert(nbits <= 3);
-      w.writeBits(nbits, 2);
-      for (var i = 0; i < clusters; i++) {
-        w.writeBits(i, nbits);
-      }
-    }
+    _writeClusterMap(w, clusters);
     w.writeBool(false); // use_prefix_code = false (ANS)
     w.writeBits(_ansLog - 5, 2);
     for (var c = 0; c < clusters; c++) {
@@ -652,6 +644,29 @@ final class EntropyCodes {
     }
   }
 
+  /// Writes an identity cluster map for [clusters] contexts: the simple
+  /// fixed-width form for up to 8 clusters, otherwise a nested entropy
+  /// stream over the cluster ids (the decoder's complex path, no MTF).
+  static void _writeClusterMap(BitWriter w, int clusters) {
+    if (clusters <= 1) return;
+    final nbits = ceilLog1p(clusters - 1);
+    if (nbits <= 3) {
+      w.writeBool(true); // simple
+      w.writeBits(nbits, 2);
+      for (var i = 0; i < clusters; i++) {
+        w.writeBits(i, nbits);
+      }
+      return;
+    }
+    w.writeBool(false); // complex
+    w.writeBool(false); // use_mtf = false
+    final nested = EntropyWriter(1);
+    for (var i = 0; i < clusters; i++) {
+      nested.write(0, i);
+    }
+    nested.finalize(w);
+  }
+
   /// Writes the distribution header (mirror of `EntropyStream.read`).
   void writeHeader(BitWriter w) {
     w.writeBool(usesLz77);
@@ -670,15 +685,7 @@ final class EntropyCodes {
       }
     }
     final clusters = _numClusters;
-    if (clusters > 1) {
-      w.writeBool(true); // simple cluster map
-      final nbits = ceilLog1p(clusters - 1);
-      assert(nbits <= 3, 'simple cluster map supports up to 8 contexts');
-      w.writeBits(nbits, 2);
-      for (var i = 0; i < clusters; i++) {
-        w.writeBits(i, nbits);
-      }
-    }
+    _writeClusterMap(w, clusters);
     w.writeBool(true); // use_prefix_code
     for (var c = 0; c < clusters; c++) {
       w.writeBits(config.splitExponent, ceilLog1p(15));

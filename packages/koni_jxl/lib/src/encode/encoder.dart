@@ -4,6 +4,7 @@ import '../entropy/hybrid_uint.dart';
 import '../io/bit_writer.dart';
 import '../jxl_image.dart';
 import '../util/math_helper.dart';
+import 'context_tree.dart';
 import 'entropy_writer.dart';
 import 'headers.dart';
 
@@ -116,71 +117,29 @@ final class JxlEncoder {
 
 const _config = HybridIntegerConfig(4, 1, 0);
 
-/// The fixed MA tree: 7 gradient-activity contexts, all leaves using the
-/// clamped-gradient predictor. Written in the reader's BFS node order.
-///
-/// Walk (property > value ? left : right), properties: 11 = NW - N,
-/// 10 = W - NW:
-///   d = NW - N:  d > 16 -> ctx big+; 2 < d <= 16 -> mid+;
-///   -2 <= d <= 2 -> split on e = W - NW into {e > 2, -2 <= e <= 2, e < -2};
-///   -16 <= d < -2 -> mid-; d < -16 -> big-.
-const _numContexts = 7;
-
-void _writeFixedTree(BitWriter w) {
-  final tokens = EntropyWriter(6);
-  void inner(int property, int value) {
-    tokens.write(1, property + 1);
-    tokens.write(0, _packSigned(value));
-  }
-
-  void leaf() {
-    tokens.write(1, 0);
-    tokens.write(2, 5); // predictor: clamped gradient
-    tokens.write(3, 0); // offset
-    tokens.write(4, 0); // mul_log
-    tokens.write(5, 0); // mul_bits
-  }
-
-  // BFS order (matches MaTree.read's node layout).
-  inner(11, 16); //          root: d > 16 ?
-  leaf(); //                 ctx 0: big+
-  inner(11, 2); //           d > 2 ?
-  leaf(); //                 ctx 1: mid+
-  inner(11, -3); //          d >= -2 ?
-  inner(10, 2); //             e > 2 ?
-  inner(11, -17); //         d >= -16 ?
-  leaf(); //                 ctx 2: e > 2
-  inner(10, -3); //            e >= -2 ?
-  leaf(); //                 ctx 3: mid-
-  leaf(); //                 ctx 4: big-
-  leaf(); //                 ctx 5: flat
-  leaf(); //                 ctx 6: e < -2
-  tokens.finalize(w);
-}
-
-@pragma('vm:prefer-inline')
-int _context(int d, int e) {
-  if (d > 16) return 0;
-  if (d > 2) return 1;
-  if (d >= -2) {
-    if (e > 2) return 2;
-    if (e >= -2) return 5;
-    return 6;
-  }
-  if (d >= -16) return 3;
-  return 4;
-}
-
 int _packSigned(int v) => v >= 0 ? v << 1 : (-v << 1) - 1;
 
-/// Emits one tile's residual tokens (context from the fixed tree,
-/// clamped-gradient prediction), matching the decoder's per-tile borders.
-void _tokenizeTile(Int32List plane, int imageWidth, int ox, int oy, int tw,
-    int th, List<int> contexts, List<int> values) {
+/// Pass A over a tile: appends packed-signed clamped-gradient residuals to
+/// [valuesOut], and for every [stride]-th pixel records its property vector
+/// and hybrid token for context-tree training.
+void _tileResiduals(
+    Int32List plane,
+    int imageWidth,
+    int ox,
+    int oy,
+    int tw,
+    int th,
+    List<int> valuesOut,
+    List<int> trainProps,
+    List<int> trainTokens,
+    int stride,
+    List<int> strideState) {
   final tile = Int32List(tw * th);
   for (var y = 0; y < th; y++) {
     tile.setRange(y * tw, y * tw + tw, plane, (oy + y) * imageWidth + ox);
   }
+  final props = Int32List(treeProperties.length);
+  var counter = strideState[0];
   for (var y = 0; y < th; y++) {
     for (var x = 0; x < tw; x++) {
       final o = y * tw + x;
@@ -199,8 +158,34 @@ void _tokenizeTile(Int32List plane, int imageWidth, int ox, int oy, int tw,
           : grad > hi
               ? hi
               : grad;
-      contexts.add(_context(nw - n, w - nw));
-      values.add(_packSigned(tile[o] - pred));
+      final value = _packSigned(tile[o] - pred);
+      valuesOut.add(value);
+      if (counter == 0) {
+        computePropsAt(tile, tw, th, y, x, props);
+        for (var pi = 0; pi < props.length; pi++) {
+          trainProps.add(props[pi]);
+        }
+        trainTokens.add(tokenizeHybrid(_config, value).$1);
+        counter = stride;
+      }
+      counter--;
+    }
+  }
+  strideState[0] = counter;
+}
+
+/// Pass B over a tile: assigns each pixel a context by walking [tree].
+void _tileContexts(Int32List plane, int imageWidth, int ox, int oy, int tw,
+    int th, ContextTree tree, List<int> contextsOut) {
+  final tile = Int32List(tw * th);
+  for (var y = 0; y < th; y++) {
+    tile.setRange(y * tw, y * tw + tw, plane, (oy + y) * imageWidth + ox);
+  }
+  final props = Int32List(treeProperties.length);
+  for (var y = 0; y < th; y++) {
+    for (var x = 0; x < tw; x++) {
+      computePropsAt(tile, tw, th, y, x, props);
+      contextsOut.add(contextFor(tree, props));
     }
   }
 }
@@ -280,23 +265,29 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     }
   }
 
-  // Meta (palette) channel tokens: always part of the global stream.
-  final metaContexts = <int>[];
+  // Pass A: residuals per group (and the palette meta channel), plus a
+  // strided training set for the context tree. The meta channel (palette
+  // colors) rides in the global stream and shares the same tree.
+  final totalPixels = width * height * planes.length;
+  final stride = totalPixels > 300000 ? totalPixels ~/ 300000 : 1;
+  final strideState = [0];
+  final trainProps = <int>[];
+  final trainTokens = <int>[];
+
   final metaValues = <int>[];
+  Int32List? pal;
   if (palette != null) {
     final n = palette.length;
-    final pal = Int32List(3 * n);
+    pal = Int32List(3 * n);
     for (var i = 0; i < n; i++) {
       pal[i] = palette[i] >>> 40;
       pal[n + i] = (palette[i] >>> 20) & 0xFFFFF;
       pal[2 * n + i] = palette[i] & 0xFFFFF;
     }
-    _tokenizeTile(pal, n, 0, 0, n, 3, metaContexts, metaValues);
+    _tileResiduals(pal, n, 0, 0, n, 3, metaValues, trainProps, trainTokens,
+        stride, strideState);
   }
 
-  // Tokenize every group tile (channel-major inside each group, matching
-  // decodeChannels order).
-  final groupContexts = List<List<int>>.generate(numGroups, (_) => []);
   final groupValues = List<List<int>>.generate(numGroups, (_) => []);
   for (var g = 0; g < numGroups; g++) {
     final ox = (g % groupsX) * groupDim;
@@ -304,8 +295,29 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     final tw = (width - ox).clamp(0, groupDim);
     final th = (height - oy).clamp(0, groupDim);
     for (final plane in planes) {
-      _tokenizeTile(
-          plane, width, ox, oy, tw, th, groupContexts[g], groupValues[g]);
+      _tileResiduals(plane, width, ox, oy, tw, th, groupValues[g], trainProps,
+          trainTokens, stride, strideState);
+    }
+  }
+
+  // Learn the context tree, then Pass B: assign each pixel a context.
+  final tree = learnContextTree(
+      Int32List.fromList(trainProps), Int32List.fromList(trainTokens));
+  final numContexts = tree.contexts;
+
+  final metaContexts = <int>[];
+  if (pal != null) {
+    _tileContexts(
+        pal, palette!.length, 0, 0, palette.length, 3, tree, metaContexts);
+  }
+  final groupContexts = List<List<int>>.generate(numGroups, (_) => []);
+  for (var g = 0; g < numGroups; g++) {
+    final ox = (g % groupsX) * groupDim;
+    final oy = (g ~/ groupsX) * groupDim;
+    final tw = (width - ox).clamp(0, groupDim);
+    final th = (height - oy).clamp(0, groupDim);
+    for (final plane in planes) {
+      _tileContexts(plane, width, ox, oy, tw, th, tree, groupContexts[g]);
     }
   }
 
@@ -335,7 +347,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     for (var s = 0; s < sectionValues.length; s++)
       lz77Compress(sectionContexts[s], sectionValues[s]),
   ];
-  final lzCodes = EntropyCodes.buildLz77(_numContexts, sectionOps, _config);
+  final lzCodes = EntropyCodes.buildLz77(numContexts, sectionOps, _config);
   final allContexts = <int>[];
   final allValues = <int>[];
   for (var s = 0; s < sectionValues.length; s++) {
@@ -343,7 +355,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     allValues.addAll(sectionValues[s]);
   }
   final plainCodes =
-      EntropyCodes.build(_numContexts, allContexts, allValues, _config);
+      EntropyCodes.build(numContexts, allContexts, allValues, _config);
   // Four candidates: {plain, LZ77} x {prefix, ANS}. ANS spends fractional
   // bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs. Unifying
   // them lets an image get both wins when the estimator says so.
@@ -377,7 +389,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     final lfGlobal = BitWriter();
     lfGlobal.writeBool(true); // default lfDequant
     lfGlobal.writeBool(true); // has_global_tree
-    _writeFixedTree(lfGlobal);
+    serializeContextTree(lfGlobal, tree);
     if (ans) {
       codes.writeAnsHeader(lfGlobal);
     } else {
