@@ -51,11 +51,23 @@ final class HfCoefficients {
       final sX = size.width >> header.jpegUpsamplingX[c];
       coeffHeight[c] = sY;
       coeffWidth[c] = sX;
-      quantizedCoeffs.add(Int32List(sY * sX));
+      quantizedCoeffs.add(Float32List(sY * sX));
     }
     dequantHFCoeff0 = floatMatrix(coeffHeight[0], coeffWidth[0]);
     dequantHFCoeff1 = floatMatrix(coeffHeight[1], coeffWidth[1]);
     dequantHFCoeff2 = floatMatrix(coeffHeight[2], coeffWidth[2]);
+    simdViews = coeffWidth[0] & 3 == 0 &&
+        coeffWidth[1] & 3 == 0 &&
+        coeffWidth[2] & 3 == 0;
+    if (simdViews) {
+      dequantHFCoeffV0 = rowVectorViews(dequantHFCoeff0);
+      dequantHFCoeffV1 = rowVectorViews(dequantHFCoeff1);
+      dequantHFCoeffV2 = rowVectorViews(dequantHFCoeff2);
+      quantizedCoeffsV = [
+        for (final qc in quantizedCoeffs)
+          Float32x4List.view(qc.buffer, 0, qc.length >> 2),
+      ];
+    }
     final pos = frame.groupPosInLFGroup(lfg.lfGroupID, groupID);
     groupPosY = pos.y << 5;
     groupPosX = pos.x << 5;
@@ -99,11 +111,11 @@ final class HfCoefficients {
         }
         // SPEC: the spec doesn't say to abort here if nonZero == 0.
         if (nonZero <= 0) continue;
-        final orderSize = hfPass.order[tt.orderID][c].length;
+        final orderSize = hfPass.orderFor(tt.orderID)[c].length;
         final ucoeffLen = orderSize - numBlocks;
         final histCtx = offset + 458 * blockCtx + 37 * hfctx.numClusters;
         var prevCoeff = 0;
-        final orderList = hfPass.order[tt.orderID][c];
+        final orderList = hfPass.orderFor(tt.orderID)[c];
         final qc = quantizedCoeffs[c];
         final qw = coeffWidth[c];
         for (var k = 0; k < ucoeffLen; k++) {
@@ -120,7 +132,7 @@ final class HfCoefficients {
           final ox = order & 0xFFFF;
           final posY2 = (flip ? ox : oy) + pixelGroupY;
           final posX2 = (flip ? oy : ox) + pixelGroupX;
-          qc[posY2 * qw + posX2] = unpackSigned(u) << shift;
+          qc[posY2 * qw + posX2] = (unpackSigned(u) << shift).toDouble();
           if (u != 0) {
             if (--nonZero == 0) break;
           }
@@ -145,7 +157,7 @@ final class HfCoefficients {
   late final EntropyStream stream;
 
   /// Per channel: flat (coeffHeight x coeffWidth) arrays.
-  late final List<Int32List> quantizedCoeffs;
+  late final List<Float32List> quantizedCoeffs;
   late final List<Float32List> dequantHFCoeff0;
   late final List<Float32List> dequantHFCoeff1;
   late final List<Float32List> dequantHFCoeff2;
@@ -153,6 +165,16 @@ final class HfCoefficients {
 
   List<Float32List> dequantHFCoeffAt(int c) =>
       c == 0 ? dequantHFCoeff0 : (c == 1 ? dequantHFCoeff1 : dequantHFCoeff2);
+
+  late final bool simdViews;
+  late final List<Float32x4List> dequantHFCoeffV0;
+  late final List<Float32x4List> dequantHFCoeffV1;
+  late final List<Float32x4List> dequantHFCoeffV2;
+  late final List<Float32x4List> quantizedCoeffsV;
+
+  List<Float32x4List> dequantHFCoeffVAt(int c) => c == 0
+      ? dequantHFCoeffV0
+      : (c == 1 ? dequantHFCoeffV1 : dequantHFCoeffV2);
   late final List<int> coeffWidth;
   late final int groupPosY;
   late final int groupPosX;
@@ -211,8 +233,16 @@ final class HfCoefficients {
       globalScale,
       globalScale * math.pow(0.8, header.bqmScale - 2.0).toDouble(),
     ];
-    final weightsFlat = frame.hfGlobal!.weightsFlat;
-    final weightsWidth = frame.hfGlobal!.weightsWidth;
+    final hfGlobal = frame.hfGlobal!;
+    final weightsWidth = hfGlobal.weightsWidth;
+    final vnum = Float32x4.splat(matrix.quantBiasNumerator);
+    final vone = Float32x4.splat(1.0);
+    final vzero = Float32x4.zero();
+    final vbias = [
+      Float32x4.splat(matrix.quantBias[0]),
+      Float32x4.splat(matrix.quantBias[1]),
+      Float32x4.splat(matrix.quantBias[2]),
+    ];
     final qbclut = [
       [-matrix.quantBias[0], 0.0, matrix.quantBias[0]],
       [-matrix.quantBias[1], 0.0, matrix.quantBias[1]],
@@ -227,7 +257,7 @@ final class HfCoefficients {
       final groupY = posY - groupPosY;
       final groupX = posX - groupPosX;
       final flip = tt.flip;
-      final w2 = weightsFlat[tt.parameterIndex];
+      final w2 = hfGlobal.flatWeightsFor(tt.parameterIndex);
       final w3w = weightsWidth[tt.parameterIndex];
       for (var c = 0; c < 3; c++) {
         final sGroupY = groupY >> header.jpegUpsamplingY[c];
@@ -236,13 +266,47 @@ final class HfCoefficients {
             groupX != sGroupX << header.jpegUpsamplingX[c]) {
           continue; // subsampled block
         }
-        final w3 = w2[c]!;
         final sfc = scaleFactor[c] / meta.hfMultiplierAt(posY, posX);
         final pixelGroupY = sGroupY << 3;
         final pixelGroupX = sGroupX << 3;
+        final qw = coeffWidth[c];
+        if (simdViews && tt.pixelWidth & 3 == 0) {
+          // Vector path: LLF positions hold zero coefficients and produce
+          // zero here (finalizeLLF overwrites them), so no skip test is
+          // needed. quant for |coeff| < 2 is exactly bias * coeff, and
+          // flipped transforms read the pre-transposed weights so the
+          // access is always row-major with stride pixelWidth.
+          final qcV = quantizedCoeffsV[c];
+          final dqV = dequantHFCoeffVAt(c);
+          final wV = flip
+              ? hfGlobal.weightsFlatTV[tt.parameterIndex][c]!
+              : hfGlobal.weightsFlatV[tt.parameterIndex][c]!;
+          final vsfc = Float32x4.splat(sfc);
+          final vbiasC = vbias[c];
+          final qw4 = qw >> 2;
+          final w3w4 = tt.pixelWidth >> 2;
+          final gx4 = pixelGroupX >> 2;
+          final vecs = tt.pixelWidth >> 2;
+          for (var y = 0; y < tt.pixelHeight; y++) {
+            final qRow = (pixelGroupY + y) * qw4 + gx4;
+            final dRow = dqV[pixelGroupY + y];
+            final wRow = y * w3w4;
+            for (var i = 0; i < vecs; i++) {
+              final coeff = qcV[qRow + i];
+              // Coefficients are exact integers: m is 0 for |c| < 2 and
+              // 1 otherwise, all in float math (Int32x4 masks box in AOT).
+              final m = (coeff.abs() - vone).clamp(vzero, vone);
+              final invM = vone - m;
+              final big = coeff - vnum / (coeff * m + invM);
+              final quant = vbiasC * coeff * invM + big * m;
+              dRow[gx4 + i] = quant * vsfc * wV[wRow + i];
+            }
+          }
+          continue;
+        }
+        final w3 = w2[c]!;
         final qbc = qbclut[c];
         final qc = quantizedCoeffs[c];
-        final qw = coeffWidth[c];
         final dq = dequantHFCoeffAt(c);
         for (var y = 0; y < tt.pixelHeight; y++) {
           for (var x = 0; x < tt.pixelWidth; x++) {
@@ -251,7 +315,7 @@ final class HfCoefficients {
             final pX = pixelGroupX + x;
             final coeff = qc[pY * qw + pX];
             final quant = coeff > -2 && coeff < 2
-                ? qbc[coeff + 1]
+                ? qbc[coeff.toInt() + 1]
                 : coeff - matrix.quantBiasNumerator / coeff;
             final wy = flip ? x : y;
             final wx = x ^ y ^ wy;

@@ -113,7 +113,10 @@ void invertVarDCTGroup(
     List<Float32List> s1,
     List<Float32List> s2,
     List<Float32List> s3,
-    List<Float32List> s4) {
+    List<Float32List> s4,
+    List<Float32x4List>? fbV0,
+    List<Float32x4List>? fbV1,
+    List<Float32x4List>? fbV2) {
   final frame = hf.frame;
   final header = frame.header;
   final meta = hf.lfg.hfMetadata!;
@@ -175,8 +178,21 @@ void invertVarDCTGroup(
       final fb = c == 0 ? fb0 : (c == 1 ? fb1 : fb2);
       switch (tt.transformMethod) {
         case TransformMethod.dct:
-          inverseDCT2D(cc, fb, ppgY, ppgX, ppfY, ppfX, tt.pixelHeight,
-              tt.pixelWidth, s0, s1, false);
+          if (tt.pixelHeight == 8 &&
+              tt.pixelWidth == 8 &&
+              fbV0 != null &&
+              hf.simdViews) {
+            inverseDCT8x8Simd(
+                hf.dequantHFCoeffVAt(c),
+                c == 0 ? fbV0 : (c == 1 ? fbV1! : fbV2!),
+                ppgY,
+                ppgX >> 2,
+                ppfY,
+                ppfX >> 2);
+          } else {
+            inverseDCT2D(cc, fb, ppgY, ppgX, ppfY, ppfX, tt.pixelHeight,
+                tt.pixelWidth, s0, s1, false);
+          }
         case TransformMethod.dct8x4:
           final coeff0 = cc[ppgY][ppgX];
           final coeff1 = cc[ppgY + 1][ppgX];

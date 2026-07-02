@@ -86,4 +86,27 @@ void main() {
       }
     });
   }
+
+  test('inverseDCT8x8Simd matches the scalar 8x8 path', () {
+    final src = floatMatrix(16, 16);
+    final destScalar = floatMatrix(16, 16);
+    final destSimd = floatMatrix(16, 16);
+    final rng = math.Random(42);
+    for (var y = 0; y < 16; y++) {
+      for (var x = 0; x < 16; x++) {
+        src[y][x] = rng.nextDouble() * 2 - 1;
+      }
+    }
+    final s0 = floatMatrix(8, 8);
+    final s1 = floatMatrix(8, 8);
+    inverseDCT2D(src, destScalar, 8, 8, 8, 8, 8, 8, s0, s1, false);
+    inverseDCT8x8Simd(
+        rowVectorViews(src), rowVectorViews(destSimd), 8, 2, 8, 2);
+    for (var y = 8; y < 16; y++) {
+      for (var x = 8; x < 16; x++) {
+        expect(destSimd[y][x], closeTo(destScalar[y][x], 1e-4),
+            reason: 'y=$y x=$x');
+      }
+    }
+  });
 }

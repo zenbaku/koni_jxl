@@ -12,7 +12,10 @@
   transform types, chroma-from-luma, XYB, Gaborish + EPF filters,
   upsampling, noise synthesis, YCbCr.
 - Performance: row-based image planes, Lee-recursion DCT with fused
-  unrolled 8x8 inverse kernel, specialized edge-preserving-filter loops.
+  unrolled 8x8 inverse kernel, specialized edge-preserving-filter loops,
+  Float32x4 SIMD in the 8x8 IDCT / dequantization / XYB inverse (native
+  on AOT targets; emulated on the web), lazy quant-weight and
+  coefficient-order setup.
 - Not yet supported (throws `JxlUnsupportedException`): splines,
   spot-color rendering, animation, progressive/LF frames, JPEG
   reconstruction, float (HDR) sample formats.

@@ -57,21 +57,22 @@ final class HfPass {
   HfPass(BitReader reader, Frame frame, int passIndex) {
     usedOrders = reader.readU32(0x5F, 0, 0x13, 0, 0, 0, 0, 13);
     final stream = usedOrders != 0 ? EntropyStream.read(reader, 8) : null;
-    order = List.generate(13, (b) {
+    // Permuted orders must be read from the bitstream now; natural orders
+    // for unused IDs are built lazily on first use (the big zigzag sorts
+    // are expensive and most images touch only a few transform types).
+    for (var b = 0; b < 13; b++) {
+      if (usedOrders & (1 << b) == 0) continue;
       final naturalOrder = _getNaturalOrder(b);
       final len = naturalOrder.length;
-      return List.generate(3, (c) {
-        if (usedOrders & (1 << b) != 0) {
-          final perm = readPermutation(reader, stream!, len, len ~/ 64);
-          final o = Int32List(len);
-          for (var i = 0; i < len; i++) {
-            o[i] = naturalOrder[perm[i]];
-          }
-          return o;
+      _order[b] = List.generate(3, (c) {
+        final perm = readPermutation(reader, stream!, len, len ~/ 64);
+        final o = Int32List(len);
+        for (var i = 0; i < len; i++) {
+          o[i] = naturalOrder[perm[i]];
         }
-        return naturalOrder;
-      });
-    });
+        return o;
+      }, growable: false);
+    }
     if (stream != null && !stream.validateFinalState()) {
       throw JxlInvalidBitstreamException(
           'ANS state decoding HFPass perms: $passIndex');
@@ -84,7 +85,15 @@ final class HfPass {
 
   late final int usedOrders;
 
-  /// order[orderID][channel] -> packed (y << 16 | x) coefficient positions.
-  late final List<List<Int32List>> order;
+  final List<List<Int32List>?> _order = List.filled(13, null);
   late final EntropyStream contextStream;
+
+  /// orderFor(orderID)[channel] -> packed (y << 16 | x) coefficient
+  /// positions.
+  List<Int32List> orderFor(int orderID) {
+    final cached = _order[orderID];
+    if (cached != null) return cached;
+    final naturalOrder = _getNaturalOrder(orderID);
+    return _order[orderID] = List.filled(3, naturalOrder, growable: false);
+  }
 }

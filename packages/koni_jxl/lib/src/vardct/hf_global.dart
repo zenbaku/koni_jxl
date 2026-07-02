@@ -315,32 +315,58 @@ final class HfGlobal {
     }
     weights =
         List.generate(17, (_) => List<List<Float32List>?>.filled(3, null));
-    for (var i = 0; i < 17; i++) {
-      _generateWeights(i);
-    }
-    // Flatten each weight matrix; the dequant hot loop indexes these.
+    // Weight generation (incl. large-matrix interpolation) is deferred to
+    // first use per parameter index: most images use few transform types.
     weightsFlat = List.generate(17, (_) => List<Float32List?>.filled(3, null));
+    weightsFlatV =
+        List.generate(17, (_) => List<Float32x4List?>.filled(3, null));
+    weightsFlatTV =
+        List.generate(17, (_) => List<Float32x4List?>.filled(3, null));
     weightsWidth = List<int>.filled(17, 0);
-    for (var i = 0; i < 17; i++) {
-      for (var ch = 0; ch < 3; ch++) {
-        final w = weights[i][ch];
-        if (w == null) continue;
-        final rows = w.length;
-        final cols = w[0].length;
-        weightsWidth[i] = cols;
-        final flat = Float32List(rows * cols);
-        for (var y = 0; y < rows; y++) {
-          flat.setRange(y * cols, (y + 1) * cols, w[y]);
-        }
-        weightsFlat[i][ch] = flat;
-      }
-    }
     numHfPresets = 1 + reader.readBits(ceilLog1p(frame.numGroups - 1));
   }
 
   late List<DctParams> params;
+  final List<bool> _weightsReady = List<bool>.filled(17, false);
+
+  /// Generates (once) and returns the flattened weight matrices for a
+  /// parameter index.
+  List<Float32List?> flatWeightsFor(int index) {
+    if (!_weightsReady[index]) {
+      _generateWeights(index);
+      for (var ch = 0; ch < 3; ch++) {
+        final w = weights[index][ch];
+        if (w == null) continue;
+        final rows = w.length;
+        final cols = w[0].length;
+        weightsWidth[index] = cols;
+        final flat = Float32List(rows * cols);
+        for (var y = 0; y < rows; y++) {
+          flat.setRange(y * cols, (y + 1) * cols, w[y]);
+        }
+        weightsFlat[index][ch] = flat;
+        weightsFlatV[index][ch] =
+            Float32x4List.view(flat.buffer, 0, flat.length >> 2);
+        // Transposed copy: flipped transforms read weights column-major,
+        // which this turns back into row-major (y * pixelWidth + x).
+        final flatT = Float32List(rows * cols);
+        for (var y = 0; y < rows; y++) {
+          for (var x = 0; x < cols; x++) {
+            flatT[x * rows + y] = flat[y * cols + x];
+          }
+        }
+        weightsFlatTV[index][ch] =
+            Float32x4List.view(flatT.buffer, 0, flatT.length >> 2);
+      }
+      _weightsReady[index] = true;
+    }
+    return weightsFlat[index];
+  }
+
   late final List<List<List<Float32List>?>> weights;
   late final List<List<Float32List?>> weightsFlat;
+  late final List<List<Float32x4List?>> weightsFlatV;
+  late final List<List<Float32x4List?>> weightsFlatTV;
   late final List<int> weightsWidth;
   late final int numHfPresets;
 

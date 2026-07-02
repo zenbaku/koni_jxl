@@ -420,6 +420,12 @@ final class Frame {
       final fb0 = buffer[0].floatRows;
       final fb1 = buffer[1].floatRows;
       final fb2 = buffer[2].floatRows;
+      final simdOk = fb0[0].length & 3 == 0 &&
+          fb1[0].length & 3 == 0 &&
+          fb2[0].length & 3 == 0;
+      final fbV0 = simdOk ? rowVectorViews(fb0) : null;
+      final fbV1 = simdOk ? rowVectorViews(fb1) : null;
+      final fbV2 = simdOk ? rowVectorViews(fb2) : null;
       final s0 = floatMatrix(256, 256);
       final s1 = floatMatrix(256, 256);
       final s2 = floatMatrix(256, 256);
@@ -437,7 +443,10 @@ final class Frame {
               s1,
               s2,
               s3,
-              s4);
+              s4,
+              fbV0,
+              fbV1,
+              fbV2);
         }
       }
       if (sw2 != null) {

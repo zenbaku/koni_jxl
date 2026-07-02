@@ -98,5 +98,13 @@ final class ImageBuffer {
 
 /// A free-standing jagged float matrix (Java-style `float[h][w]`), used by
 /// the VarDCT block code where jxlatte uses nested arrays.
+/// Float32x4 views over each row (row widths must be multiples of 4).
+List<Float32x4List> rowVectorViews(List<Float32List> rows) =>
+    List<Float32x4List>.generate(
+        rows.length,
+        (y) => Float32x4List.view(
+            rows[y].buffer, rows[y].offsetInBytes, rows[y].length >> 2),
+        growable: false);
+
 List<Float32List> floatMatrix(int height, int width) =>
     List.generate(height, (_) => Float32List(width), growable: false);
