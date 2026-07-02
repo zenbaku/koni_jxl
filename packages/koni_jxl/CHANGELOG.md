@@ -13,9 +13,11 @@
   upsampling, noise synthesis, YCbCr.
 - Performance: row-based image planes, Lee-recursion DCT with fused
   unrolled 8x8 inverse kernel, specialized edge-preserving-filter loops,
-  Float32x4 SIMD in the 8x8 IDCT / dequantization / XYB inverse /
-  gaborish / edge-preserving filter (native on AOT targets; emulated on
-  the web), lazy quant-weight and coefficient-order setup.
+  Float32x4 SIMD in the 8x8 IDCT / batched large-block IDCT /
+  dequantization / XYB inverse / gaborish / edge-preserving filter
+  (native on AOT targets; emulated on the web), allocation-free weighted
+  predictor with an interior fast path, lazy quant-weight and
+  coefficient-order setup.
 - Not yet supported (throws `JxlUnsupportedException`): splines,
   spot-color rendering, animation, progressive/LF frames, JPEG
   reconstruction, float (HDR) sample formats.

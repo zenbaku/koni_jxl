@@ -109,4 +109,44 @@ void main() {
       }
     }
   });
+
+  test('inverseDCT2DSimd matches the scalar path', () {
+    for (final (h, w) in [
+      (8, 8),
+      (16, 16),
+      (32, 32),
+      (64, 64),
+      (128, 128),
+      (256, 256),
+      (16, 32),
+      (32, 16),
+      (8, 16),
+      (16, 8),
+      (64, 32),
+    ]) {
+      final src = floatMatrix(h, w + 8);
+      final destScalar = floatMatrix(h, w + 8);
+      final destSimd = floatMatrix(h, w + 8);
+      final rng = math.Random(h * 1000 + w);
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          src[y][x + 8] = rng.nextDouble() * 2 - 1;
+        }
+      }
+      final s0 = floatMatrix(256, 256);
+      final s1 = floatMatrix(256, 256);
+      inverseDCT2D(src, destScalar, 0, 8, 0, 8, h, w, s0, s1, false);
+      inverseDCT2DSimd(
+          rowVectorViews(src), rowVectorViews(destSimd), 0, 2, 0, 2, h, w);
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          final ref = destScalar[y][x + 8];
+          // Large twiddles (up to ~115 at N=256) amplify float32 rounding.
+          final tol = 3e-3 + ref.abs() * 2e-3;
+          expect(destSimd[y][x + 8], closeTo(ref, tol),
+              reason: '${h}x$w y=$y x=$x');
+        }
+      }
+    }
+  });
 }

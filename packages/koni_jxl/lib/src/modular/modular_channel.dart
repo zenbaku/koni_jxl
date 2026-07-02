@@ -97,7 +97,6 @@ final class ModularChannel {
   Int32List? _err0, _err1, _err2, _err3, _err4;
   Int32List? _pred;
   final Int32List _subpred = Int32List(4);
-  final Int32List _weight = Int32List(4);
 
   void allocate() {
     buffer ??= Int32List(height * width);
@@ -224,6 +223,84 @@ final class ModularChannel {
     }
   }
 
+  @pragma('vm:prefer-inline')
+  int _wpPlaneWeight(Int32List ep, int o, int x, int y, int wpWeight) {
+    var eSum = _errNorth(ep, o, y) +
+        _errWest(ep, o, x) +
+        _errNorthWest(ep, o, x, y) +
+        _errWestWest(ep, o, x) +
+        _errNorthEast(ep, o, x, y);
+    if (x + 1 == width) eSum += _errWest(ep, o, x);
+    var shift = floorLog1p(eSum) - 5;
+    if (shift < 0) shift = 0;
+    return 4 + ((wpWeight * _oneL24OverKP1[eSum >> shift]) >> shift);
+  }
+
+  @pragma('vm:prefer-inline')
+  int _wpPlaneWeightInterior(Int32List ep, int o, int wpWeight) {
+    final eSum = ep[o - width] +
+        ep[o - 1] +
+        ep[o - width - 1] +
+        ep[o - 2] +
+        ep[o - width + 1];
+    var shift = floorLog1p(eSum) - 5;
+    if (shift < 0) shift = 0;
+    return 4 + ((wpWeight * _oneL24OverKP1[eSum >> shift]) >> shift);
+  }
+
+  /// [_prePredictWp] for interior pixels (y > 1, 1 < x < width - 1):
+  /// identical arithmetic with all border branches removed.
+  int _prePredictWpInterior(WpParams wp, int x, int y) {
+    final b = buffer!;
+    final o = y * width + x;
+    final n3 = b[o - width] << 3;
+    final nw3 = b[o - width - 1] << 3;
+    final ne3 = b[o - width + 1] << 3;
+    final w3 = b[o - 1] << 3;
+    final nn3 = b[o - 2 * width] << 3;
+    final e4 = _err4!;
+    final tN = e4[o - width];
+    final tW = e4[o - 1];
+    final tNE = e4[o - width + 1];
+    final tNW = e4[o - width - 1];
+    _subpred[0] = w3 + ne3 - n3;
+    _subpred[1] = n3 - (((tW + tN + tNE) * wp.param1) >> 5);
+    _subpred[2] = w3 - (((tW + tN + tNW) * wp.param2) >> 5);
+    _subpred[3] = n3 -
+        ((tNW * wp.param3a +
+                tN * wp.param3b +
+                tNE * wp.param3c +
+                (nn3 - n3) * wp.param3d +
+                (nw3 - w3) * wp.param3e) >>
+            5);
+    final wpw = wp.weight;
+    final rw0 = _wpPlaneWeightInterior(_err0!, o, wpw[0]);
+    final rw1 = _wpPlaneWeightInterior(_err1!, o, wpw[1]);
+    final rw2 = _wpPlaneWeightInterior(_err2!, o, wpw[2]);
+    final rw3 = _wpPlaneWeightInterior(_err3!, o, wpw[3]);
+    final logWeight = floorLog1p(rw0 + rw1 + rw2 + rw3 - 1) - 4;
+    final sw0 = rw0 >> logWeight;
+    final sw1 = rw1 >> logWeight;
+    final sw2 = rw2 >> logWeight;
+    final sw3 = rw3 >> logWeight;
+    final wSum = sw0 + sw1 + sw2 + sw3;
+    var s = (wSum >> 1) - 1;
+    s += _subpred[0] * sw0;
+    s += _subpred[1] * sw1;
+    s += _subpred[2] * sw2;
+    s += _subpred[3] * sw3;
+    var pred = (s * _oneL24OverKP1[wSum - 1]) >> 24;
+    if (((tN ^ tW) | (tN ^ tNW)) <= 0) {
+      pred = _clamp4(pred, w3, n3, ne3);
+    }
+    _pred![o] = pred;
+    var maxError = tW;
+    if (tN.abs() > maxError.abs()) maxError = tN;
+    if (tNW.abs() > maxError.abs()) maxError = tNW;
+    if (tNE.abs() > maxError.abs()) maxError = tNE;
+    return maxError;
+  }
+
   /// Computes the weighted-predictor subpredictions, weights, and prediction
   /// for pixel (y, x); returns maxError (MA-tree property 15).
   int _prePredictWp(WpParams wp, int x, int y) {
@@ -249,32 +326,22 @@ final class ModularChannel {
                 (nn3 - n3) * wp.param3d +
                 (nw3 - w3) * wp.param3e) >>
             5);
-    var wSum = 0;
-    final errPlanes = [_err0!, _err1!, _err2!, _err3!];
-    for (var e = 0; e < 4; e++) {
-      final ep = errPlanes[e];
-      var eSum = _errNorth(ep, o, y) +
-          _errWest(ep, o, x) +
-          _errNorthWest(ep, o, x, y) +
-          _errWestWest(ep, o, x) +
-          _errNorthEast(ep, o, x, y);
-      if (x + 1 == width) eSum += _errWest(ep, o, x);
-      var shift = floorLog1p(eSum) - 5;
-      if (shift < 0) shift = 0;
-      _weight[e] =
-          4 + ((wp.weight[e] * _oneL24OverKP1[eSum >> shift]) >> shift);
-      wSum += _weight[e];
-    }
-    final logWeight = floorLog1p(wSum - 1) - 4;
-    wSum = 0;
-    for (var e = 0; e < 4; e++) {
-      _weight[e] >>= logWeight;
-      wSum += _weight[e];
-    }
+    final wpw = wp.weight;
+    final rw0 = _wpPlaneWeight(_err0!, o, x, y, wpw[0]);
+    final rw1 = _wpPlaneWeight(_err1!, o, x, y, wpw[1]);
+    final rw2 = _wpPlaneWeight(_err2!, o, x, y, wpw[2]);
+    final rw3 = _wpPlaneWeight(_err3!, o, x, y, wpw[3]);
+    final logWeight = floorLog1p(rw0 + rw1 + rw2 + rw3 - 1) - 4;
+    final sw0 = rw0 >> logWeight;
+    final sw1 = rw1 >> logWeight;
+    final sw2 = rw2 >> logWeight;
+    final sw3 = rw3 >> logWeight;
+    final wSum = sw0 + sw1 + sw2 + sw3;
     var s = (wSum >> 1) - 1;
-    for (var e = 0; e < 4; e++) {
-      s += _subpred[e] * _weight[e];
-    }
+    s += _subpred[0] * sw0;
+    s += _subpred[1] * sw1;
+    s += _subpred[2] * sw2;
+    s += _subpred[3] * sw3;
     var pred = (s * _oneL24OverKP1[wSum - 1]) >> 24;
     if (((tN ^ tW) | (tN ^ tNW)) <= 0) {
       pred = _clamp4(pred, w3, n3, ne3);
@@ -386,7 +453,11 @@ final class ModularChannel {
     for (var y = 0; y < height; y++) {
       final refinedTree = tree.compactify(channelIndex, streamIndex, y);
       for (var x = 0; x < width; x++) {
-        final maxError = wp != null ? _prePredictWp(wp, x, y) : 0;
+        final maxError = wp == null
+            ? 0
+            : (y > 1 && x > 1 && x + 1 < width
+                ? _prePredictWpInterior(wp, x, y)
+                : _prePredictWp(wp, x, y));
         var node = refinedTree;
         while (!node.isLeaf) {
           final p = _property(parentChannels, channelIndex, streamIndex,

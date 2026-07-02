@@ -666,3 +666,145 @@ void inverseDCT8x8Simd(List<Float32x4List> src, List<Float32x4List> dest,
     d7[destVX + 1] = oh7;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Batched-vector inverse DCT: the 1D recursion applied to Float32x4 elements
+// (4 image columns, or 4 rows after an in-register transpose, per lane).
+
+final Float32x4List _scratchV = Float32x4List(1024);
+final Float32x4List _seqA = Float32x4List(256);
+final Float32x4List _seqB = Float32x4List(256);
+final List<Float32x4List> _interV =
+    List.generate(256, (_) => Float32x4List(64), growable: false);
+
+void _idct8Vec(Float32x4List src, int so, Float32x4List dest, int dOff) {
+  final c0 = src[so];
+  final c1 = src[so + 1];
+  final c2 = src[so + 2];
+  final c3 = src[so + 3];
+  final c4 = src[so + 4];
+  final c5 = src[so + 5];
+  final c6 = src[so + 6];
+  final c7 = src[so + 7];
+  final ee0 = c0 + c4;
+  final ee1 = c0 - c4;
+  final ed1 = (c2 + c6).scale(_invSqrt2);
+  final et0 = (c2 + ed1).scale(_w4x0);
+  final et1 = (c2 - ed1).scale(_w4x1);
+  final e0 = ee0 + et0;
+  final e3 = ee0 - et0;
+  final e1 = ee1 + et1;
+  final e2 = ee1 - et1;
+  final f1 = (c1 + c3).scale(_invSqrt2);
+  final f2 = (c3 + c5).scale(_invSqrt2);
+  final f3 = (c5 + c7).scale(_invSqrt2);
+  final g0 = c1 + f2;
+  final g1 = c1 - f2;
+  final h1 = (f1 + f3).scale(_invSqrt2);
+  final u0 = (f1 + h1).scale(_w4x0);
+  final u1 = (f1 - h1).scale(_w4x1);
+  final t0 = (g0 + u0).scale(_w8x0);
+  final t3 = (g0 - u0).scale(_w8x3);
+  final t1 = (g1 + u1).scale(_w8x1);
+  final t2 = (g1 - u1).scale(_w8x2);
+  dest[dOff] = e0 + t0;
+  dest[dOff + 7] = e0 - t0;
+  dest[dOff + 1] = e1 + t1;
+  dest[dOff + 6] = e1 - t1;
+  dest[dOff + 2] = e2 + t2;
+  dest[dOff + 5] = e2 - t2;
+  dest[dOff + 3] = e3 + t3;
+  dest[dOff + 4] = e3 - t3;
+}
+
+/// Vector analogue of [_idct]; input and output must not alias.
+void _idctVec(Float32x4List src, int srcOff, Float32x4List dest, int destOff,
+    int n, int logN, int so) {
+  if (n == 8) {
+    _idct8Vec(src, srcOff, dest, destOff);
+    return;
+  }
+  final h = n >> 1;
+  final s = _scratchV;
+  for (var r = 0; r < h; r++) {
+    s[so + r] = src[srcOff + 2 * r];
+  }
+  s[so + h] = src[srcOff + 1];
+  for (var r = 1; r < h; r++) {
+    s[so + h + r] =
+        (src[srcOff + 2 * r - 1] + src[srcOff + 2 * r + 1]).scale(_invSqrt2);
+  }
+  _idctVec(s, so, dest, destOff, h, logN - 1, so + n);
+  _idctVec(s, so + h, dest, destOff + h, h, logN - 1, so + n);
+  for (var j = 0; j < h; j++) {
+    s[so + j] = dest[destOff + h + j];
+  }
+  final w = _twiddles[logN];
+  for (var j = 0; j < h; j++) {
+    final e = dest[destOff + j];
+    final o = s[so + j].scale(w[j]);
+    dest[destOff + j] = e + o;
+    dest[destOff + n - 1 - j] = e - o;
+  }
+}
+
+/// SIMD 2D inverse DCT for non-transposed blocks with height and width
+/// both >= 8. Column transforms use 4 adjacent columns per lane directly;
+/// row transforms go through in-register 4x4 transposes. Offsets are in
+/// Float32x4 units.
+void inverseDCT2DSimd(List<Float32x4List> src, List<Float32x4List> dest,
+    int srcY, int srcVX, int destY, int destVX, int height, int width) {
+  final logH = ceilLog2(height);
+  final logW = ceilLog2(width);
+  final w4 = width >> 2;
+  for (var g = 0; g < w4; g++) {
+    for (var k = 0; k < height; k++) {
+      _seqA[k] = src[srcY + k][srcVX + g];
+    }
+    _idctVec(_seqA, 0, _seqB, 0, height, logH, 0);
+    for (var k = 0; k < height; k++) {
+      _interV[k][g] = _seqB[k];
+    }
+  }
+  for (var r = 0; r < height; r += 4) {
+    final i0 = _interV[r];
+    final i1 = _interV[r + 1];
+    final i2 = _interV[r + 2];
+    final i3 = _interV[r + 3];
+    for (var vj = 0; vj < w4; vj++) {
+      final a = i0[vj];
+      final b = i1[vj];
+      final cc = i2[vj];
+      final d = i3[vj];
+      final s0 = a.shuffleMix(b, Float32x4.xzxz);
+      final s1 = a.shuffleMix(b, Float32x4.ywyw);
+      final s2 = cc.shuffleMix(d, Float32x4.xzxz);
+      final s3 = cc.shuffleMix(d, Float32x4.ywyw);
+      final j4 = vj << 2;
+      _seqA[j4] = s0.shuffleMix(s2, Float32x4.xzxz);
+      _seqA[j4 + 1] = s1.shuffleMix(s3, Float32x4.xzxz);
+      _seqA[j4 + 2] = s0.shuffleMix(s2, Float32x4.ywyw);
+      _seqA[j4 + 3] = s1.shuffleMix(s3, Float32x4.ywyw);
+    }
+    _idctVec(_seqA, 0, _seqB, 0, width, logW, 0);
+    final d0 = dest[destY + r];
+    final d1 = dest[destY + r + 1];
+    final d2 = dest[destY + r + 2];
+    final d3 = dest[destY + r + 3];
+    for (var vj = 0; vj < w4; vj++) {
+      final j4 = vj << 2;
+      final a = _seqB[j4];
+      final b = _seqB[j4 + 1];
+      final cc = _seqB[j4 + 2];
+      final d = _seqB[j4 + 3];
+      final s0 = a.shuffleMix(b, Float32x4.xzxz);
+      final s1 = a.shuffleMix(b, Float32x4.ywyw);
+      final s2 = cc.shuffleMix(d, Float32x4.xzxz);
+      final s3 = cc.shuffleMix(d, Float32x4.ywyw);
+      d0[destVX + vj] = s0.shuffleMix(s2, Float32x4.xzxz);
+      d1[destVX + vj] = s1.shuffleMix(s3, Float32x4.xzxz);
+      d2[destVX + vj] = s0.shuffleMix(s2, Float32x4.ywyw);
+      d3[destVX + vj] = s1.shuffleMix(s3, Float32x4.ywyw);
+    }
+  }
+}

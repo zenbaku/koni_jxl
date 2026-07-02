@@ -57,13 +57,13 @@ Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless
-manga page decodes in ~60 ms (effort 1 encodes) to ~530 ms (effort 7–9).
+manga page decodes in ~60 ms (effort 1 encodes) to ~400 ms (effort 7–9).
 Lossy (VarDCT) pages decode in ~0.3 s (JPEG-transcoded manga chapters) to
-~0.65 s (worst-case dense screentone at effort 7) — on par with lossless
-for the same content — using Float32x4 SIMD (fused 8×8 inverse DCT,
-dequantization, XYB inverse, gaborish and EPF filters) plus a recursive
-O(N log N) DCT for larger blocks. Flutter Web (dart2js) emulates SIMD and
-decodes lossy images noticeably slower.
+~0.5 s (worst-case dense screentone at effort 7), using Float32x4 SIMD
+throughout the float pipeline: fused 8×8 inverse DCT, batched-vector
+large DCTs, dequantization, XYB inverse, gaborish and EPF filters.
+Flutter Web (dart2js) emulates SIMD and decodes lossy images noticeably
+slower.
 
 ## Development
 

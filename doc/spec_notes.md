@@ -61,14 +61,26 @@ dequantization (float-arithmetic lane masks; Int32x4 select boxes in
 AOT), the XYB opsin inverse, gaborish, and the EPF interior (8-pixel
 groups so the per-block sigma and border-lane pattern are constant per
 group; +-1 neighbors via shuffle + lane insert, +-2 via one shuffleMix).
-Larger DCTs use Lee's O(N log N) recursion with unrolled 2/4/8-point
-kernels. Weight matrices and coefficient orders are generated lazily per
+Larger DCTs (16x16 to 256x256) run a batched-vector form of Lee's
+O(N log N) recursion: column transforms put 4 adjacent columns in the
+lanes with no shuffling at all, row transforms go through in-register
+4x4 transposes, and twiddles apply via Float32x4.scale. (At N=256 the
+largest twiddle is ~115, which amplifies float32 rounding to ~1e-3
+relative - matching libjxl's own float32 arithmetic and far inside the
+conformance thresholds.) Weight matrices and coefficient orders are generated lazily per
 transform type actually used. On a 3.4MP page the EPF pass runs in
 ~57 ms and gaborish in ~34 ms.
 
 Note for Flutter Web: dart2js emulates Float32x4 in software, so lossy
 decoding is substantially slower there; AOT targets (Android/iOS/desktop)
-get native SIMD. Remaining gap vs libjxl is threading and deeper SIMD.
+get native SIMD.
+
+Multi-core decode via isolates was evaluated and deferred: Dart isolates
+share no mutable memory, so parallel pass-group decoding would need
+either per-worker re-parsing of the LF/global sections or bulk copies of
+coefficient state, and at ~0.3-0.5 s per page single-threaded the added
+complexity outweighs the plausible ~2x. Revisit if shared-memory
+isolates land or if multi-megapixel spreads become the common case.
 
 A hard-won Dart AOT lesson encoded in the hot paths: never derive a
 `List<Float32List>` used in a hot loop from a nested

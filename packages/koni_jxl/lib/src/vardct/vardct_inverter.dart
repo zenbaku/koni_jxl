@@ -189,6 +189,16 @@ void invertVarDCTGroup(
                 ppgX >> 2,
                 ppfY,
                 ppfX >> 2);
+          } else if (fbV0 != null && hf.simdViews) {
+            inverseDCT2DSimd(
+                hf.dequantHFCoeffVAt(c),
+                c == 0 ? fbV0 : (c == 1 ? fbV1! : fbV2!),
+                ppgY,
+                ppgX >> 2,
+                ppfY,
+                ppfX >> 2,
+                tt.pixelHeight,
+                tt.pixelWidth);
           } else {
             inverseDCT2D(cc, fb, ppgY, ppgX, ppfY, ppfX, tt.pixelHeight,
                 tt.pixelWidth, s0, s1, false);
