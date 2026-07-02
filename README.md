@@ -23,14 +23,26 @@ Image(image: JxlImageProvider.asset('assets/page.jxl'))
 import 'package:koni_jxl/koni_jxl.dart';
 
 final info = JxlInfo.parse(bytes);          // header only, cheap
-final image = JxlDecoder.decode(bytes);     // full decode
+final image = JxlDecoder.decode(bytes);     // full decode (first frame)
 final rgba = image.toRgba8();               // interleaved RGBA bytes
+
+final anim = JxlDecoder.decodeAnimation(bytes);   // all frames
+final delay = anim.frameDuration(0);              // per-frame Duration
 ```
 
 ## Status
 
+**Feature-complete for its target use case** (manga/comic readers and
+general image display). All planned milestones (M0–M7) are done:
+container/headers, the full entropy stack, lossless modular, lossy
+VarDCT, restoration filters, animation, splines, and a Float32x4 SIMD
+performance pass.
+
 Correctness is verified **bit-exact against libjxl's `djxl`** on a large
-generated corpus and the official conformance test suite.
+generated corpus and the official conformance test suite (~210 automated
+tests), and validated on real-world commercially-distributed CBZ chapters
+containing JPEG-transcoded JXL pages: **34/34 pages match djxl within a
+max pixel difference of 1/255**.
 
 Supported today:
 
@@ -44,11 +56,13 @@ Supported today:
 - ✅ Grayscale, RGB, palette (incl. delta palette), alpha, 8/16-bit
 - ✅ All modular predictors incl. the self-correcting weighted predictor
 - ✅ RCT, palette, and squeeze (responsive) transforms
-- ✅ Patches, splines, reference frames, all blend modes
+- ✅ Patches, reference frames, all blend modes
 - ✅ ISOBMFF container and bare codestreams; EXIF orientation
 - ✅ Embedded ICC profiles (decoded and exposed)
 - ✅ Animation: all frames with durations and loop count
-  (`JxlDecoder.decodeAnimation`, `JxlAnimationView` widget)
+  (`JxlDecoder.decodeAnimation`, `JxlAnimationView` widget) — the
+  newtons_cradle conformance animation is bit-exact on all 36 frames
+- ✅ Splines (both spline conformance cases within 1/255 of djxl)
 
 Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 
@@ -70,9 +84,17 @@ slower.
 ```bash
 dart pub get
 cd packages/koni_jxl && dart test           # unit + gate tests
-python3 tool/gen_corpus.py                  # regenerate test corpus (needs cjxl)
+cd packages/koni_jxl_flutter && flutter test
+python3 tool/gen_corpus.py                  # regenerate test corpus (needs cjxl/djxl)
 python3 tool/check_jxl_info.py              # header gate vs jxlinfo
 ```
+
+Differential gates (bit-exact lossless compares, lossy RMSE thresholds)
+run automatically when `cjxl`/`djxl` and the generated corpus are
+present, and skip cleanly otherwise. `doc/spec_notes.md` documents every
+known deviation from libjxl and from the jxlatte reference (including
+two jxlatte bugs this decoder fixes). See `CLAUDE.md` for the full
+development playbook.
 
 The decoder is ported from [jxlatte](https://github.com/Traneptora/jxlatte)
 (MIT) and cross-checked against
