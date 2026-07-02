@@ -68,10 +68,17 @@ this costs 5-20x in pixel loops.
 ## Real-world validation
 
 Two commercially-distributed CBZ chapters containing JPEG-transcoded JXL
-pages (VarDCT + JPEG reconstruction data, YCbCr; 1066x1600 B/W and up to
-1920x1508 full color) decode with zero failures: 33/34 pages match djxl
-within a max pixel difference of 1/255; one non-block-aligned page shows
-max 10/255 confined to its final row (144 of 2.9M pixels, an edge-padding
-nuance). ~0.3-0.4 s per page AOT single-threaded. The `jbrd` JPEG
-reconstruction box is ignored; pixels decode through the normal VarDCT
-path (byte-exact JPEG re-emission is out of scope).
+pages (VarDCT + JPEG reconstruction data, YCbCr 4:2:0; 1066x1600 B/W and
+up to 1920x1508 full color) decode with zero failures: all 34 pages match
+djxl within a max pixel difference of 1/255, ~0.3-0.4 s per page AOT
+single-threaded. The `jbrd` JPEG reconstruction box is ignored; pixels
+decode through the normal VarDCT path (byte-exact JPEG re-emission is out
+of scope).
+
+Deviation fixed relative to jxlatte: chroma upsampling (subsampling
+inversion) mirrors its neighbor taps at the *visible* subsampled extent,
+as libjxl's render pipeline does. jxlatte reads the padded DCT samples
+beyond ceil(visible/2) instead, which shifts the final visible row of
+4:2:0 images whose height is even but not a block multiple (verified:
+jxlatte deviates from djxl by up to 10/255 on such a row; we match djxl
+to 1/255 after the fix).

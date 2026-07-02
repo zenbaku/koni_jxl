@@ -272,10 +272,17 @@ final class Frame {
 
   /// Inverts JPEG-style chroma subsampling by repeatedly doubling the
   /// subsampled color planes with a [0.25, 0.75] filter.
+  ///
+  /// Neighbor taps mirror at the *visible* subsampled extent, matching
+  /// libjxl's render pipeline: the padded DCT rows/columns beyond
+  /// ceil(visible / 2) are never read. (jxlatte reads the padded samples
+  /// instead, which shifts the final visible row on 4:2:0 images whose
+  /// height is not a block multiple.)
   void _invertSubsampling() {
     for (var c = 0; c < 3; c++) {
       var xShift = header.jpegUpsamplingX[c];
       while (xShift-- > 0) {
+        final visIn = ceilDiv(boundsWidth, 1 << (xShift + 1));
         final old = buffer[c]
           ..castToFloat(globalMetadata.bitDepth.bitsPerSample);
         final oldRows = old.floatRows;
@@ -287,15 +294,15 @@ final class Frame {
           for (var x = 0; x < oldRow.length; x++) {
             final b75 = 0.75 * oldRow[x];
             newRow[2 * x] = b75 + 0.25 * oldRow[x == 0 ? 0 : x - 1];
-            newRow[2 * x + 1] = b75 +
-                0.25 *
-                    oldRow[x + 1 == oldRow.length ? oldRow.length - 1 : x + 1];
+            newRow[2 * x + 1] =
+                b75 + 0.25 * oldRow[x + 1 >= visIn ? visIn - 1 : x + 1];
           }
         }
         buffer[c] = newBuffer;
       }
       var yShift = header.jpegUpsamplingY[c];
       while (yShift-- > 0) {
+        final visIn = ceilDiv(boundsHeight, 1 << (yShift + 1));
         final old = buffer[c]
           ..castToFloat(globalMetadata.bitDepth.bitsPerSample);
         final oldRows = old.floatRows;
@@ -304,7 +311,7 @@ final class Frame {
         for (var y = 0; y < old.height; y++) {
           final oldRow = oldRows[y];
           final prevRow = oldRows[y == 0 ? 0 : y - 1];
-          final nextRow = oldRows[y + 1 == old.height ? old.height - 1 : y + 1];
+          final nextRow = oldRows[y + 1 >= visIn ? visIn - 1 : y + 1];
           final first = newRows[2 * y];
           final second = newRows[2 * y + 1];
           for (var x = 0; x < oldRow.length; x++) {
