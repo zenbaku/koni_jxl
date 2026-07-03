@@ -125,6 +125,12 @@ This contract is fuzz-tested and enforced by a regression suite;
 `JxlLimits` caps what a crafted header can allocate (override if you
 legitimately decode very large images).
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md). The headline next item is **lossy (VarDCT)
+encoding** — making koni_jxl a complete codec — plus lossless-encoder
+refinements and the remaining decoder gaps.
+
 ## Development
 
 ```bash
