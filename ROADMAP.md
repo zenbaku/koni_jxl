@@ -192,6 +192,31 @@ output for where the gap actually is.
   calibration tool) ships anyway: it's correctness-verified and directly
   reusable for a future banding-aware distortion term or for the
   transform-size RD search still deferred from L3.
+- ✅ **Compression efficiency, round 4: a learned context tree for DC.**
+  `_writeLfCoefficients` now learns a real per-image context tree
+  (`encode/context_tree.dart` — the same machinery the lossless encoder's
+  biggest lever already uses, reused unmodified) instead of writing DC
+  residuals through one shared single-leaf histogram. Verified legal by
+  reading the decoder source first: DC decodes through the same generic
+  modular-channel path lossless images use, and the property sets
+  involved never cross a channel boundary, so one tree trained across all
+  three DC channels together is exactly as sound as the lossless
+  encoder's own multi-plane tree. Real, no-quality-cost win on photo
+  content (`color_cover`: 6-9% smaller at *identical* RMSE across every
+  distance) and a smaller real win on manga-typical screentone content
+  (`gray_screentone`: 0.3-0.9% smaller, also at identical RMSE); a small
+  synthetic pattern (`screentone_256`) came out byte-identical (the tree
+  found no split worth its header cost and degenerated to the old
+  single-leaf form exactly) and only `palette16` saw a tiny ~0.1-0.2%
+  size increase. Costs ~20-60% more encode time (extra tree-learning and
+  per-pixel context-assignment passes per predictor candidate per LF
+  group) — still sub-second per LF group at every size tested. See
+  doc/spec_notes.md for the full write-up, including a subtle bug caught
+  before shipping (the original probe/commit shape copied a byte-aligned
+  `toBytes()` for the winning candidate, which would have corrupted
+  everything written after it in the same section once per-pixel
+  contexts were involved). AC-side rate-distortion search remains the
+  largest lever still on the table.
 
 ---
 

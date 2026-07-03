@@ -11,6 +11,7 @@ import '../../vardct/hf_coefficients.dart' show HfCoefficients;
 import '../../vardct/hf_global.dart' show defaultDctParams, getDCTQuantWeights;
 import '../../vardct/hf_pass.dart' show getNaturalOrder;
 import '../../vardct/transform_type.dart' show TransformMode, TransformType;
+import '../context_tree.dart';
 import '../entropy_writer.dart';
 import '../headers.dart';
 import '../wp_predictor.dart';
@@ -975,30 +976,44 @@ _ChromaFromLumaFit _chromaFromLumaFit(List<List<Float32List>> planes, int bh,
   return _ChromaFromLumaFit(kXGlobal, kBGlobal, kXRegion, kBRegion, corrW);
 }
 
-/// Writes a modular sub-stream with a single-leaf MA tree (no per-pixel
-/// property splitting — one shared histogram per stream) using [predictor]
-/// (default 0 == Zero, so `prediction == 0` always and every decoded pixel
-/// equals exactly `unpackSigned(symbol)`; see `_gradientResiduals` for the
-/// non-zero-predictor case). Offset 0, multiplier 1 always: the decoder
-/// reconstructs `trueValue = unpackSigned(symbol) + prediction(...)`
+/// Writes a modular sub-stream using [predictor] (default 0 == Zero, so
+/// `prediction == 0` always and every decoded pixel equals exactly
+/// `unpackSigned(symbol)`; see `_gradientResiduals` for the non-zero-
+/// predictor case). Offset 0, multiplier 1 always: the decoder reconstructs
+/// `trueValue = unpackSigned(symbol) + prediction(...)`
 /// (`modular/modular_channel.dart`'s decode loop), so [channelsInOrder]
 /// must already be in that residual domain for [predictor] != 0.
+///
+/// With [tree] null, uses a single-leaf MA tree (one shared histogram for
+/// the whole stream) — the original L0/L1/L2 behavior. With [tree] given
+/// (a real learned context tree, [tree.contexts] leaves), serializes it via
+/// [serializeContextTree] and routes each channel's values to the
+/// per-pixel context in the matching entry of [contexts] (same shape as
+/// [channelsInOrder]) — the same `EntropyWriter`/cluster-map machinery the
+/// lossless encoder's learned tree already uses (identity cluster map, the
+/// complex nested-stream form kicking in automatically above 8 contexts).
 void _writeModularStream(BitWriter w, List<List<int>> channelsInOrder,
-    {int predictor = 0}) {
+    {int predictor = 0, ContextTree? tree, List<List<int>>? contexts}) {
   w.writeBool(false); // use_global_tree
   w.writeBool(true); // wp_params default
   w.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 0
-  final treeTokens = EntropyWriter(6);
-  treeTokens.write(1, 0); // property + 1 == 0 -> leaf
-  treeTokens.write(2, predictor);
-  treeTokens.write(3, 0); // offset = packSigned(0) = 0
-  treeTokens.write(4, 0); // mulLog = 0
-  treeTokens.write(5, 0); // mulBits = 0 -> multiplier = 1
-  treeTokens.finalize(w);
-  final residuals = EntropyWriter(1);
-  for (final channel in channelsInOrder) {
-    for (final v in channel) {
-      residuals.write(0, _packSigned(v));
+  if (tree != null) {
+    serializeContextTree(w, tree, predictor);
+  } else {
+    final treeTokens = EntropyWriter(6);
+    treeTokens.write(1, 0); // property + 1 == 0 -> leaf
+    treeTokens.write(2, predictor);
+    treeTokens.write(3, 0); // offset = packSigned(0) = 0
+    treeTokens.write(4, 0); // mulLog = 0
+    treeTokens.write(5, 0); // mulBits = 0 -> multiplier = 1
+    treeTokens.finalize(w);
+  }
+  final residuals = EntropyWriter(tree?.contexts ?? 1);
+  for (var c = 0; c < channelsInOrder.length; c++) {
+    final channel = channelsInOrder[c];
+    final channelContexts = contexts?[c];
+    for (var i = 0; i < channel.length; i++) {
+      residuals.write(channelContexts?[i] ?? 0, _packSigned(channel[i]));
     }
   }
   residuals.finalize(w);
@@ -1051,38 +1066,103 @@ List<int> _gradientResiduals(Int32List values, int width) {
 /// `cMap`). Tries predictor 5 (clamped gradient, `_gradientResiduals`)
 /// and predictor 6 (self-correcting weighted, `wpTileResiduals` — the
 /// exact same decoder-verified computation `encoder.dart`'s lossless
-/// path already uses) for all three channels together and keeps whichever
-/// assembles smaller real bytes, mirroring that same lossless encoder's
-/// "try gradient and WP, keep the smaller actual output" pattern
-/// (`bestForPredictor` in `encoder.dart`) — WP tends to win on
-/// photographic/tonal content, gradient on flatter content, and DC
-/// planes see both depending on image and channel (X/B are
-/// chroma-from-luma residuals, often flatter than Y).
+/// path already uses), each with its OWN learned context tree (property
+/// splitting over all three channels together, exactly
+/// `encoder.dart`'s `bestForPredictor`/learned-tree pattern for the
+/// lossless path — same `context_tree.dart` machinery, same property
+/// sets, legal here because the decoder's DC/LF stream is decoded via the
+/// same generic modular-channel path as lossless, per-LF-group-local, and
+/// none of `gradProperties`/`wpProperties` cross a channel boundary), and
+/// keeps whichever assembles smaller real bytes. WP tends to win on
+/// photographic/tonal content, gradient on flatter content, and DC planes
+/// see both depending on image and channel (X/B are chroma-from-luma
+/// residuals, often flatter than Y).
 void _writeLfCoefficients(
     BitWriter w, Int32List dcX, Int32List dcY, Int32List dcB, int width) {
   w.writeBits(0, 2); // extraPrecision = 0
   final height = dcY.length ~/ width;
-  final gradResiduals = [
-    _gradientResiduals(dcY, width),
-    _gradientResiduals(dcX, width),
-    _gradientResiduals(dcB, width),
-  ];
-  Int32List wpOf(Int32List values) {
-    final out = Int32List(values.length);
-    wpTileResiduals(values, width, height, out);
-    return out;
+  final trueChannels = [dcY, dcX, dcB]; // decoder Y, X, B order
+
+  // Builds one predictor's residuals/tree/contexts and a bits-only probe
+  // (never actually appended anywhere — `_writeLfCoefficients` is not
+  // byte-aligned within its section, so the real winner is re-emitted
+  // directly into `w` from the same precomputed tree/contexts below rather
+  // than copying a byte-aligned `probe.toBytes()`, which would corrupt
+  // everything written after it).
+  (BitWriter, List<Int32List>, ContextTree, List<List<int>>) buildCandidate(
+      bool useWp) {
+    final predictor = useWp ? 6 : 5;
+    final properties = useWp ? wpProperties : gradProperties;
+    final residuals = <Int32List>[];
+    final maxErr = useWp ? <Int32List>[] : null;
+    for (final ch in trueChannels) {
+      if (useWp) {
+        final res = Int32List(ch.length);
+        final err = Int32List(ch.length);
+        wpTileResiduals(ch, width, height, res, err);
+        residuals.add(res);
+        maxErr!.add(err);
+      } else {
+        residuals.add(Int32List.fromList(_gradientResiduals(ch, width)));
+      }
+    }
+
+    // Learn a tree from every pixel of all three channels (small enough per
+    // LF group — at most 256x256 DC values per channel — that no training
+    // subsample is needed, unlike the lossless encoder's whole-image tree).
+    final trainProps = <int>[];
+    final trainTokens = <int>[];
+    final props = Int32List(properties.length);
+    for (var c = 0; c < 3; c++) {
+      final ch = trueChannels[c];
+      final err = maxErr?[c];
+      final res = residuals[c];
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final o = y * width + x;
+          computeProps(
+              ch, width, height, y, x, properties, err?[o] ?? 0, props);
+          trainProps.addAll(props);
+          trainTokens.add(tokenizeHybrid(
+                  const HybridIntegerConfig(4, 1, 0), _packSigned(res[o]))
+              .$1);
+        }
+      }
+    }
+    final tree = learnContextTree(Int32List.fromList(trainProps),
+        Int32List.fromList(trainTokens), properties);
+
+    final contexts = <List<int>>[];
+    for (var c = 0; c < 3; c++) {
+      final ch = trueChannels[c];
+      final err = maxErr?[c];
+      final ctxList = List<int>.filled(ch.length, 0);
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final o = y * width + x;
+          computeProps(
+              ch, width, height, y, x, tree.properties, err?[o] ?? 0, props);
+          ctxList[o] = contextFor(tree, props);
+        }
+      }
+      contexts.add(ctxList);
+    }
+
+    final probe = BitWriter();
+    _writeModularStream(probe, residuals,
+        predictor: predictor, tree: tree, contexts: contexts);
+    return (probe, residuals, tree, contexts);
   }
 
-  final wpResiduals = [wpOf(dcY), wpOf(dcX), wpOf(dcB)];
-
-  final gradProbe = BitWriter();
-  _writeModularStream(gradProbe, gradResiduals, predictor: 5);
-  final wpProbe = BitWriter();
-  _writeModularStream(wpProbe, wpResiduals, predictor: 6);
+  final (gradProbe, gradResiduals, gradTree, gradContexts) =
+      buildCandidate(false);
+  final (wpProbe, wpResiduals, wpTree, wpContexts) = buildCandidate(true);
   if (wpProbe.bitsWritten < gradProbe.bitsWritten) {
-    _writeModularStream(w, wpResiduals, predictor: 6);
+    _writeModularStream(w, wpResiduals,
+        predictor: 6, tree: wpTree, contexts: wpContexts);
   } else {
-    _writeModularStream(w, gradResiduals, predictor: 5);
+    _writeModularStream(w, gradResiduals,
+        predictor: 5, tree: gradTree, contexts: gradContexts);
   }
 }
 

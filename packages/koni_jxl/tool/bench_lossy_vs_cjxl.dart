@@ -14,9 +14,12 @@ import 'package:koni_jxl/koni_jxl.dart';
 /// are the closer comparison point; higher efforts show how much
 /// headroom a real RD search leaves on the table.
 ///
-/// Usage: `dart run tool/bench_lossy_vs_cjxl.dart [ppm files...]`
+/// Usage: `dart run tool/bench_lossy_vs_cjxl.dart [ppm/pgm files...]`
 /// (defaults to the corpus's two RGB `_d0_` goldens if none are given —
-/// run `tool/gen_corpus.py` first).
+/// run `tool/gen_corpus.py` first). Grayscale `.pgm` inputs are replicated
+/// to RGB (this encoder's `encodeLossy` is RGB-only), matching
+/// `encoder_lossy_corpus_test.dart`'s own pattern for exercising grayscale
+/// corpus content.
 void main(List<String> args) {
   final inputs = args.isNotEmpty
       ? args
@@ -31,7 +34,7 @@ void main(List<String> args) {
       stderr.writeln('skip (not found): $path');
       continue;
     }
-    final (width, height, pixels) = _readPpm(file.readAsBytesSync());
+    final (width, height, pixels) = _readPnm(file.readAsBytesSync());
     print('\n=== $path (${width}x$height) ===');
     print('distance  encoder    bytes   size-ratio  rmse    encode-ms');
     for (final distance in [0.5, 1.0, 2.0, 4.0, 8.0]) {
@@ -128,6 +131,29 @@ double _decodeAndRmse(
 /// Minimal binary PPM (P6) reader — just enough for this benchmark's
 /// self-generated inputs (comment-free, single-byte-per-sample headers).
 (int, int, Uint8List) _readPpm(Uint8List data) {
+  final (magic, width, height, maxValue, i) = _readPnmHeader(data);
+  if (magic != 'P6') throw FormatException('expected P6 PPM, got $magic');
+  if (maxValue != 255) throw FormatException('expected 8-bit PPM');
+  return (width, height, Uint8List.sublistView(data, i));
+}
+
+/// Reads a source input for the benchmark: binary PPM (P6, RGB) as-is, or
+/// binary PGM (P5, grayscale) replicated to RGB triples (`encodeLossy` is
+/// RGB-only).
+(int, int, Uint8List) _readPnm(Uint8List data) {
+  final (magic, width, height, maxValue, i) = _readPnmHeader(data);
+  if (maxValue != 255) throw FormatException('expected 8-bit PNM');
+  if (magic == 'P6') return (width, height, Uint8List.sublistView(data, i));
+  if (magic != 'P5') throw FormatException('expected P5/P6 PNM, got $magic');
+  final gray = Uint8List.sublistView(data, i);
+  final rgb = Uint8List(gray.length * 3);
+  for (var p = 0; p < gray.length; p++) {
+    rgb[p * 3] = rgb[p * 3 + 1] = rgb[p * 3 + 2] = gray[p];
+  }
+  return (width, height, rgb);
+}
+
+(String, int, int, int, int) _readPnmHeader(Uint8List data) {
   var i = 0;
   String token() {
     while (data[i] == 0x20 || data[i] == 0x0A || data[i] == 0x0D) {
@@ -141,11 +167,9 @@ double _decodeAndRmse(
   }
 
   final magic = token();
-  if (magic != 'P6') throw FormatException('expected P6 PPM, got $magic');
   final width = int.parse(token());
   final height = int.parse(token());
   final maxValue = int.parse(token());
-  if (maxValue != 255) throw FormatException('expected 8-bit PPM');
   i++; // single whitespace byte after maxValue
-  return (width, height, Uint8List.sublistView(data, i));
+  return (magic, width, height, maxValue, i);
 }

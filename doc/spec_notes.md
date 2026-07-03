@@ -805,6 +805,106 @@ verified for the opt-in path across single-group, multi-group, multi-LF-
 group and 16x16-block-mixed configurations
 (`vardct_l0_test.dart`'s "RD hfMult search (opt-in) decodes correctly").
 
+### Lossy (VarDCT) encoder — compression efficiency: a learned context tree for DC
+
+Follow-up to the two DC prediction fixes above, picked as the smaller,
+bounded-scope item over a full AC-side RD search (see that section's
+"Next" note). `_writeLfCoefficients` previously wrote DC residuals
+through a trivial single-leaf MA tree — one shared histogram for the
+whole LF group, all three channels combined (`_writeModularStream`'s
+original form). This upgrades it to a real learned context tree
+(`encode/context_tree.dart`'s `learnContextTree`/`computeProps`/
+`contextFor`/`serializeContextTree`), the exact same machinery the
+lossless encoder already uses for its biggest single lever, reused
+without modification.
+
+**Why this is legal, verified by reading the decoder source before
+writing any code (per the project's established methodology)**:
+`lf_coefficients.dart` decodes DC through `ModularStream.read` — the
+*same* generic modular-channel decode path lossless images use, per
+LF group (`streamIndex: 1 + lfGroupID`), already confirmed independent
+per LF group (each carries its own local tree, `use_global_tree =
+false`, matching what `_writeLfCoefficients` already did for the
+predictor-only version). `modular_channel.dart`'s `_property` (the
+MA-tree property evaluator) has cross-channel properties (0 = channel
+index, 1 = stream index, and `k >= 16` = other channels' values), but
+`gradProperties`/`wpProperties` (`context_tree.dart`) use only the
+pure within-channel spatial properties (4-14, plus 15 = WP max-error) —
+identical to what the lossless encoder already relies on when it learns
+one shared tree across multiple color planes. So a single tree trained
+on samples from all three DC channels (Y, X, B) together, exactly
+mirroring `encoder.dart`'s `bestForPredictor`, is provably as legal here
+as it already is for lossless. `computeProps` also needs *true* pixel
+values (not residuals) for its neighbor lookups — matches `dcX`/`dcY`/
+`dcB`, which are already true DC values before `_gradientResiduals`/
+`wpTileResiduals` are applied.
+
+**Implementation**: `_writeModularStream` gained an optional `tree`/
+`contexts` parameter — when given, it calls `serializeContextTree`
+instead of hand-writing a single leaf, and routes each channel's values
+through `EntropyWriter(tree.contexts)` at the assigned per-pixel context
+instead of always context 0. `EntropyWriter` already handles the
+cluster-map form transition (simple fixed-width up to 8 contexts,
+complex nested-entropy-stream form above it) internally, so no new
+cluster-map code was needed. `_writeLfCoefficients` now runs the same
+"probe both, keep smaller real bytes" comparison as before, but each
+candidate first learns its own tree (trained on *every* pixel of all
+three channels — at most 256x256 DC values per channel per LF group, far
+under the lossless encoder's 300k-sample stride threshold, so no
+subsampling was needed). One subtlety caught before it could corrupt
+output: the original code compared two full `BitWriter` probes and
+`writeBytes()`'d the winner's `toBytes()` into the real output — safe
+only because the probe stream was, incidentally, always byte-unaligned
+garbage-free in the single-leaf case. With per-pixel contexts the probe
+is genuinely no longer meant to be reused verbatim (`_writeLfCoefficients`
+is not byte-aligned within its enclosing section — anything written
+after it in the same section would desync if a byte-aligned copy were
+spliced in). Fixed by keeping the precomputed tree/contexts/residuals
+around and calling `_writeModularStream` a second time directly into the
+real `BitWriter`, exactly mirroring the original code's own two-call
+probe/commit shape, just with an extra 4-tuple of precomputed state
+threaded through instead of relying on `toBytes()`.
+
+**Measured effect (`tool/bench_lossy_vs_cjxl.dart`, extended in the same
+change to read grayscale `.pgm` corpus inputs — replicated to RGB, same
+pattern `encoder_lossy_corpus_test.dart` already uses — so manga-typical
+screentone content could be measured directly, not just the two RGB
+goldens)**: on `color_cover` (real photo), 6-9% smaller across every
+distance tried, at **exactly identical RMSE** in every case (133295 →
+123388 bytes at distance 1.0, RMSE unchanged at 1.80) — a pure
+entropy-coding improvement with zero quality cost, since prediction,
+quantization and reconstruction are all untouched. On `gray_screentone`
+(1536x2200, large manga-like screentone), a smaller but still real 0.3-
+0.9% win, also at identical RMSE. On `screentone_256` (a small, clean
+synthetic screentone pattern), output was **byte-identical** — the
+learned tree found no split worth its header cost and degenerated to a
+single leaf, and `serializeContextTree`'s single-leaf output is bit-for-
+bit identical to the old hardcoded single-leaf tree, so the two paths
+coincide exactly. This self-verifies the "no downside" property: when
+there's nothing to gain, the new code doesn't just avoid regressing, it
+produces the identical bitstream. The one exception: `palette16` (a
+low-color-count synthetic image) saw a tiny ~0.1-0.2% *increase*
+(38405 → 38453 bytes at distance 1.0) — the tree did find a marginal
+split whose real assembled cost slightly exceeds its estimated training
+gain, the same kind of small header-vs-gain miss already documented for
+per-cluster overhead elsewhere (see the per-region CfL section above).
+Judged an acceptable trade given the real wins on photo/screentone
+content, following the same "try harder, keep smaller real bytes"
+philosophy — no size-regression gate was added for the same reason as
+the WP-for-DC change above (a hand-built synthetic case reliably showing
+a >1% win is hard to construct; the real-corpus gate already covers
+this path's correctness).
+
+**Cost**: encode time increases meaningfully (roughly 20-60% slower on
+the two RGB corpus images, e.g. `color_cover` at distance 1.0: 653ms →
+817ms) since each LF group now runs tree-learning and a per-pixel
+context-assignment pass for *both* predictor candidates, on top of the
+residual computation that already existed. Still comfortably sub-second
+per LF group at the sizes tested; no regression test exists for encode
+time specifically (per CLAUDE.md's performance-rules doc, the tracked
+reference numbers are for the decode path and the lossless encoder, not
+yet this newer lossy-encoder work).
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
