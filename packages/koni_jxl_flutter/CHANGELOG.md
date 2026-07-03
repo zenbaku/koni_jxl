@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.1
+
+- **`decodeJxlToUiCodec`** — decode to a `ui.Codec`, the shape custom
+  `ImageProvider`s feed to `MultiFrameImageStreamCompleter`. Stills yield
+  a single-frame codec; animated files carry their frame durations and
+  loop count. Handles the engine's raw-descriptor lifetime rules
+  internally (frames are extracted before the backing buffers are
+  released, then handed out as clones).
+- **`jxlAwareDecode(bytes, decode)`** — the drop-in seam for apps whose
+  providers render mixed formats from one byte source: sniffs JPEG XL by
+  content (`looksLikeJxl`, re-exported from `koni_jxl` 0.1.1) and decodes
+  it here; anything else goes to the engine callback unchanged.
+- `JxlImageProvider` now uses `decodeJxlToUiCodec`, so animated JPEG XL
+  plays through plain `Image` widgets with correct timing and loop count
+  (it previously showed only the first frame).
+- The whole `koni_jxl` API is re-exported, so one dependency suffices.
+- Fixed web builds: every decode/encode helper used `Isolate.run`, which
+  throws `UnsupportedError` under dart2js/dart2wasm, so the package did
+  not actually work on the web. All heavy work now goes through Flutter's
+  `compute` — still a background isolate (with transferred, not copied,
+  result buffers) on native platforms, a plain call on the web, where the
+  decode runs on the UI thread.
+
 ## 0.1.0
 
 First release. Flutter bindings for the pure-Dart `koni_jxl` codec.

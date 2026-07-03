@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter/painting.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -65,6 +66,84 @@ void main() {
       expect(anim.frames.length, 1);
       expect(anim.isAnimated, isFalse);
       anim.dispose();
+    });
+  });
+
+  group('decodeJxlToUiCodec', () {
+    test('a still image yields a single-frame codec', () async {
+      final codec = await decodeJxlToUiCodec(sample.readAsBytesSync());
+      expect(codec.frameCount, 1);
+      expect(codec.repetitionCount, 0);
+      final frame = await codec.getNextFrame();
+      expect(frame.image.width, 256);
+      expect(frame.image.height, 256);
+      expect(frame.duration, Duration.zero);
+      frame.image.dispose();
+      codec.dispose();
+    });
+
+    test('an animated file yields all frames, durations and loop count',
+        () async {
+      final codec = await decodeJxlToUiCodec(
+          File('test/assets/anim_d0.jxl').readAsBytesSync());
+      expect(codec.frameCount, 4);
+      expect(codec.repetitionCount, -1); // numLoops 0 = play forever
+      for (var i = 0; i < 5; i++) {
+        final frame = await codec.getNextFrame();
+        expect(frame.image.width, 64);
+        expect(frame.image.height, 48);
+        expect(frame.duration, const Duration(milliseconds: 100));
+        frame.image.dispose();
+      }
+      codec.dispose();
+    });
+
+    test('hands out clones: consumed frames do not poison the next loop',
+        () async {
+      // The image stream machinery disposes every frame it consumes; a
+      // second play-through must still get live images.
+      final codec = await decodeJxlToUiCodec(
+          File('test/assets/anim_d0.jxl').readAsBytesSync());
+      for (var i = 0; i < codec.frameCount * 2; i++) {
+        final frame = await codec.getNextFrame();
+        frame.image.dispose();
+      }
+      final again = await codec.getNextFrame();
+      expect(again.image.clone(), isNotNull);
+      again.image.dispose();
+      codec.dispose();
+    });
+  });
+
+  group('jxlAwareDecode', () {
+    Future<ui.Codec> mustNotReachEngine(
+      ui.ImmutableBuffer buffer, {
+      ui.TargetImageSizeCallback? getTargetSize,
+    }) async {
+      fail('JXL bytes were handed to the engine decoder');
+    }
+
+    test('routes JXL bytes to the koni_jxl decoder', () async {
+      final codec =
+          await jxlAwareDecode(sample.readAsBytesSync(), mustNotReachEngine);
+      expect(codec.frameCount, 1);
+      final frame = await codec.getNextFrame();
+      expect(frame.image.width, 256);
+      frame.image.dispose();
+      codec.dispose();
+    });
+
+    test('hands anything else to the engine callback', () async {
+      final png = Uint8List.fromList([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]);
+      var engineSaw = -1;
+      await expectLater(
+        jxlAwareDecode(png, (buffer, {getTargetSize}) {
+          engineSaw = buffer.length;
+          throw const FormatException('sentinel');
+        }),
+        throwsFormatException,
+      );
+      expect(engineSaw, png.length);
     });
   });
 

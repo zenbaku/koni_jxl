@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:koni_jxl/src/encode/encoder.dart';
 import 'package:koni_jxl/src/exceptions.dart';
 import 'package:koni_jxl/src/io/container.dart';
 import 'package:test/test.dart';
@@ -127,5 +128,37 @@ void main() {
     ]);
     expect(() => demuxContainer(data),
         throwsA(isA<JxlInvalidBitstreamException>()));
+  });
+
+  group('looksLikeJxl', () {
+    test('recognizes a bare codestream prefix', () {
+      expect(looksLikeJxl(codestream), isTrue);
+      expect(looksLikeJxl([0xFF, 0x0A]), isTrue);
+    });
+
+    test('recognizes the container signature', () {
+      expect(looksLikeJxl(signature), isTrue);
+      expect(
+          looksLikeJxl(concat([signature, box('jxlc', codestream)])), isTrue);
+    });
+
+    test('recognizes real encoder output', () {
+      final jxl = JxlEncoder.encodeLossless(
+          Uint8List.fromList(List.filled(4 * 4 * 4, 128)),
+          width: 4,
+          height: 4,
+          hasAlpha: true);
+      expect(looksLikeJxl(jxl), isTrue);
+    });
+
+    test('rejects other formats, short input, and near-misses', () {
+      expect(looksLikeJxl([0x89, 0x50, 0x4E, 0x47]), isFalse); // PNG
+      expect(looksLikeJxl([0xFF, 0xD8, 0xFF, 0xE0]), isFalse); // JPEG
+      expect(looksLikeJxl([]), isFalse);
+      expect(looksLikeJxl([0xFF]), isFalse);
+      expect(looksLikeJxl(signature.sublist(0, 11)), isFalse);
+      final wrongTail = [...signature]..[11] = 0x0B;
+      expect(looksLikeJxl(wrongTail), isFalse);
+    });
   });
 }

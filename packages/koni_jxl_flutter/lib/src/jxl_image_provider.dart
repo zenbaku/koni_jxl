@@ -16,7 +16,9 @@ import 'jxl_codec.dart';
 /// ```
 ///
 /// Decoding runs in a background isolate; results participate in Flutter's
-/// [ImageCache] like any other provider.
+/// [ImageCache] like any other provider. Animated JPEG XL plays with its
+/// frame timing and loop count, exactly like an engine-decoded GIF/APNG
+/// (via [decodeJxlToUiCodec]).
 class JxlImageProvider extends ImageProvider<JxlImageProvider> {
   /// Decodes .jxl bytes already in memory.
   JxlImageProvider.memory(Uint8List bytes, {this.scale = 1.0})
@@ -49,18 +51,14 @@ class JxlImageProvider extends ImageProvider<JxlImageProvider> {
   @override
   ImageStreamCompleter loadImage(
       JxlImageProvider key, ImageDecoderCallback decode) {
-    return OneFrameImageStreamCompleter(
-      _loadAsync(),
+    return MultiFrameImageStreamCompleter(
+      codec: _load().then(decodeJxlToUiCodec),
+      scale: scale,
+      debugLabel: toString(),
       informationCollector: () => [
         DiagnosticsProperty<JxlImageProvider>('Image provider', this),
       ],
     );
-  }
-
-  Future<ImageInfo> _loadAsync() async {
-    final bytes = await _load();
-    final image = await decodeJxlToUiImage(bytes);
-    return ImageInfo(image: image, scale: scale);
   }
 
   @override

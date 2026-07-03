@@ -21,6 +21,22 @@ const _containerSignature = [
   0x0D, 0x0A, 0x87, 0x0A,
 ];
 
+/// Whether [bytes] start with a JPEG XL signature — the bare codestream
+/// marker (`FF 0A`) or the 12-byte ISOBMFF container signature box.
+///
+/// A cheap prefix check for routing bytes of mixed image formats to the
+/// right decoder; it validates nothing beyond the signature (a `true` can
+/// still fail to decode — use `JxlInfo.parse` to actually inspect the
+/// file). Never throws, whatever the input length.
+bool looksLikeJxl(List<int> bytes) {
+  if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0x0A) return true;
+  if (bytes.length < _containerSignature.length) return false;
+  for (var i = 0; i < _containerSignature.length; i++) {
+    if (bytes[i] != _containerSignature[i]) return false;
+  }
+  return true;
+}
+
 /// Extracts the codestream from [data], which may be a bare codestream or an
 /// ISOBMFF container with `jxlc`/`jxlp` boxes. Unknown boxes are skipped.
 DemuxedStream demuxContainer(Uint8List data) {

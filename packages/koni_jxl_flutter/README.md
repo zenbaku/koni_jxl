@@ -17,14 +17,28 @@ Image(image: JxlImageProvider.memory(jxlBytes))
 final ui.Image image = await decodeJxlToUiImage(bytes);
 ```
 
-Decoding runs in a background isolate (`Isolate.run`) so the UI thread
-never blocks; decoded images participate in Flutter's `ImageCache`
-normally.
+Decoding runs through Flutter's `compute` — a background isolate on
+native platforms, so the UI thread never blocks; on the web, which has
+no isolates, the decode runs on the UI thread. Decoded images
+participate in Flutter's `ImageCache` normally.
 
 ## What's included
 
 - **`JxlImageProvider`** (`.asset` / `.file` / `.memory`) and
-  `decodeJxlToUiImage` — decode a still image.
+  `decodeJxlToUiImage` — decode an image; animated files play through
+  plain `Image` widgets with correct timing and loop count.
+- **`jxlAwareDecode` and `decodeJxlToUiCodec`** — for apps with custom
+  `ImageProvider`s over mixed formats (readers, caches, archives): sniff
+  JPEG XL by content and decode it to a `ui.Codec` for the standard
+  `MultiFrameImageStreamCompleter` machinery, handing everything else to
+  the engine callback unchanged:
+
+  ```dart
+  Future<ui.Codec> _loadCodec(ImageDecoderCallback decode) async {
+    final bytes = await _readBytes();
+    return jxlAwareDecode(bytes, decode);
+  }
+  ```
 - **`JxlAnimationView`** and `decodeJxlAnimation` — play animated JPEG XL
   with correct per-frame timing and loop count.
 - **`JxlProgressiveImage`** and `decodeJxlProgressive` — show a blurry

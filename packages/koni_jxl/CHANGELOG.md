@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
+
+### API
+
+- **`looksLikeJxl(bytes)`** — cheap signature sniff (bare `FF 0A`
+  codestream or the ISOBMFF container box) for routing bytes of mixed
+  image formats to the right decoder, e.g. inside a custom Flutter
+  `ImageProvider`. Never throws.
 
 ### Encoding
 
