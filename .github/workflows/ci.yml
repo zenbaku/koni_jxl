@@ -14,7 +14,7 @@ jobs:
         with:
           channel: stable
       - run: flutter pub get
-      - run: dart format --output=none --set-exit-code packages/koni_jxl packages/koni_jxl_flutter
+      - run: dart format --output=none --set-exit-if-changed packages/koni_jxl packages/koni_jxl_flutter
       - run: dart analyze --fatal-infos
       - run: dart test
         working-directory: packages/koni_jxl
