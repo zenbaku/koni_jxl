@@ -84,6 +84,33 @@ final class BitWriter {
     writeU32(value, 0, 0, 1, 0, 2, 4, 18, 6);
   }
 
+  /// Mirror of `BitReader.readF16`: writes [value] as an IEEE-754-like
+  /// half-precision float (round-toward-zero on the mantissa). Magnitudes
+  /// too large to represent clamp to the largest finite half value;
+  /// magnitudes too small (or zero/NaN) flush to signed zero — this
+  /// encoder never needs subnormal precision for the small set of
+  /// quantizer parameters it writes as F16.
+  void writeF16(double value) {
+    if (value == 0 || value.isNaN) {
+      writeBits(0, 16);
+      return;
+    }
+    final bits64 = (ByteData(8)..setFloat64(0, value)).getUint64(0);
+    final sign = (bits64 >> 63) & 1;
+    var exp16 = ((bits64 >> 52) & 0x7FF).toInt() - 1023 + 15;
+    int mantissa16;
+    if (exp16 >= 31) {
+      exp16 = 30;
+      mantissa16 = 0x3FF;
+    } else if (exp16 <= 0) {
+      writeBits(sign << 15, 16);
+      return;
+    } else {
+      mantissa16 = (bits64 >> 42) & 0x3FF;
+    }
+    writeBits((sign << 15) | (exp16 << 10) | mantissa16, 16);
+  }
+
   /// Pads with zero bits to the next byte boundary.
   void zeroPadToByte() {
     if (_cacheBits > 0) writeBits(0, 8 - _cacheBits);

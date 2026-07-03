@@ -7,6 +7,7 @@ import '../util/math_helper.dart';
 import 'context_tree.dart';
 import 'entropy_writer.dart';
 import 'headers.dart';
+import 'vardct/vardct_l0_encoder.dart';
 import 'wp_predictor.dart';
 
 /// Pure-Dart JPEG XL encoder (lossless modular).
@@ -114,6 +115,24 @@ final class JxlEncoder {
     }
     return _encodeModular(setup, planes);
   }
+
+  /// Lossily (VarDCT) encodes an interleaved 8-bit RGB image (L0/L1 of
+  /// doc/lossy_encoder_plan.md: 8x8-DCT-only, real HF coefficient context
+  /// model, multi-group; still filters-off and single-LfGroup). [width]
+  /// and [height] must be multiples of 8 and at most 2048. [distance] is a
+  /// cjxl-like quality knob (larger = smaller/lower quality); pass [config]
+  /// instead for direct control over the quantizer knobs.
+  static Uint8List encodeLossy(
+    Uint8List rgbPixels, {
+    required int width,
+    required int height,
+    double distance = 1.0,
+    VardctL0Config? config,
+  }) =>
+      encodeLossyVardctL0(rgbPixels,
+          width: width,
+          height: height,
+          config: config ?? VardctL0Config.fromDistance(distance));
 }
 
 const _config = HybridIntegerConfig(4, 1, 0);

@@ -9,6 +9,7 @@ import '../io/bit_reader.dart';
 import '../util/image_buffer.dart';
 import '../util/math_helper.dart';
 import 'dct.dart';
+import 'hf_block_context.dart';
 
 const _coeffFreqCtx = <int>[
   // Index 0 is unused.
@@ -104,10 +105,10 @@ final class HfCoefficients {
           throw const JxlInvalidBitstreamException(
               'transform block extends past its group');
         }
-        final predicted =
-            _getPredictedNonZeroes(nonZeroes, c, sGroupY, sGroupX);
-        final blockCtx = _getBlockContext(c, tt.orderID, hfMult, lfIndex);
-        final nonZeroCtx = offset + _getNonZeroContext(predicted, blockCtx);
+        final predicted = getPredictedNonZeroes(nonZeroes, c, sGroupY, sGroupX);
+        final blockCtx = getBlockContext(hfctx, c, tt.orderID, hfMult, lfIndex);
+        final nonZeroCtx =
+            offset + getNonZeroContext(hfctx, predicted, blockCtx);
         var nonZero = stream.readSymbol(reader, nonZeroCtx);
         if (nonZero > tt.pixelHeight * tt.pixelWidth - numBlocks) {
           throw const JxlInvalidBitstreamException(
@@ -135,7 +136,7 @@ final class HfCoefficients {
               ? (nonZero > orderSize ~/ 16 ? 0 : 1)
               : (prevCoeff != 0 ? 1 : 0);
           final ctx = histCtx +
-              _getCoefficientContext(k + numBlocks, nonZero, numBlocks, prev);
+              getCoefficientContext(k + numBlocks, nonZero, numBlocks, prev);
           final u = stream.readSymbol(reader, ctx);
           prevCoeff = u;
           final order = orderList[k + numBlocks];
@@ -199,8 +200,10 @@ final class HfCoefficients {
     _finalizeLLF();
   }
 
-  int _getBlockContext(int c, int orderID, int hfMult, int lfIndex) {
-    final hfctx = frame.lfGlobal.hfBlockCtx!;
+  /// Public so the lossy encoder can compute the exact same block-context
+  /// cluster id the decoder does, without hand-duplicating the formula.
+  static int getBlockContext(
+      HfBlockContext hfctx, int c, int orderID, int hfMult, int lfIndex) {
     var idx = (c < 2 ? 1 - c : c) * 13 + orderID;
     idx *= hfctx.qfThresholds.length + 1;
     for (final t in hfctx.qfThresholds) {
@@ -210,21 +213,27 @@ final class HfCoefficients {
     return hfctx.clusterMap[idx + lfIndex];
   }
 
-  int _getNonZeroContext(int predicted, int ctx) {
-    final hfctx = frame.lfGlobal.hfBlockCtx!;
+  /// Public so the lossy encoder can compute the exact same non-zero-count
+  /// context id the decoder does.
+  static int getNonZeroContext(HfBlockContext hfctx, int predicted, int ctx) {
     if (predicted > 64) predicted = 64;
     if (predicted < 8) return ctx + hfctx.numClusters * predicted;
     return ctx + hfctx.numClusters * (4 + predicted ~/ 2);
   }
 
-  static int _getCoefficientContext(
+  /// Public so the lossy encoder can compute the exact same per-position
+  /// coefficient context id the decoder does (mirrors `_coeffNumNonzeroCtx`
+  /// / `_coeffFreqCtx` exactly, without hand-duplicating those tables).
+  static int getCoefficientContext(
       int k, int nonZeroes, int numBlocks, int prev) {
     nonZeroes = (nonZeroes + numBlocks - 1) ~/ numBlocks;
     k ~/= numBlocks;
     return (_coeffNumNonzeroCtx[nonZeroes] + _coeffFreqCtx[k]) * 2 + prev;
   }
 
-  static int _getPredictedNonZeroes(Int32List nonZeroes, int c, int y, int x) {
+  /// Public so the lossy encoder can maintain the exact same
+  /// predicted-non-zero-count grid the decoder does.
+  static int getPredictedNonZeroes(Int32List nonZeroes, int c, int y, int x) {
     final base = c * 1024;
     if (x == 0 && y == 0) return 32;
     if (x == 0) return nonZeroes[base + (y - 1) * 32];

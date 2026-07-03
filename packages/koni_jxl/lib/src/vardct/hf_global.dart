@@ -282,7 +282,10 @@ double _interpolate(double scaledPos, List<double> bands) {
   return a * math.pow(b / a, fracIndex);
 }
 
-List<Float32List> _getDCTQuantWeights(
+/// Computes the raw (pre-inversion) DCT quantization weight matrix for one
+/// channel. Public so the lossy encoder can mirror it exactly when choosing
+/// quantization steps (the decoder inverts this matrix per weight).
+List<Float32List> getDCTQuantWeights(
     int height, int width, List<double> params) {
   final bands = List<double>.filled(params.length, 0);
   bands[0] = params[0];
@@ -439,8 +442,8 @@ final class HfGlobal {
 
   List<Float32List> _getAFVTransformWeights(int index, int c) {
     final p = params[index];
-    final weights4x8 = _getDCTQuantWeights(4, 8, p.dctParam![c]);
-    final weights4x4 = _getDCTQuantWeights(4, 4, p.params4x4![c]);
+    final weights4x8 = getDCTQuantWeights(4, 8, p.dctParam![c]);
+    final weights4x4 = getDCTQuantWeights(4, 4, p.params4x4![c]);
     const low = 0.8517778890324296;
     const high = 12.97166202570235;
     final bands = List<double>.filled(4, 0);
@@ -485,11 +488,11 @@ final class HfGlobal {
     for (var c = 0; c < 3; c++) {
       switch (p.mode) {
         case TransformMode.dct:
-          weights[index][c] = _getDCTQuantWeights(
+          weights[index][c] = getDCTQuantWeights(
               tt.matrixHeight, tt.matrixWidth, p.dctParam![c]);
         case TransformMode.dct4:
           final target = floatMatrix(8, 8);
-          final w = _getDCTQuantWeights(4, 4, p.dctParam![c]);
+          final w = getDCTQuantWeights(4, 4, p.dctParam![c]);
           for (var y = 0; y < 8; y++) {
             for (var x = 0; x < 8; x++) {
               target[y][x] = w[y ~/ 2][x ~/ 2];
@@ -530,7 +533,7 @@ final class HfGlobal {
           weights[index][c] = w;
         case TransformMode.dct4x8:
           final target = floatMatrix(8, 8);
-          final w = _getDCTQuantWeights(4, 8, p.dctParam![c]);
+          final w = getDCTQuantWeights(4, 8, p.dctParam![c]);
           for (var y = 0; y < 8; y++) {
             for (var x = 0; x < 8; x++) {
               target[y][x] = w[y ~/ 2][x];

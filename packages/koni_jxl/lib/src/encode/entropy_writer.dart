@@ -667,8 +667,42 @@ final class EntropyCodes {
     nested.finalize(w);
   }
 
+  /// Writes a general cluster map: `clusterMap[i]` is the output cluster
+  /// for input context id `i` (need not be identity, and need not use
+  /// every input id — unreachable ids can map anywhere). Mirrors the
+  /// decoder's `EntropyStream.readClusterMap`'s two encodings: the
+  /// fixed-width "simple" form when `numClusters <= 8`, otherwise a nested
+  /// entropy stream over the per-entry cluster ids (which Huffman-codes
+  /// away the cost of ids that repeat a lot, e.g. every unreachable
+  /// context id sharing one arbitrary fallback cluster).
+  static void _writeGeneralClusterMap(
+      BitWriter w, List<int> clusterMap, int numClusters) {
+    if (clusterMap.length <= 1) return;
+    final nbits = ceilLog1p(numClusters - 1);
+    if (nbits <= 3) {
+      w.writeBool(true); // simple
+      w.writeBits(nbits, 2);
+      for (final c in clusterMap) {
+        w.writeBits(c, nbits);
+      }
+      return;
+    }
+    w.writeBool(false); // complex
+    w.writeBool(false); // use_mtf = false
+    final nested = EntropyWriter(1);
+    for (final c in clusterMap) {
+      nested.write(0, c);
+    }
+    nested.finalize(w);
+  }
+
   /// Writes the distribution header (mirror of `EntropyStream.read`).
-  void writeHeader(BitWriter w) {
+  ///
+  /// [clusterMap], when given, writes a general (possibly non-identity)
+  /// cluster map via [_writeGeneralClusterMap] instead of the default
+  /// identity map; `clusterMap[i]` must be a valid cluster index for every
+  /// input context id `i` this stream's decoder-side domain size expects.
+  void writeHeader(BitWriter w, {List<int>? clusterMap}) {
     w.writeBool(usesLz77);
     if (usesLz77) {
       w.writeU32(lz77MinSymbol, 224, 0, 512, 0, 4096, 0, 8, 15);
@@ -685,7 +719,11 @@ final class EntropyCodes {
       }
     }
     final clusters = _numClusters;
-    _writeClusterMap(w, clusters);
+    if (clusterMap != null) {
+      _writeGeneralClusterMap(w, clusterMap, clusters);
+    } else {
+      _writeClusterMap(w, clusters);
+    }
     w.writeBool(true); // use_prefix_code
     for (var c = 0; c < clusters; c++) {
       w.writeBits(config.splitExponent, ceilLog1p(15));

@@ -36,9 +36,13 @@ void _writeSizeValue(BitWriter w, int value, bool div8) {
   }
 }
 
-/// Writes the 0xFF0A signature, SizeHeader and ImageMetadata for a
-/// non-XYB (lossless modular) image, byte-aligned at return.
-void writeImageHeader(BitWriter w, JxlEncodeSetup s) {
+/// Writes the 0xFF0A signature, SizeHeader and ImageMetadata, byte-aligned
+/// at return. [xybEncoded] selects VarDCT-lossy (XYB) vs lossless-modular
+/// (direct-sample) pixel encoding; every other field is identical either
+/// way since `default_matrix = true` skips the OpsinInverseMatrix payload
+/// regardless.
+void writeImageHeader(BitWriter w, JxlEncodeSetup s,
+    {bool xybEncoded = false}) {
   w.writeBits(0xFF, 8);
   w.writeBits(0x0A, 8);
   // SizeHeader.
@@ -74,7 +78,7 @@ void writeImageHeader(BitWriter w, JxlEncodeSetup s) {
       w.writeBool(false); // alpha_associated
     }
   }
-  w.writeBool(false); // xyb_encoded
+  w.writeBool(xybEncoded);
   // ColorEncoding.
   if (s.grayscale) {
     w.writeBool(false); // all_default

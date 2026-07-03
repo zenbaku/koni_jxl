@@ -25,20 +25,54 @@ from the lossless work. What the encoder adds is the *analysis* side —
 choosing quantization, block sizes, and CfL — which is where perceptual
 quality lives.
 
-- 🔲 **L0 — minimal valid stream.** RGB→XYB forward (inverse of
-  `opsin_inverse`), forward 8×8 DCT everywhere (no block-size selection),
-  uniform quantization from a single distance parameter, no CfL, Gaborish
-  and EPF disabled, default coefficient order, entropy-coded with the
-  existing ANS/prefix encoder. Goal: a file djxl decodes at all, with a
-  measured round-trip RMSE. Quality will be poor; correctness is the bar.
-- 🔲 **L1 — rate control + coefficient model.** Map `distance` to quant
-  the way libjxl does; get the DC image, LF/HF split, and the HF
-  coefficient context model (non-zero counts, LF context, block context)
-  exactly right so sizes are competitive at a given quality.
-- 🔲 **L2 — perceptual quantization.** Adaptive quant field (per-block
-  multipliers from a masking/heuristic model) and chroma-from-luma
-  (per-block X-from-Y and B-from-Y that minimize residual). This is the
-  jump from "works" to "looks good at a given bitrate."
+- ✅ **L0 — minimal valid stream.** `JxlEncoder.encodeLossy` (single-group,
+  ≤256×256, width/height multiples of 8): RGB→XYB forward (exact inverse of
+  `OpsinInverseMatrix.invertXyb`), forward 8×8 DCT via the existing
+  `forwardDCT2D`, uniform quantization mirroring the decoder's DC
+  (`scaledDequant`) and AC (`scaleFactor` × default DCT8x8 quant weights)
+  formulas, chroma-from-luma pre-subtraction for B, filters off, natural
+  coefficient order, HF coefficients entropy-coded with a single collapsed
+  prefix-code cluster (correct but not yet using the real 495-context
+  model). Gated against djxl end-to-end on the first real attempt; see
+  `packages/koni_jxl/test/encode/vardct_l0_test.dart` and
+  `packages/koni_jxl/test/encode/vardct_forward_test.dart`. Quality is
+  intentionally crude (~28% of raw at defaults) — L1 is where it improves.
+- ✅ **L1 — rate control + coefficient model.** `distance:` parameter on
+  `JxlEncoder.encodeLossy` (encoder policy, not a decoder-mirrored
+  formula — see `VardctL0Config.fromDistance`'s doc comment for its
+  known floor around distance ~0.5-0.8, a consequence of `quant_all_default
+  = true` capping how fine `globalScale` can go; genuine near-lossless
+  needs custom per-frequency quant weights, deferred to L2). The real HF
+  coefficient context model is now implemented (non-zero-count prediction,
+  block context, per-position coefficient context — mirrors
+  `hf_coefficients.dart` exactly), clustered into up to 256 histograms
+  (a hard, empirically-discovered bitstream limit — see doc/spec_notes.md)
+  with the smallest-actual-bytes choice made per image rather than a fixed
+  budget. Multi-group support removed the 256x256 ceiling — up to
+  2048x2048 (single LF group; true multi-LfGroup is still open, tracked
+  below).
+- ✅ **L2 — perceptual quantization.** Adaptive per-block quant multiplier
+  from a Y AC-energy heuristic (smooth/low-energy blocks get boosted
+  precision to avoid banding — measured ~65-70% RMSE reduction on smooth
+  gradients; busy blocks stay at baseline, since masking hides
+  quantization noise there). Custom per-frequency quant weight tables
+  (`quant_all_default = false`, via a new `acScale` config knob) removed
+  L1's ~0.5-0.8 `distance` floor entirely — RMSE is now monotonic all the
+  way to `distance = 0.05` in testing. Chroma-from-luma is implemented as
+  a **global** (whole-image, least-squares-optimal X-on-Y and B-on-Y
+  slope) correlation rather than the spec's per-64x64-region granularity
+  — a deliberate scope cut (see doc/spec_notes.md); still a real,
+  measured win on non-gradient content. `BitWriter` gained `writeF16`
+  (mirror of `BitReader.readF16`) to support both of the above.
+- 🔲 **Per-region chroma-from-luma.** Upgrade L2's global CfL to the
+  spec's real per-64x64-region granularity (`xFromY`/`bFromY` in
+  HfMetadata, currently always 0) for a further, currently-unclaimed
+  quality win, especially on images with spatially-varying color content.
+- 🔲 **Multi-LfGroup support.** `encodeLossy` currently caps at 2048x2048
+  (single LF group); images larger than that need multiple LfGroup
+  sections (each up to 256x256 blocks), not just multiple 256x256 groups
+  within one. Lower priority than L2/L3 — manga pages are well under this
+  limit.
 - 🔲 **L3 — transform selection + filters.** Variable block sizes (choose
   among the 27 varblock transforms per region by a rate-distortion
   heuristic), and enable Gaborish/EPF with the encoder accounting for
@@ -52,6 +86,10 @@ lossy format, big but correct) vs a **lossy-modular** shortcut (quantize
 then encode with the existing modular encoder — far less work, worse
 quality, still "lossy"). Decided: **VarDCT** (a true codec). Detailed implementation plan in
 [doc/lossy_encoder_plan.md](doc/lossy_encoder_plan.md).
+
+L0 is done (see above); L1 (real distance→quant mapping, the actual HF
+context model instead of one collapsed cluster, multi-group support) is
+next.
 
 ---
 

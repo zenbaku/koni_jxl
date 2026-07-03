@@ -113,6 +113,186 @@ candidates, which is what makes WP win on color/tonal content (one piece
 color page -4%, B/W page flips to WP).
 All output is bit-exact through this decoder and djxl.
 
+### Lossy (VarDCT) encoder — L0
+
+`JxlEncoder.encodeLossy` (`lib/src/encode/vardct/`) implements the L0
+milestone from `doc/lossy_encoder_plan.md`: single-group (width/height
+multiples of 8, up to 256x256), 8x8-DCT-only, uniform quantization,
+filters off. Gated against djxl end-to-end
+(`test/encode/vardct_l0_test.dart`, `test/encode/vardct_forward_test.dart`).
+
+Two channel-ordering conventions coexist in the VarDCT decoder and both
+matter for a bit-exact writer:
+
+- **Semantic/scalar order is X, Y, B** (index 0/1/2) — used by
+  `jpegUpsamplingY/X`, `xqmScale`/`bqmScale` (→ `scaleFactor[0]`/`[2]`),
+  `lfDequant`/`scaledDequant`, `quantBias`, and
+  `defaultDctParams[0].dctParam` row order.
+- **Bitstream/processing order is Y, X, B** — the `LfCoefficients` and
+  `HfCoefficients` per-block channel loops, and the `lfQuant`/`info`
+  channel-array order, all iterate in this order. `frame/frame.dart`'s
+  `cMap = [1, 0, 2]` converts between the two (it's a self-inverse
+  permutation, i.e. `cMap[cMap[i]] == i`, which makes both directions look
+  identical in the source — worth tracing through concrete values rather
+  than assuming a direction).
+
+Chroma-from-luma is **not optional** at the defaults: `baseCorrelationB`
+defaults to `1.0` (not `0.0`), so the decoder always adds the full
+dequantized Y coefficient into B, at both DC and AC. The encoder must
+pre-subtract Y from B (before quantizing) at every coefficient position,
+not just DC.
+
+The HF coefficient context model (`vardct/hf_coefficients.dart`,
+`hf_block_context.dart`) has 495 contexts per (HF preset, block-context
+cluster) — non-zero-count prediction from neighbor blocks, a per-position
+frequency/nonzero-count table, and a `prev`-nonzero bit. L0 does not
+implement per-context histograms: it writes a single `EntropyStream`
+distribution but with a **collapsed cluster map** sized for the real
+`495 * numHfPresets * numClusters` context domain (`simple` clustering,
+`nbits = 0`, so every context decodes as cluster 0) — this is legal per
+the bitstream format and correct regardless of which context a symbol
+"should" have used, since cluster assignment only affects compression
+ratio, not which values are decodable. `EntropyCodes.writeHeader` gained a
+`clusterMapDomainSize` parameter for this. L1 is where the real context
+model (and therefore competitive compression) lands.
+
+Natural (unpermuted) coefficient order is read via the decoder's own
+`getNaturalOrder` (made public, not reimplemented) so the scan is
+bit-identical by construction; the same goes for the DCT8x8 quantization
+weight table (`getDCTQuantWeights`, also made public).
+
+### Lossy (VarDCT) encoder — L1: real HF context model
+
+L1 replaced L0's single-collapsed-cluster HF entropy coding with the
+decoder's real context model (`HfCoefficients.getBlockContext` /
+`getNonZeroContext` / `getCoefficientContext` / `getPredictedNonZeroes`,
+all made public — same "reuse, don't reimplement" rule as `getNaturalOrder`
+above). This surfaced an **undocumented bitstream limit found only by
+testing against djxl**: an entropy code may have **at most 256 histograms
+(clusters)**. This decoder's own `EntropyStream.readClusterMap` never
+enforces it — a hand-written encoder producing 257+ clusters (easy once
+per-context histograms are real: a busy 24x32 synthetic image reaches
+~300 distinct contexts) parses and decodes cleanly through *this*
+decoder, but djxl rejects the file outright with no diagnostic detail
+(`Failed to decode image`). Root-caused by a differential trace: an
+isolated round-trip of the exact bits this encoder wrote, decoded via
+this project's own `EntropyStream`, matched perfectly (proving the
+Huffman/cluster-map *mechanics* were correct) — the count of distinct
+histograms was the only remaining variable, and bisecting it against djxl
+confirmed 256 passes / 257 fails exactly. `vardct_l0_encoder.dart` now
+caps at `_maxHfClusters = 256`, routing the least-frequent contexts
+(by usage count) into one shared overflow cluster beyond that budget.
+
+Splitting into more clusters is not free — each pays a fixed header cost
+(config + alphabet size + a prefix code table) independent of its sample
+count, so for small images more clusters can make the file *larger* than
+one shared histogram. Rather than guess a cluster-count budget, the
+encoder tries several (1, 16, 64, 256, and the actual distinct-context
+count) and assembles real bytes for each, keeping the smallest — the same
+"estimates can't resolve near-ties, verify by real assembly" rule the
+lossless encoder already follows.
+
+### Lossy (VarDCT) encoder — L1: multi-group and distance
+
+Multi-group support (images up to 2048x2048, still a single LF group)
+mirrors the format's own split: `numGroups == 1` forces exactly one TOC
+entry (LfGlobal/LfGroup/HfGlobal+HfPass/PassGroup bit-concatenated with no
+byte alignment, per the L0 note above); `numGroups > 1` is NOT optional at
+that point — the decoder computes `tocEntryCount` purely from image
+dimensions, so the encoder has no choice but to switch to one
+independently byte-aligned section per (LfGlobal, the single LfGroup,
+HfGlobal+HfPass, and each group's own PassGroup). The HF coefficient
+context model's cluster map and histograms are still built once from
+every group's tokens combined (mirroring `EntropyStream.clone` sharing
+one `HfPass.contextStream` across groups); only the per-symbol payload
+bits are per-group. Each group gets its own non-zero-prediction grid reset
+(mirrors a fresh `HfCoefficients` per (pass, group)).
+
+`JxlEncoder.encodeLossy`'s `distance:` parameter has no decoder-side
+formula to mirror (libjxl's distance-to-quantizer mapping lives entirely
+in the encoder) so `VardctL0Config.fromDistance` is a hand-picked,
+monotonic mapping, calibrated empirically rather than derived from spec.
+Both `globalScale` and `quantLF` are dequantization *divisors*
+(`dequant = stored / (something * globalScale-or-quantLF)`), so smaller
+distance (finer/higher quality) needs LARGER values of both — an inverted
+sign here (shipped briefly during development for `quantLF`) silently
+makes "higher quality" requests coarser instead, without any error or
+gate failure, since both directions produce a valid, djxl-decodable
+bitstream. Caught by checking the RMSE trend empirically, not by a type
+or bounds error. `globalScale`'s bitstream field caps `globalScaleF`
+(`65536 / globalScale`) at a minimum of ~0.889 (`65536/73728`), so
+requesting distances below ~0.5-0.8 stops improving quality — the AC
+quantizer literally cannot represent a finer step via this field alone.
+Reaching further requires custom per-frequency quant weight tables
+(`quant_all_default = false`), deferred to L2.
+
+### Lossy (VarDCT) encoder — L2: perceptual quantization
+
+**Adaptive per-block quantization.** `hfMultiplier` (`HfMetadata`'s
+per-block field, `hf_coefficients.dart`'s `sfc = scaleFactor[c] /
+hfMultiplier`) is a *divisor* on the dequantized value, so it can only
+make a block **finer** than the frame's baseline (`hfMultiplier >= 1`
+always — `1 + storedValue`, `storedValue` a non-negative modular int).
+There is no way to make a specific block *coarser* through this field.
+The encoder therefore boosts precision selectively (Y AC energy relative
+to a `distance`-scaled reference step decides low/medium/baseline
+buckets: `4`/`2`/`1`) rather than trying to trade quality between blocks
+— smooth/low-energy blocks (where rounding AC to zero causes visible
+banding) get boosted; busy blocks stay at the baseline multiplier, since
+masking hides quantization noise there and they already spend plenty of
+bits regardless. Measured effect: ~65-70% RMSE reduction on a smooth
+gradient test image at default distance, at an 18-26% file size cost.
+Since `hfMult` doesn't change which context cluster a coefficient uses
+(the default `HfBlockContext`'s `qfThresholds` are empty, so
+`getBlockContext`'s threshold loop is a no-op regardless of `hfMult`'s
+value), this composes with L1's context model without any interaction to
+account for.
+
+**Custom per-frequency quant weight tables.** `getDCTQuantWeights`'s
+output scales *uniformly* with the first element of its `params` array
+(`bands[0]`): every other band is a running product
+`bands[i] = bands[i-1] * quantMult(params[i])`, and `_interpolate`'s
+`a * (b/a)^frac` is scale-invariant in `frac`, so multiplying `params[0]`
+by a constant `K` multiplies the entire interpolated weight table output
+by `K`. This gives a quantization fineness knob (`VardctL0Config.acScale`)
+with no format-imposed ceiling, unlike `globalScale`. The bitstream cost
+is `quant_all_default = false` plus one `TransformMode.dct`-encoded
+custom table for parameter slot 0 (the only slot this encoder's transform
+type, DCT8x8, ever uses) and `TransformMode.library` (0 further bits
+each) for the other 16 slots — `TransformType.validateIndex` only
+enforces index restrictions for modes other than `library`/`dct`/`raw`,
+so slot 0 with `TransformMode.dct` needs no special-casing.
+`_readDCTParams` multiplies the first read F16 value by 64 on decode, so
+the encoder must write `params[0] / 64.0`, not `params[0]`, in that slot.
+This needed `BitWriter.writeF16` (new — a mirror of `BitReader.readF16`;
+IEEE-754-like half precision, round-toward-zero on the mantissa, no
+subnormal support since this encoder's parameter values never need it).
+Removing `globalScale`'s ceiling this way took RMSE from a hard plateau
+around distance 0.5-0.8 to fully monotonic down to distance 0.05 in
+testing (RMSE 1.9 at that point, vs. the ~15.5 plateau L1 had).
+
+**Chroma-from-luma.** Implemented as a single **global** (whole-image)
+linear fit rather than the spec's per-64x64-region granularity
+(`xFromY`/`bFromY` in `HfMetadata` still write 0 everywhere — a
+deliberate scope cut). `_globalChromaFromLuma` computes the
+least-squares-optimal slopes (`kX = sum(Y*X)/sum(Y*Y)`, `kB =
+sum(Y*B)/sum(Y*Y)`) over every block's **AC-only** DCT coefficients
+(excluding DC) across the whole image, then writes them as a custom
+(non-default) `LfChannelCorrelation` (`baseCorrelationX`/
+`baseCorrelationB`, with `colorFactor`/`xFactorLF`/`bFactorLF` left at
+their neutral defaults so the per-region offset terms are exactly zero
+and the global slopes apply everywhere, both DC and HF). Including DC in
+the least-squares fit was tried first and made a smooth-gradient test
+case measurably *worse* (RMSE 1.06 vs. 0.62 without adaptive
+quantization's help) — DC's much larger magnitude dominates the sum and
+pulls the fitted slope away from what's optimal for the AC coefficients
+that determine banding, so DC is excluded from the fit even though the
+resulting global `kX`/`kB` still gets applied to DC too (there's only one
+frame-wide correlation value available without per-region granularity).
+This is a real, measured net win on non-gradient content (e.g. one mixed
+synthetic test case dropped from RMSE 16.4 to 15.5 and shrank ~6% at the
+same distance) even without per-region adaptivity.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

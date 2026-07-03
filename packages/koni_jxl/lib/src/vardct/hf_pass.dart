@@ -11,7 +11,9 @@ import 'transform_type.dart';
 /// Natural coefficient orders per orderID, as packed (y << 16 | x) values.
 final List<Int32List?> _naturalOrderCache = List.filled(13, null);
 
-Int32List _getNaturalOrder(int i) {
+/// Public so the lossy encoder can scan coefficients in the exact same
+/// (cached) order the decoder reads them in.
+Int32List getNaturalOrder(int i) {
   final cached = _naturalOrderCache[i];
   if (cached != null) return cached;
   final tt = TransformType.byOrderID(i);
@@ -62,7 +64,7 @@ final class HfPass {
     // are expensive and most images touch only a few transform types).
     for (var b = 0; b < 13; b++) {
       if (usedOrders & (1 << b) == 0) continue;
-      final naturalOrder = _getNaturalOrder(b);
+      final naturalOrder = getNaturalOrder(b);
       final len = naturalOrder.length;
       _order[b] = List.generate(3, (c) {
         final perm = readPermutation(reader, stream!, len, len ~/ 64);
@@ -93,7 +95,7 @@ final class HfPass {
   List<Int32List> orderFor(int orderID) {
     final cached = _order[orderID];
     if (cached != null) return cached;
-    final naturalOrder = _getNaturalOrder(orderID);
+    final naturalOrder = getNaturalOrder(orderID);
     return _order[orderID] = List.filled(3, naturalOrder, growable: false);
   }
 }

@@ -8,9 +8,11 @@ import '../util/math_helper.dart';
 /// The HF block context model: cluster map over (channel, orderID,
 /// qf-threshold bucket, lf-threshold bucket).
 final class HfBlockContext {
-  factory HfBlockContext.read(BitReader reader) {
-    if (reader.readBool()) {
-      return HfBlockContext._(
+  /// The built-in default (a single `true` bit on the wire): a 39-entry
+  /// cluster map, 15 clusters, no LF/QF thresholds. Public so the lossy
+  /// encoder can compute context ids against the same default object the
+  /// decoder uses without re-parsing a bitstream.
+  factory HfBlockContext.defaults() => HfBlockContext._(
         Int32List.fromList(const [
           0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, //
           7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14, //
@@ -21,6 +23,10 @@ final class HfBlockContext {
         Int32List(0),
         1,
       );
+
+  factory HfBlockContext.read(BitReader reader) {
+    if (reader.readBool()) {
+      return HfBlockContext.defaults();
     }
     final nbLFThresh = List<int>.filled(3, 0);
     final lfThresholds = <Int32List>[];

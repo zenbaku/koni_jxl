@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Encoding
+
+- **Lossy (VarDCT) — L0 milestone.** `JxlEncoder.encodeLossy` produces a
+  real VarDCT stream: 8x8-DCT-only, uniform quantization mirroring the
+  decoder's own dequantization formulas, chroma-from-luma pre-subtraction,
+  filters off, single group (width/height multiples of 8, up to 256x256).
+  This is a correctness-first milestone (see ROADMAP.md) — quality and
+  compactness come with later phases.
+- **Lossy (VarDCT) — L1 milestone.** `encodeLossy` gained a `distance:`
+  parameter, the real HF coefficient context model (in place of L0's
+  single shared histogram — meaningfully smaller files on busier images),
+  and multi-group support (up to 2048x2048, still a single LF group; see
+  ROADMAP.md for the multi-LfGroup gap).
+- **Lossy (VarDCT) — L2 milestone.** Adaptive per-block quantization
+  (~65-70% RMSE reduction on smooth/gradient content, where fixed
+  quantization causes visible banding), a custom per-frequency quant
+  weight table that removes `distance`'s previous quality floor (now
+  monotonic down to `distance = 0.05` in testing, vs. plateauing around
+  0.5-0.8 before), and a global (whole-image) chroma-from-luma fit. See
+  ROADMAP.md for the remaining per-region CfL upgrade.
+- **ANS (rANS)** is now a per-image lossless entropy candidate alongside
+  prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
+  `prefix`/`ANS`, smallest actual output wins).
+- **Learned per-image context tree** replaces the fixed 7-context MA tree:
+  a greedy entropy-minimizing split search over decoder properties, up to
+  64 contexts.
+- **Weighted predictor** is now a second per-image predictor candidate
+  (alongside clamped gradient), with its own property set including the
+  WP max-error signal.
+
 ## 0.1.0
 
 First release. A pure-Dart JPEG XL codec with zero native dependencies,
