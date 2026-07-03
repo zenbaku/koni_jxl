@@ -905,6 +905,176 @@ time specifically (per CLAUDE.md's performance-rules doc, the tracked
 reference numbers are for the decode path and the lossless encoder, not
 yet this newer lossy-encoder work).
 
+### Lossy (VarDCT) encoder — AC-side RDOQ (coefficient dropping), and why it's off despite real wins
+
+Follow-up to round 3's block-level `hfMult` RD search and round 4's DC
+context tree — the AC-side rate-distortion search both those sections'
+"next" notes pointed at. Implements genuine per-AC-coefficient
+rate-distortion-optimized quantization ("RDOQ"): for each block-channel's
+already-quantized coefficients, walk backward from the true last-nonzero
+scan position toward position 0, proposing to zero any coefficient whose
+removal reduces `distortion + lambda * rate`, then only committing the
+proposal if a real re-encode confirms it actually shrinks that
+block-channel. Implemented in `_chooseAcRdoq`/`_rdoqBlockChannel`/
+`_PlacedBlock.applyRdoqDrops` (`vardct_l0_encoder.dart`), behind
+`VardctL0Config.enableRdoq` — **off by default**, same outcome as round
+3, but for a different and more surprising reason: correctness is fully
+verified and there's a genuine, measured win in the specific case
+calibration checked — the constant that produces it is simply unsafe
+outside that case, discovered only by testing a wider distance range
+than the calibration tool covered.
+
+**Algorithm shape, decided before any code was written.** A full
+per-block trellis/DP (state = position × remaining-count × prev-flag)
+was evaluated and rejected on a back-of-envelope perf estimate: ~60-500x
+more coefficient-decision ops than a greedy single-pass alternative for a
+2048x2048 image, realistically 0.7-19s of pure DP-transition compute
+against a whole-image budget on the order of ~0.4-0.8s. Chose instead a
+**greedy, single reverse-scan-order pass** ("coefficient dropping"),
+costing about the same order of magnitude as the already-shipped
+`_chooseHfMultRd`. Sound for the same reason `_chooseHfMultRd` already
+established (re-verified fresh, not assumed): coefficient values, like
+`hfMult`, never change which entropy cluster a token routes to in this
+encoder's configuration (`HfBlockContext.defaults()` leaves
+`qfThresholds` empty), so a bootstrap-then-freeze clustering/code-length
+table is sound for scoring candidates.
+
+**Two real bugs found and fixed during design review, before any code
+was written** (via two research passes + two design/adversarial-review
+passes, mirroring round 3's process): the format mechanic is that a
+block-channel's coefficient stream stops the instant `countNonZero`
+nonzero values have been emitted (everything after the true last-nonzero
+is implicit, free) — dropping the current end-of-block (EOB) coefficient
+retreats that boundary, removing every position in the swept gap from
+the stream at once. (1) An early draft priced a *second* EOB retreat in
+the same walk using a table frozen from the *original* (pre-drop) scan —
+provably wrong, since the swept gap's true `remaining` context is always
+1 by that point (proven by induction on a `keptCountSoFar == 0`
+invariant), not whatever the original scan had there. Fixed by pricing
+each retreat's swept gap live instead of from a stale table. (2) Position
+0's "prev" bit is a block-global threshold (`remaining >
+orderSize/16`), not a sequential dependency on position -1 — freezing it
+like every other position's `prev` was needlessly wrong, since position 0
+is always the *last* position decided (nothing causally blocks computing
+it live). Both fixes shipped in the same commit as the initial
+implementation, not as follow-ups.
+
+**A third, larger gap found only empirically, after both bugs above were
+already fixed** — this is the most important methodological finding of
+this section. A debug-only differential test (comparing the walk's
+claimed per-decision rate delta against a real re-scan of the actual
+entropy coder, isolating one decision at a time) kept failing by small
+but real amounts (1-2 bits) even after both proven-correct fixes above.
+Root cause, confirmed by direct trace: dropping **any** coefficient — not
+just an EOB retreat — shifts the `remaining` bucket
+(`_coeffNumNonzeroCtx`'s coarse thresholds), hence the real bit cost, of
+**every surviving lower position**, including ones whose own value never
+changes. This walk's formulas only ever price the position(s) directly
+flipped by each decision; they never retroactively re-price
+already-encoded lower positions each time an earlier drop shifts their
+bucket. Exactly accounting for that ripple would mean repricing up to
+O(ucoeffLen) positions per drop — reintroducing the O(ucoeffLen²) cost
+the whole DP-vs-greedy tradeoff was chosen to avoid. Worse, this isn't
+just a diagnostic nitpick: a real test case showed the ripple can flip an
+individually-"beneficial-looking" drop into a **net loss** for that
+block-channel (one isolated drop, claimed savings +8 bits, real
+measured effect −2 bits — i.e. the block-channel's total bits *grew*).
+An estimation gap that can reverse sign on a single decision is not
+safely ignorable.
+
+**The fix: turn the diagnostic into a real, always-on safety net**,
+rather than trying to model the ripple. `_rdoqBlockChannel` now ends by
+real-re-encoding the proposed block-channel both before and after
+applying its proposed drops (one extra pair of real `_blockChannelTokens`
+calls, O(ucoeffLen) total, not per-decision) and only calls
+`applyRdoqDrops` if the real total bits actually decreased — the same
+"estimates can't resolve near-ties, verify by real assembly, keep the
+better one" pattern `_chooseAcClustering` and the lossless encoder's
+predictor choice already use elsewhere in this codebase. This makes
+RDOQ provably never-worse-than-off **for total bits**, per block-channel,
+regardless of any remaining rate-estimation inaccuracy.
+
+**Structural mitigation carried over from round 3's finding**: blocks
+with `hfMult == 4` (the L2 heuristic's own strongest banding-protection
+signal) are skipped by RDOQ entirely, since RDOQ shares the same
+weighted-squared-error distortion metric that already, in round 3's
+calibration, proved unable to represent banding perceptual cost. Unlike
+`_chooseHfMultRd` (which *was* the protection decision, with no
+structural escape hatch), RDOQ is additive and can cheaply defer to the
+heuristic's own choice for these blocks.
+
+**Calibration at `distance = 1.0`** (`tool/calibrate_rdoq_lambda.dart`,
+mirrors `tool/calibrate_rd_lambda.dart`'s structure): found a genuinely
+good constant, `_kRdoqLambda = 5000.0`. On `color_cover` (real photo),
+monotonic size wins from -0.5% (`kLambda=500`) to -8.7% (`kLambda=
+50000`) with RMSE essentially flat (1.804-1.808) through `kLambda=8000`.
+The gradient-banding regression test stayed **safely under its RMSE gate
+through `kLambda=20000`** (0.930 baseline — RDOQ has *zero* effect below
+`kLambda≈2000` thanks to the `hfMult==4` exclusion — rising only to
+0.946 at 20000, only failing at 50000). On real corpus screentone content
+(`gray_screentone`, manga-typical), a tiny but real win at negligible
+RMSE cost (1159900→1159742 bytes at `kLambda=8000`, RMSE unchanged to 4
+decimal places). Two small synthetic patterns (`screentone_256`, and the
+tool's own synthetic screentone/line-art sanity checks) saw **zero
+effect at every lambda tested** — RDOQ found nothing worth dropping
+there, a safe (if unhelpful) outcome for the project's dominant content
+type. `palette16` (low-color synthetic) saw a real trade, not a free
+win: -1.7% size at `kLambda=5000` for +1.2% RMSE (3.44→3.48) — consistent
+with round 4's DC-context-tree finding that this same synthetic image is
+the one recurring case where small header/estimation overheads don't pay
+for themselves cleanly.
+
+**Why it's still off: the calibrated constant is unsafe outside
+`distance = 1.0`, found only by testing a wider range than the
+calibration tool covered.** `lambda = kLambda * refStep^2` (the same
+scaling convention `_kRdLambda` already uses, chosen because standard
+scalar-quantizer RD theory says the rate/distortion trade-off's slope
+near a given step size scales with `step^2`) means `lambda` grows
+*quadratically* with `refStep`, which itself grows with `distance`
+(coarser quantization → larger dequant step). Re-running the standard
+benchmark (`tool/bench_lossy_vs_cjxl.dart`) across its full distance
+sweep (0.5-8.0), not just the single `distance=1.0` point the
+calibration tool checked, surfaced a severe regression at high distance:
+on `palette16` at `distance=8.0`, the *identical* `kLambda=5000` that was
+safe and beneficial at `distance=1.0` cut size 42% (20135→11670 bytes)
+at the cost of **RMSE nearly doubling** (9.00→17.52). A follow-up sweep
+at `distance=8.0` showed this isn't a cliff at the calibrated value —
+even `kLambda=100` (50x smaller than the calibrated constant) already
+measurably degrades quality there (9.00→9.18), climbing steeply from
+there (`kLambda=300`: 9.80, `1000`: 11.49, `3000`: 15.23). The real-bits
+safety net does not catch this class of regression — it only verifies
+rate decreased, not that the resulting distortion stayed acceptable, and
+at a large enough `lambda` the walk's own decisions happily trade
+significant distortion for a small rate saving, exactly as the
+`distortion + lambda*rate` formula says to. This is a real, structural
+gap in the `refStep^2`-based scaling for RDOQ specifically (plausibly
+because RDOQ's cumulative, many-coefficients-per-block-channel effect
+compounds in a way a single per-block `hfMult` choice's bounded 3-way
+decision doesn't) — not a constant to keep re-sweeping, and not
+something a same-session fix was responsibly rushable given the
+stakes of a default-on encoder behavior change.
+
+**What's shipped despite the negative result**: the full RDOQ machinery
+(`_scanChannelValues`/`_tokenRate` extracted as reusable helpers,
+`_rdoqBlockChannel`'s walk, `_chooseAcRdoq`'s bootstrap, the real-bits
+safety net), `VardctL0Config.enableRdoq`/`rdoqLambdaOverride` (default
+`false`/`null`), and `tool/calibrate_rdoq_lambda.dart` — all
+correctness-verified (djxl round-trips clean across single-group,
+multi-group, multi-LF-group, 16x16-mixed, and combined-with-
+`enableRdHfMult` configurations; see `vardct_l0_test.dart`'s "RDOQ
+coefficient dropping (opt-in) decodes correctly" and "RDOQ can drop
+every AC coefficient in a channel"). A future attempt should start from
+this section's two concrete findings rather than re-deriving them: (1)
+the real-bits-only safety net needs a distortion-aware companion (e.g.
+bound the aggregate RMSE contribution, not just verify bytes shrank) or
+`_kRdoqLambda` needs a genuinely distance-aware formula (not just
+`refStep^2`) before this can default on; (2) calibrate and gate-test
+across the *whole* distance range a user-facing default must support,
+not a single representative point — this section's `distance=1.0`-only
+calibration is exactly the kind of narrow-window validation that let a
+severe regression through undetected until a broader benchmark run
+caught it by chance.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

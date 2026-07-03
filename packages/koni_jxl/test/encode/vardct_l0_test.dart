@@ -356,6 +356,87 @@ void main() {
     }
   });
 
+  test('RDOQ coefficient dropping (opt-in) decodes correctly', () {
+    if (!_haveDjxl) return;
+    // Phase 1 gate (doc/spec_notes.md): correctness only, not yet a
+    // quality/size claim (kRdoqLambda is uncalibrated — see
+    // tool/calibrate_rdoq_lambda.dart). Same matrix as the RD-hfMult
+    // test, plus one case combining both optional passes to confirm they
+    // compose without corrupting each other's state. Every block-channel
+    // RDOQ actually drops a coefficient in also exercises the encoder's
+    // internal debug-only differential rate-accounting self-check
+    // (`_rdoqBlockChannel`'s `assert` block) — `dart test` runs with
+    // assertions enabled, so this is the real correctness gate for the
+    // live/frozen remaining/prev accounting, not just a round-trip check
+    // (a round-trip decode alone can't distinguish an internally
+    // consistent RD estimate from a buggy one, since the real bitstream
+    // is always rebuilt fresh from whatever final coefficients result).
+    for (final (w, h, variableTransforms, alsoRdHfMult) in [
+      (256, 256, false, false),
+      (264, 104, false, false), // multi-group
+      (2056, 8, false, false), // multi-LF-group
+      (264, 264, true, false), // + 16x16 blocks
+      (256, 256, false, true), // + RD hfMult search combined
+    ]) {
+      final pixels = _synthetic(w, h, 11);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: w,
+          height: h,
+          config: VardctL0Config(
+              enableRdoq: true,
+              enableRdHfMult: alsoRdHfMult,
+              enableVariableTransforms: variableTransforms));
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, w);
+      expect(image.height, h);
+      final dir = Directory.systemTemp.createTempSync('koni_rdoq');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed for ${w}x$h: ${r.stderr}');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('RDOQ can drop every AC coefficient in a channel', () {
+    if (!_haveDjxl) return;
+    // Edge case: a flat (constant-color) image has zero true AC energy in
+    // every block, so RDOQ should be able (in principle) to zero whatever
+    // the quantizer produced without hitting an unhandled countNonZero==0
+    // state either inside the walk or downstream in token emission.
+    const w = 64, h = 64;
+    final pixels = Uint8List(w * h * 3);
+    for (var i = 0; i < pixels.length; i += 3) {
+      pixels[i] = 128;
+      pixels[i + 1] = 128;
+      pixels[i + 2] = 128;
+    }
+    final encoded = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config:
+            const VardctL0Config(enableRdoq: true, rdoqLambdaOverride: 1e7));
+    final image = JxlDecoder.decode(encoded);
+    expect(image.width, w);
+    expect(image.height, h);
+    final dir = Directory.systemTemp.createTempSync('koni_rdoq_flat');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(encoded);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
   test('variable transforms default off: regresses manga-like content', () {
     if (!_haveDjxl) return;
     // Regression guard for the enableVariableTransforms default. The

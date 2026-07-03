@@ -42,6 +42,8 @@ class VardctL0Config {
     this.enableVariableTransforms = false,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
+    this.enableRdoq = false,
+    this.rdoqLambdaOverride,
   });
 
   /// Derives quantization knobs from a cjxl-like `distance` (butteraugli
@@ -117,6 +119,40 @@ class VardctL0Config {
   /// so `tool/calibrate_rd_lambda.dart` can sweep it in one process).
   /// Null (the default) uses the shipped, calibrated constant.
   final double? rdHfMultLambdaOverride;
+
+  /// Whether to run a rate-distortion coefficient-dropping pass ("RDOQ")
+  /// over each block's already-committed AC coefficients (from the L2
+  /// heuristic and, if [enableRdHfMult] is also on, its RD hfMult
+  /// choice): walks each block-channel's scan-order coefficients
+  /// backward from the true last-nonzero position, proposing to zero any
+  /// coefficient whose removal reduces `distortion + lambda * rate`, then
+  /// only committing the proposal if a real re-encode confirms it
+  /// actually shrinks that block-channel (see `_chooseAcRdoq`'s and
+  /// `_rdoqBlockChannel`'s doc comments for why the real-assembly check
+  /// is load-bearing, not just a sanity check). Independent of
+  /// [enableRdHfMult] — meaningful (and runs) whichever hfMult source is
+  /// active; when both are enabled, RDOQ always runs after hfMult is
+  /// finalized. Defaults to **off**: calibration at `distance = 1.0`
+  /// found a `_kRdoqLambda` that genuinely wins on real photo/screentone
+  /// content at negligible RMSE cost and keeps the smooth-gradient
+  /// banding-protection test safely under its gate — but the same
+  /// constant is **not safe at other distances**: `lambda = kLambda *
+  /// refStep^2` grows quadratically with `distance` (coarser
+  /// quantization → larger `refStep`), and measured at `distance = 8.0`
+  /// the identical constant that was safe at `distance = 1.0` roughly
+  /// *doubled* RMSE on real corpus content — a real, measured regression
+  /// the rate-only real-assembly safety net does not catch (it only
+  /// verifies bits decreased, not that quality stayed acceptable). See
+  /// doc/spec_notes.md before enabling this outside a narrow, explicitly
+  /// tested distance range, or before attempting to fix the underlying
+  /// scaling gap.
+  final bool enableRdoq;
+
+  /// Overrides the RDOQ rate/distortion trade-off constant `_kRdoqLambda`
+  /// (mirrors [rdHfMultLambdaOverride] — a runtime knob for
+  /// `tool/calibrate_rdoq_lambda.dart`, not a recompile). Null uses the
+  /// shipped constant.
+  final double? rdoqLambdaOverride;
 }
 
 int _packSigned(int v) => v >= 0 ? v << 1 : (-v << 1) - 1;
@@ -352,6 +388,31 @@ Uint8List encodeLossyVardctL0(
         groupsY,
         blocksByGroup,
         config.rdHfMultLambdaOverride);
+  }
+
+  // 5.8. Optional: a rate-distortion coefficient-dropping pass ("RDOQ")
+  // over whatever hfMult/AC state is already committed (the L2 heuristic,
+  // optionally refined by step 5.5) — see _chooseAcRdoq's doc comment.
+  // Off by default pending calibration (doc/spec_notes.md).
+  if (config.enableRdoq) {
+    _chooseAcRdoq(
+        placedBlocks,
+        planes,
+        cfl,
+        refStep,
+        scaleFactor,
+        rawWeight8,
+        rawWeight16,
+        scratch8a,
+        scratch8b,
+        scratch16a,
+        scratch16b,
+        hfctx,
+        ctxByType,
+        groupsX,
+        groupsY,
+        blocksByGroup,
+        config.rdoqLambdaOverride);
   }
 
   // 6. AC coefficient tokens, one group at a time (each group is its own
@@ -601,6 +662,11 @@ class _PlacedBlock {
   /// [commit] (never re-set directly), so a block can be re-quantized
   /// with several candidate multipliers (see `_chooseHfMultRd`) before
   /// committing to one without violating single-assignment expectations.
+  /// One narrow, documented exception: [applyRdoqDrops] (the RDOQ
+  /// coefficient-dropping pass, `_rdoqBlockChannel`) zeroes individual
+  /// already-committed entries in place — it only ever narrows what
+  /// [commit] established (nonzero -> zero, never the reverse), so it
+  /// doesn't disturb `commit`'s other invariants (hfMult, DC values).
   List<Int32List> acInt = const [];
 
   /// Forward DCT + chroma-from-luma pre-subtraction for this block: the
@@ -734,6 +800,17 @@ class _PlacedBlock {
         dcInt[c][(by + 1) * bw + bx] = candidate.dc[c * 4 + 2].round();
         dcInt[c][(by + 1) * bw + bx + 1] = candidate.dc[c * 4 + 3].round();
       }
+    }
+  }
+
+  /// Zeros out already-committed AC coefficients at the given flat
+  /// (row-major, `y * tt.pixelWidth + x`) indices for channel [c] — the
+  /// sole mutation the RDOQ coefficient-dropping pass (`_rdoqBlockChannel`)
+  /// performs on an already-[commit]-ted block. See [acInt]'s doc comment.
+  void applyRdoqDrops(int c, List<int> flatIndices) {
+    final data = acInt[c];
+    for (final i in flatIndices) {
+      data[i] = 0;
     }
   }
 
@@ -1283,17 +1360,15 @@ class _GroupTokens {
 /// against a *frozen* snapshot of that grid (see `_chooseHfMultRd`'s doc
 /// comment for why). Returns this channel's real non-zero count, which
 /// the caller needs to update its own prediction grid/bookkeeping.
-int _blockChannelTokens(
-    _TransformCtx ctx,
-    HfBlockContext hfctx,
-    int c,
-    Int32List acData,
-    int predicted,
-    List<int> contextsOut,
-    List<int> valuesOut) {
+/// Reads a block-channel's already-quantized AC coefficients into scan
+/// order, applying the same transposed index (`acData[ox * n + oy]`) the
+/// decoder's `flip` convention requires for every square DCT this encoder
+/// emits. Shared by [_blockChannelTokens] (token emission) and the RDOQ
+/// coefficient-dropping pass (`_rdoqBlockChannel`, scoring only) — pure
+/// extraction, no behavior change.
+(List<int>, int, int) _scanChannelValues(_TransformCtx ctx, Int32List acData) {
   final numBlocks = ctx.numBlocks;
-  final orderSize = ctx.orderSize;
-  final ucoeffLen = orderSize - numBlocks;
+  final ucoeffLen = ctx.orderSize - numBlocks;
   final n = ctx.tt.pixelWidth;
   var countNonZero = 0;
   var lastNonZeroK = -1;
@@ -1310,6 +1385,20 @@ int _blockChannelTokens(
       lastNonZeroK = k;
     }
   }
+  return (vals, countNonZero, lastNonZeroK);
+}
+
+int _blockChannelTokens(
+    _TransformCtx ctx,
+    HfBlockContext hfctx,
+    int c,
+    Int32List acData,
+    int predicted,
+    List<int> contextsOut,
+    List<int> valuesOut) {
+  final numBlocks = ctx.numBlocks;
+  final orderSize = ctx.orderSize;
+  final (vals, countNonZero, lastNonZeroK) = _scanChannelValues(ctx, acData);
 
   final nonZeroCtx =
       HfCoefficients.getNonZeroContext(hfctx, predicted, ctx.blockCtx[c]);
@@ -1505,14 +1594,26 @@ double _blockRate(
     _blockChannelTokens(ctx, hfctx, c, acIntCandidate[c],
         predictedPerChannel[c], contexts, values);
     for (var j = 0; j < contexts.length; j++) {
-      final cluster = clusterMap[contexts[j]];
-      final (token, extraBits, _) = tokenizeHybrid(_hfConfig, values[j]);
-      final lens = lengths[cluster];
-      final codeLen = token < lens.length ? lens[token] : 15;
-      rate += codeLen + extraBits;
+      rate += _tokenRate(clusterMap, lengths, contexts[j], values[j]);
     }
   }
   return rate;
+}
+
+/// Bit cost of one (context, value) token against a frozen bootstrap
+/// code-length table — the single-token core of [_blockRate], extracted
+/// so the RDOQ coefficient-dropping pass (`_rdoqBlockChannel`) can price
+/// individual coefficients the same way without re-deriving a whole
+/// block's token sequence per candidate. See [_blockRate]'s doc comment
+/// for why a frozen table (not a live rebuild) is correct here, and why
+/// an unseen-token fallback of 15 bits is a real bound, not arbitrary.
+double _tokenRate(
+    List<int> clusterMap, List<List<int>> lengths, int contextId, int value) {
+  final cluster = clusterMap[contextId];
+  final (token, extraBits, _) = tokenizeHybrid(_hfConfig, value);
+  final lens = lengths[cluster];
+  final codeLen = token < lens.length ? lens[token] : 15;
+  return (codeLen + extraBits).toDouble();
 }
 
 /// Candidate multipliers tried by the RD search — the same set the
@@ -1658,6 +1759,329 @@ void _chooseHfMultRd(
   if (chosenHistogram != null) {
     // ignore: avoid_print
     print('vardct RD hfMult: lambda=$lambda chosen=$chosenHistogram');
+  }
+}
+
+/// Rate/distortion trade-off constant for RDOQ (`_chooseAcRdoq`/
+/// `_rdoqBlockChannel`) — same `lambda = kLambda * refStep^2` scaling as
+/// `_kRdLambda` (see its doc comment), but **not the same value**: RDOQ's
+/// decision granularity (per-coefficient, binary keep/drop) differs
+/// enough from hfMult's (per-block, 3-way discrete) that the two have no
+/// reason to share a constant. Calibrated via `tool/calibrate_rdoq_lambda.
+/// dart`, but **only at `distance = 1.0`** — this value is a genuine win
+/// there (real photo content smaller at negligible RMSE cost, gradient
+/// banding safely under its gate) but was found, after the fact, to be
+/// unsafe at other distances (see [VardctL0Config.enableRdoq]'s doc
+/// comment and doc/spec_notes.md): the same constant roughly doubled
+/// RMSE on real content at `distance = 8.0`, since `lambda`'s quadratic
+/// growth with `refStep` outpaces what stays safe as quantization
+/// coarsens. Kept as a documented, not-fully-satisfactory placeholder for
+/// `enableRdoq` (default off) and for anyone experimenting within a
+/// narrow, explicitly tested distance range — not a shipped-safe default.
+const _kRdoqLambda = 5000.0;
+
+/// Blocks the L2 heuristic already flagged with its strongest banding
+/// protection (`hfMult == 4`) are skipped by RDOQ entirely — see
+/// `_chooseAcRdoq`'s doc comment for why.
+const _rdoqExemptHfMult = 4;
+
+/// Greedy, single reverse-scan-order ("coefficient dropping") RDOQ pass
+/// for one block-channel's already-quantized AC coefficients
+/// (`block.acInt[c]`): walks from the true last-nonzero scan position
+/// backward toward position 0, zeroing any coefficient whose removal
+/// reduces `distortion + lambda * rate`, against the frozen bootstrap
+/// clustering/code-length table ([clusterMap]/[lengths]) and cross-block
+/// [predicted] value — same bootstrap-then-freeze soundness argument
+/// `_chooseHfMultRd` already establishes (coefficient values never change
+/// which cluster a token routes to in this encoder's configuration).
+///
+/// **Live vs. frozen, and why** (verified by hand-trace and formal
+/// induction before implementation — see doc/spec_notes.md for the full
+/// derivation): within one block-channel's own scan, `remaining` (count
+/// of not-yet-emitted nonzeros) is tracked *live* as the walk proceeds —
+/// a drop at position k' only ever shifts `remaining`-context for
+/// positions with LOWER index (not yet visited by this backward walk),
+/// so it can be updated exactly. `prev` (whether the immediately
+/// preceding position was nonzero) is the opposite: a drop at k' only
+/// ever shifts `prev`-context at position k'+1 (HIGHER index, already
+/// decided earlier in the walk) — causally unavailable to revise in a
+/// single pass, so `prev` is frozen at its original, pre-RDOQ value
+/// ([basePrev]) for every position except position 0, whose "prev" is
+/// actually the block-global `remaining > orderSize/16` threshold, not a
+/// sequential dependency — and being the LAST position visited (nothing
+/// left below it), it's computed live too, from whatever `remaining`
+/// each of position 0's own two hypotheses (kept/dropped) implies.
+///
+/// An end-of-block (EOB) retreat (dropping the *current* true
+/// last-nonzero coefficient) doesn't just zero one token: every position
+/// between the next surviving nonzero and the old EOB is removed from
+/// the stream entirely (implicit, free zero — see the early-stop decode
+/// loop in `hf_coefficients.dart`). That savings is priced *live*,
+/// position by position over just the swept gap — never a table frozen
+/// from the original (pre-RDOQ) scan, which would price a second-or-later
+/// retreat in the same walk using stale `remaining` values (an earlier
+/// design draft's bug, caught by proof before implementation). Since
+/// each position is swept at most once across the whole walk, this stays
+/// O(ucoeffLen) total per block-channel, not O(ucoeffLen) per retreat.
+///
+/// **Known estimation gap, and why the walk's proposed drops are only
+/// ever committed after a real-assembly check** (found empirically
+/// during implementation, documented in doc/spec_notes.md — a genuine
+/// finding, not a hypothetical): dropping any coefficient — not just an
+/// EOB retreat — shifts the `remaining` bucket (`_coeffNumNonzeroCtx`'s
+/// coarse thresholds), hence the real bit cost, of *every surviving
+/// lower position*, including ones whose own value never changes. This
+/// walk only prices the position(s) directly flipped by each decision
+/// (the swept gap for an EOB retreat, or the one token for an interior
+/// drop) — it does not retroactively re-price already-encoded lower
+/// positions each time an earlier (higher-k) drop shifts their bucket.
+/// Exactly accounting for that ripple would mean repricing up to
+/// O(ucoeffLen) positions per drop, reintroducing the O(ucoeffLen^2) cost
+/// this greedy design was chosen over a full DP specifically to avoid
+/// (see doc/spec_notes.md's cost comparison). This makes the per-decision
+/// rate estimate an approximation that can go either way — measured
+/// directly (not just theorized): a real test case had the walk propose
+/// a single, individually-"beneficial-looking" drop that, once actually
+/// re-encoded, made that block-channel's total bits *increase*. Given
+/// that, the walk's proposed [toZero] set is never trusted blindly: the
+/// function ends with one real-assembly comparison (before/after real
+/// bit counts via the same [_blockChannelTokens] path the real bitstream
+/// uses) and only commits via [_PlacedBlock.applyRdoqDrops] if the real
+/// total actually decreased — the same "estimates can't resolve
+/// near-ties, verify by real assembly, keep the better one" pattern
+/// `_chooseAcClustering` and the lossless encoder's predictor choice
+/// already use elsewhere in this codebase. This makes RDOQ provably
+/// never-worse than not running it (per block-channel), at the cost of
+/// occasionally discarding a drop set that was mostly, but not entirely,
+/// beneficial, rather than trying to model the ripple.
+void _rdoqBlockChannel(
+    _TransformCtx ctx,
+    HfBlockContext hfctx,
+    int c,
+    List<Float32List> coeffBufC,
+    List<Float32List> rawWeightC,
+    double sfc,
+    int predicted,
+    List<int> clusterMap,
+    List<List<int>> lengths,
+    double lambda,
+    _PlacedBlock block) {
+  final numBlocks = ctx.numBlocks;
+  final orderSize = ctx.orderSize;
+  final n = ctx.tt.pixelWidth;
+  final acData = block.acInt[c];
+  final (vals, countNonZero, lastNonZeroK) = _scanChannelValues(ctx, acData);
+  if (countNonZero == 0) return;
+
+  // Frozen prev for every position (position 0's frozen entry is never
+  // read -- it's recomputed live in rateAt -- computing it here anyway
+  // keeps this one forward pass uniform with _blockChannelTokens's).
+  final basePrev = List<int>.filled(lastNonZeroK + 1, 0);
+  {
+    var remaining = countNonZero;
+    var prevNonzero = false;
+    for (var k = 0; k <= lastNonZeroK; k++) {
+      basePrev[k] = k == 0
+          ? (remaining > orderSize ~/ 16 ? 0 : 1)
+          : (prevNonzero ? 1 : 0);
+      prevNonzero = vals[k] != 0;
+      if (prevNonzero) remaining--;
+    }
+  }
+
+  final nonZeroCtxId =
+      HfCoefficients.getNonZeroContext(hfctx, predicted, ctx.blockCtx[c]);
+  final histCtx = ctx.histCtx[c];
+
+  // Live cost of encoding position k under a specific (remaining, value)
+  // hypothesis -- exactly what the decoder would charge, using frozen
+  // basePrev except at k == 0 (see doc comment above).
+  double rateAt(int k, int remainingForCtx, int packedValue) {
+    final prev =
+        k == 0 ? (remainingForCtx > orderSize ~/ 16 ? 0 : 1) : basePrev[k];
+    final coefCtx = histCtx +
+        HfCoefficients.getCoefficientContext(
+            k + numBlocks, remainingForCtx, numBlocks, prev);
+    return _tokenRate(clusterMap, lengths, coefCtx, packedValue);
+  }
+
+  final nonZeroPositions = <int>[
+    for (var k = 0; k <= lastNonZeroK; k++)
+      if (vals[k] != 0) k,
+  ];
+
+  var curLastK = lastNonZeroK;
+  var curCountNonZero = countNonZero;
+  var keptCountSoFar = 0; // count of higher-k positions visited and kept
+  final toZero = <int>[];
+
+  for (var idx = nonZeroPositions.length - 1; idx >= 0; idx--) {
+    final k = nonZeroPositions[idx];
+    final qval = vals[k];
+    final o = ctx.order[k + numBlocks];
+    final oy = o >> 16, ox = o & 0xFFFF;
+    final trueVal = coeffBufC[ox][oy];
+    final w = rawWeightC[ox][oy];
+    final step = sfc / w;
+    final oldErr = trueVal - qval * step;
+    final distortionDelta =
+        (w * trueVal) * (w * trueVal) - (w * oldErr) * (w * oldErr);
+
+    double rateDelta;
+    if (k == curLastK) {
+      final newCurLastK = idx > 0 ? nonZeroPositions[idx - 1] : -1;
+      // Every position in (newCurLastK, curLastK] is currently paid for;
+      // dropping curLastK removes all of them from the stream at once.
+      // `remaining` is exactly keptCountSoFar+1 (==1, by construction:
+      // nothing has been kept since the last retreat) throughout this
+      // gap, since curLastK is its only nonzero.
+      var savings = 0.0;
+      var remaining = keptCountSoFar + 1;
+      for (var p = newCurLastK + 1; p <= curLastK; p++) {
+        final v = vals[p];
+        savings += rateAt(p, remaining, v == 0 ? 0 : _packSigned(v));
+        if (v != 0) remaining--;
+      }
+      rateDelta = -savings;
+    } else {
+      final ctxKept = rateAt(k, keptCountSoFar + 1, _packSigned(qval));
+      final ctxDropped = rateAt(k, keptCountSoFar, 0);
+      rateDelta = ctxDropped - ctxKept;
+    }
+
+    final nonZeroDelta =
+        _tokenRate(clusterMap, lengths, nonZeroCtxId, curCountNonZero - 1) -
+            _tokenRate(clusterMap, lengths, nonZeroCtxId, curCountNonZero);
+
+    final totalCost = distortionDelta + lambda * (rateDelta + nonZeroDelta);
+    if (totalCost < 0) {
+      toZero.add(ox * n + oy);
+      curCountNonZero--;
+      if (k == curLastK) {
+        curLastK = idx > 0 ? nonZeroPositions[idx - 1] : -1;
+      }
+    } else {
+      keptCountSoFar++;
+    }
+  }
+  if (toZero.isEmpty) return;
+
+  // Real-assembly safety net (always on, not debug-only — this is a
+  // functional guarantee, not a diagnostic): the walk's per-decision
+  // rate estimate cannot be exact, because dropping any coefficient
+  // shifts the `remaining` bucket (`_coeffNumNonzeroCtx`'s coarse
+  // thresholds), hence the real bit cost, of every SURVIVING lower
+  // position too — including positions whose own value never changes.
+  // Pricing that ripple exactly would mean repricing up to O(ucoeffLen)
+  // positions per drop, reintroducing the O(ucoeffLen^2) cost the
+  // DP-vs-greedy tradeoff was chosen to avoid (see doc/spec_notes.md).
+  // Discovered empirically during implementation: the ripple isn't
+  // always negligible — a single isolated drop was measured to make one
+  // real test block-channel's total bits *increase*, not decrease,
+  // despite every individual decision looking beneficial under the
+  // (ripple-blind) per-decision estimate. Rather than try to model the
+  // ripple, this reuses the codebase's own established fallback pattern
+  // (`_chooseAcClustering`, the lossless encoder's predictor choice,
+  // etc.: "estimates can't resolve near-ties, verify by real assembly,
+  // keep the smaller/better") — one extra pair of real re-scans per
+  // block-channel with any proposed drops (still O(ucoeffLen) total, not
+  // O(ucoeffLen) per decision), and only commits if the real total bits
+  // actually decreased. This makes RDOQ provably never-worse than not
+  // running it, at the cost of occasionally discarding a drop set that
+  // was mostly, but not entirely, beneficial.
+  double realBits(Int32List data) {
+    final contexts = <int>[];
+    final values = <int>[];
+    _blockChannelTokens(ctx, hfctx, c, data, predicted, contexts, values);
+    var bits = 0.0;
+    for (var j = 0; j < contexts.length; j++) {
+      bits += _tokenRate(clusterMap, lengths, contexts[j], values[j]);
+    }
+    return bits;
+  }
+
+  final before = realBits(acData);
+  final afterData = Int32List.fromList(acData);
+  for (final i in toZero) {
+    afterData[i] = 0;
+  }
+  if (realBits(afterData) < before) {
+    block.applyRdoqDrops(c, toZero);
+  }
+}
+
+/// Bootstrap-then-freeze driver for the RDOQ coefficient-dropping pass:
+/// builds a real `_AcClustering` from whatever hfMult/quantization state
+/// is already committed (the L2 heuristic, optionally refined by
+/// `_chooseHfMultRd` if `enableRdHfMult` is also on — RDOQ always runs
+/// strictly after hfMult is finalized, since its own dequant step size
+/// depends on it), freezes that clustering's code-length table and the
+/// group's non-zero-count prediction grid (same frozen-bootstrap pattern
+/// `_chooseHfMultRd` already uses, sound for the same reason — see its
+/// doc comment), then runs [_rdoqBlockChannel] over every block-channel.
+///
+/// Blocks with `hfMult == _rdoqExemptHfMult` are skipped entirely: that
+/// value is the L2 heuristic's own strongest banding-protection signal,
+/// and RDOQ shares the same weighted-squared-error distortion metric
+/// that, in `_chooseHfMultRd`'s own calibration, proved unable to
+/// represent banding perceptual cost — an RD search using it is
+/// structurally tempted to remove exactly that protection once its bit
+/// cost is priced (see doc/spec_notes.md). Deferring to the heuristic's
+/// own decision for these blocks is a mitigation only available *because*
+/// RDOQ is additive (unlike hfMult's own RD search, which *was* the
+/// protection decision and had no equivalent escape hatch).
+void _chooseAcRdoq(
+    List<_PlacedBlock> placedBlocks,
+    List<List<Float32List>> planes,
+    _ChromaFromLumaFit cfl,
+    double refStep,
+    List<double> scaleFactor,
+    List<List<Float32List>> rawWeight8,
+    List<List<Float32List>> rawWeight16,
+    List<Float32List> scratch8a,
+    List<Float32List> scratch8b,
+    List<Float32List> scratch16a,
+    List<Float32List> scratch16b,
+    HfBlockContext hfctx,
+    Map<int, _TransformCtx> ctxByType,
+    int groupsX,
+    int groupsY,
+    List<List<_PlacedBlock>> blocksByGroup,
+    double? lambdaOverride) {
+  final predictedOut = <_PlacedBlock, Int32List>{};
+  final bootstrapTokens = <_GroupTokens>[
+    for (var gy = 0; gy < groupsY; gy++)
+      for (var gx = 0; gx < groupsX; gx++)
+        _computeGroupTokens(gy * 32, gx * 32, blocksByGroup[gy * groupsX + gx],
+            hfctx, ctxByType,
+            predictedOut: predictedOut),
+  ];
+  final bootstrap = _chooseAcClustering(bootstrapTokens);
+  final lengths = bootstrap.codes.tokenBitLengths();
+  final clusterMap = bootstrap.clusterMap;
+  final lambda = (lambdaOverride ?? _kRdoqLambda) * refStep * refStep;
+
+  for (final block in placedBlocks) {
+    if (block.hfMult == _rdoqExemptHfMult) continue;
+    final coeffBuf = block.computeCoeffBuf(
+        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+    final rawWeight = block.tt == _tt16 ? rawWeight16 : rawWeight8;
+    final ctx = ctxByType[block.tt.type]!;
+    final predicted = predictedOut[block]!;
+    for (final c in _channelOrder) {
+      _rdoqBlockChannel(
+          ctx,
+          hfctx,
+          c,
+          coeffBuf[c],
+          rawWeight[c],
+          scaleFactor[c] / block.hfMult,
+          predicted[c],
+          clusterMap,
+          lengths,
+          lambda,
+          block);
+    }
   }
 }
 
