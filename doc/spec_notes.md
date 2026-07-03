@@ -1054,26 +1054,108 @@ decision doesn't) — not a constant to keep re-sweeping, and not
 something a same-session fix was responsibly rushable given the
 stakes of a default-on encoder behavior change.
 
-**What's shipped despite the negative result**: the full RDOQ machinery
+**What was shipped at the time**: the full RDOQ machinery
 (`_scanChannelValues`/`_tokenRate` extracted as reusable helpers,
 `_rdoqBlockChannel`'s walk, `_chooseAcRdoq`'s bootstrap, the real-bits
 safety net), `VardctL0Config.enableRdoq`/`rdoqLambdaOverride` (default
-`false`/`null`), and `tool/calibrate_rdoq_lambda.dart` — all
+`false`/`null` at the time), and `tool/calibrate_rdoq_lambda.dart` — all
 correctness-verified (djxl round-trips clean across single-group,
 multi-group, multi-LF-group, 16x16-mixed, and combined-with-
 `enableRdHfMult` configurations; see `vardct_l0_test.dart`'s "RDOQ
 coefficient dropping (opt-in) decodes correctly" and "RDOQ can drop
-every AC coefficient in a channel"). A future attempt should start from
-this section's two concrete findings rather than re-deriving them: (1)
-the real-bits-only safety net needs a distortion-aware companion (e.g.
-bound the aggregate RMSE contribution, not just verify bytes shrank) or
-`_kRdoqLambda` needs a genuinely distance-aware formula (not just
-`refStep^2`) before this can default on; (2) calibrate and gate-test
-across the *whole* distance range a user-facing default must support,
-not a single representative point — this section's `distance=1.0`-only
-calibration is exactly the kind of narrow-window validation that let a
-severe regression through undetected until a broader benchmark run
-caught it by chance.
+every AC coefficient in a channel"). This section left two concrete
+findings for a future attempt rather than a re-derivation: (1) the
+real-bits-only safety net needs a distortion-aware companion, or
+`_kRdoqLambda` needs a genuinely distance-aware formula; (2) calibrate
+and gate-test across the *whole* distance range a user-facing default
+must support, not a single representative point. The follow-up below
+picked up exactly there, in the very next session.
+
+### Lossy (VarDCT) encoder — AC-side RDOQ, the fix: `lambda ∝ acScale²`, not `refStep²`
+
+Follow-up session, picked up directly from this section's own two open
+findings above. Root cause, derived analytically then **verified
+empirically before trusting the derivation** (given the previous
+section's own lesson about not trusting a derivation alone):
+
+RDOQ's distortion term, `(w*trueVal)² - (w*oldErr)²` (`w` = the
+per-frequency `rawWeight`), is dominated for any non-marginal coefficient
+by `(w*trueVal)²` — a *removal* cost, not the rounding-noise term the
+`lambda ∝ step²` theorem assumes. `w` scales *proportionally* with
+`config.acScale` (exact, not approximate — L2's "scaling only the first
+band scales the whole interpolated table uniformly" finding, this
+session's spec_notes.md), so `distortionDelta ∝ acScale²`. But `refStep
+= scaleFactor[1] / rawWeight8[1][0][1] ∝ 1/acScale` (same `w`-dependence,
+inverted), so the old `lambda = kLambda * refStep² ∝ 1/acScale²` — the
+*opposite* direction from `distortionDelta`. Their ratio,
+`lambda/distortionDelta`, scaled as `acScale⁻⁴` — at `distance=8`
+(`acScale=0.125`), a **4096×** compounding mismatch relative to
+`distance=1`, which is exactly why the same constant that looked perfect
+at one point catastrophically over-dropped coefficients at another: with
+`lambda` relatively enormous compared to `distortionDelta`, the walk
+readily accepted large-distortion drops for trivial rate savings, exactly
+as `distortion + lambda*rate < 0` says to do when `lambda` dominates.
+
+**The fix**: `lambda = kLambda * acScale²` instead of `kLambda *
+refStep²` (`_chooseAcRdoq`'s `acScale` parameter replaces `refStep`;
+`_kRdoqLambda`'s doc comment has the full derivation). This cancels the
+dominant `acScale`-dependence in both terms, leaving the trade-off point
+governed mainly by coefficient content and rate — not by `distance`.
+
+**Verified, not just derived — and the first attempt at "verified" was
+itself wrong in an instructive way.** A probe with the *old* numeric
+constant (`kLambda=5000`) plugged into the *new* formula produced
+**catastrophic over-dropping at every distance, including `distance=1`**
+(RMSE 3.44→34.8, i.e. an order of magnitude worse) — not a regression in
+the fix's direction, but a units error: `acScale²=1.0` at `distance=1`
+is ~300,000× larger than `refStep²≈3.24e-6` was, so reusing the old
+numeric constant with the new formula produced an *enormous* effective
+lambda, not a comparable one. Recalibrating the constant's magnitude
+(not just its scaling direction) was still required — a small but real
+reminder that even a *correct* formula change needs a fresh sweep, not
+just a fresh sign.
+
+**Multi-distance calibration** (`tool/calibrate_rdoq_lambda.dart`,
+rewritten to sweep `distance ∈ {0.5, 1.0, 2.0, 4.0, 8.0}` — the direct
+fix for the previous section's single-point-calibration gap): found
+`_kRdoqLambda = 0.03` safe (no regression beyond a small, bounded RMSE
+cost) at **every** distance tested, with the benefit shape itself
+informative: real, meaningful wins at low-to-mid distance
+(`color_cover`: -8.8% at `distance=0.5`, -4.0% at `distance=1.0`,
+RMSE +3.3%/flat respectively), shrinking to a small-but-never-regressing
+effect at high distance (-0.1% to +0.0% by `distance=4-8`). This shape
+makes sense, not just looks safe: at coarse quantization, plain rounding
+already zeroes out most marginal AC content before RDOQ gets a chance to
+— there's genuinely less for it to do, not a sign the fix is
+under-powered. Real corpus screentone content (`gray_screentone`,
+manga-typical) saw tiny wins at essentially zero RMSE cost across the
+whole range (all five distances tested). `palette16` (the
+recurring-across-every-round low-color synthetic edge case) saw its
+largest RMSE cost at `distance=0.5` (+6.7%, for -3.5% size) but nothing
+worse — bounded, not catastrophic, and consistent with this same
+synthetic pattern's role in every prior round's write-up.
+
+**One incidental finding, out of scope for this fix**: the gradient
+banding-protection test's *own baseline* (RDOQ entirely off) already
+exceeds its RMSE<1.0 gate at `distance ≥ 4` (measured 1.043 at
+`distance=4`, 1.513 at `distance=8`) — a pre-existing property of the L2
+adaptive-quant heuristic, since the "adaptive quantization reduces
+banding" regression test in `vardct_l0_test.dart` has only ever run at
+the implicit default `distance=1.0`. RDOQ makes **no measurable
+difference** to this pattern at those distances (byte-identical output
+across every `kLambda` tested) — the finding is real and worth a note,
+but it isn't something this fix caused or could have caught differently;
+it's a gap in the *existing* heuristic's own validation coverage,
+left for a future session rather than folded into this one's scope.
+
+**Shipped**: `VardctL0Config.enableRdoq` defaults to **true**,
+`_kRdoqLambda = 0.03`. All correctness gates re-verified with the new
+default (294 tests green, including the multi-distance
+`encoder_lossy_corpus_test.dart` gates and the gradient-banding
+regression test at its existing `distance=1.0` scope). Encode-time cost:
+roughly 20-40% slower at the sizes benchmarked (e.g. `color_cover`
+`distance=1.0`: 811ms → 1115ms) — no regression test exists for this yet,
+same caveat as round 4's DC context tree.
 
 ## Robustness
 

@@ -42,7 +42,7 @@ class VardctL0Config {
     this.enableVariableTransforms = false,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
-    this.enableRdoq = false,
+    this.enableRdoq = true,
     this.rdoqLambdaOverride,
   });
 
@@ -132,20 +132,24 @@ class VardctL0Config {
   /// is load-bearing, not just a sanity check). Independent of
   /// [enableRdHfMult] — meaningful (and runs) whichever hfMult source is
   /// active; when both are enabled, RDOQ always runs after hfMult is
-  /// finalized. Defaults to **off**: calibration at `distance = 1.0`
-  /// found a `_kRdoqLambda` that genuinely wins on real photo/screentone
-  /// content at negligible RMSE cost and keeps the smooth-gradient
-  /// banding-protection test safely under its gate — but the same
-  /// constant is **not safe at other distances**: `lambda = kLambda *
-  /// refStep^2` grows quadratically with `distance` (coarser
-  /// quantization → larger `refStep`), and measured at `distance = 8.0`
-  /// the identical constant that was safe at `distance = 1.0` roughly
-  /// *doubled* RMSE on real corpus content — a real, measured regression
-  /// the rate-only real-assembly safety net does not catch (it only
-  /// verifies bits decreased, not that quality stayed acceptable). See
-  /// doc/spec_notes.md before enabling this outside a narrow, explicitly
-  /// tested distance range, or before attempting to fix the underlying
-  /// scaling gap.
+  /// finalized.
+  ///
+  /// Defaults to **on**, after a two-step calibration story worth
+  /// knowing before touching [rdoqLambdaOverride] (full detail in
+  /// doc/spec_notes.md): a first calibration at `distance = 1.0` only
+  /// found a constant that looked perfect there but roughly *doubled*
+  /// RMSE at `distance = 8.0` (`lambda`'s old `refStep^2` scaling grew in
+  /// the opposite direction from how RDOQ's own distortion metric scales
+  /// with the dequant weight table — see `_kRdoqLambda`'s doc comment for
+  /// the exact mechanism). Fixed by rederiving the scaling (`lambda ∝
+  /// acScale^2`, not `refStep^2`) and recalibrating `_kRdoqLambda` via a
+  /// **multi-distance** sweep (0.5-8.0). The shipped constant is
+  /// verified safe (no regression beyond a small, bounded RMSE cost) at
+  /// every distance tested — a real win on photo and real screentone
+  /// content concentrated at low-to-mid distance, shrinking to a
+  /// negligible-but-never-regressing effect at high distance, where
+  /// quantization alone already zeros out most marginal AC content
+  /// before RDOQ gets a chance to.
   final bool enableRdoq;
 
   /// Overrides the RDOQ rate/distortion trade-off constant `_kRdoqLambda`
@@ -399,7 +403,7 @@ Uint8List encodeLossyVardctL0(
         placedBlocks,
         planes,
         cfl,
-        refStep,
+        config.acScale,
         scaleFactor,
         rawWeight8,
         rawWeight16,
@@ -1763,22 +1767,39 @@ void _chooseHfMultRd(
 }
 
 /// Rate/distortion trade-off constant for RDOQ (`_chooseAcRdoq`/
-/// `_rdoqBlockChannel`) — same `lambda = kLambda * refStep^2` scaling as
-/// `_kRdLambda` (see its doc comment), but **not the same value**: RDOQ's
-/// decision granularity (per-coefficient, binary keep/drop) differs
-/// enough from hfMult's (per-block, 3-way discrete) that the two have no
-/// reason to share a constant. Calibrated via `tool/calibrate_rdoq_lambda.
-/// dart`, but **only at `distance = 1.0`** — this value is a genuine win
-/// there (real photo content smaller at negligible RMSE cost, gradient
-/// banding safely under its gate) but was found, after the fact, to be
-/// unsafe at other distances (see [VardctL0Config.enableRdoq]'s doc
-/// comment and doc/spec_notes.md): the same constant roughly doubled
-/// RMSE on real content at `distance = 8.0`, since `lambda`'s quadratic
-/// growth with `refStep` outpaces what stays safe as quantization
-/// coarsens. Kept as a documented, not-fully-satisfactory placeholder for
-/// `enableRdoq` (default off) and for anyone experimenting within a
-/// narrow, explicitly tested distance range — not a shipped-safe default.
-const _kRdoqLambda = 5000.0;
+/// `_rdoqBlockChannel`): `lambda = kLambda * acScale^2` — **not**
+/// `refStep^2` like `_kRdLambda` (see its doc comment for why that
+/// scaling is textbook-correct for a *rounding-error* distortion model).
+/// The first version of this constant used `refStep^2` too, copied from
+/// `_kRdLambda` without independently checking whether RDOQ's own
+/// distortion metric has the same scaling behavior — it doesn't (see
+/// below) — and shipped a severe, distance-dependent regression as a
+/// result (roughly doubled RMSE at `distance=8.0`) before a broader
+/// benchmark sweep caught it. Root cause: RDOQ's distortion, `(w*trueVal)
+/// ^2 - (w*oldErr)^2`, is dominated for any non-marginal coefficient by
+/// `(w*trueVal)^2` — a *removal* cost, not a rounding-noise term — and
+/// `w` (the per-frequency `rawWeight` table) scales *proportionally*
+/// with `acScale` (verified exactly, not approximately — see L2's
+/// "scaling only the first band" finding in doc/spec_notes.md), so
+/// `distortionDelta ∝ acScale^2`. `refStep ∝ 1/acScale`, so the old
+/// `lambda ∝ refStep^2 ∝ 1/acScale^2` scaled in the *opposite* direction
+/// from `distortionDelta` — their ratio grew as `acScale^-4`, a severe
+/// compounding mismatch at coarse quantization (small `acScale`).
+/// `lambda ∝ acScale^2` cancels the dominant `acScale`-dependence in
+/// both terms, keeping the trade-off point governed mainly by coefficient
+/// content and rate — not by `distance`. **Verified, not just derived**:
+/// this direction change alone (with the *old* numeric constant) already
+/// eliminated the catastrophic high-distance blowup in testing, though
+/// the old magnitude was wildly wrong given the ~10^8 unit change between
+/// `refStep^2` (~3e-6 at `distance=1`) and `acScale^2` (`=1` at
+/// `distance=1`) — this value is freshly recalibrated for the new
+/// formula via `tool/calibrate_rdoq_lambda.dart`'s **multi-distance**
+/// sweep (0.5-8.0, not the single point that let the first regression
+/// through undetected). See doc/spec_notes.md for the full sweep and
+/// measured numbers: a real win concentrated at low-to-mid distance
+/// (photo content notably smaller at bounded RMSE cost), shrinking to a
+/// negligible-but-never-regressing effect at high distance.
+const _kRdoqLambda = 0.03;
 
 /// Blocks the L2 heuristic already flagged with its strongest banding
 /// protection (`hfMult == 4`) are skipped by RDOQ entirely — see
@@ -2034,7 +2055,7 @@ void _chooseAcRdoq(
     List<_PlacedBlock> placedBlocks,
     List<List<Float32List>> planes,
     _ChromaFromLumaFit cfl,
-    double refStep,
+    double acScale,
     List<double> scaleFactor,
     List<List<Float32List>> rawWeight8,
     List<List<Float32List>> rawWeight16,
@@ -2059,7 +2080,7 @@ void _chooseAcRdoq(
   final bootstrap = _chooseAcClustering(bootstrapTokens);
   final lengths = bootstrap.codes.tokenBitLengths();
   final clusterMap = bootstrap.clusterMap;
-  final lambda = (lambdaOverride ?? _kRdoqLambda) * refStep * refStep;
+  final lambda = (lambdaOverride ?? _kRdoqLambda) * acScale * acScale;
 
   for (final block in placedBlocks) {
     if (block.hfMult == _rdoqExemptHfMult) continue;

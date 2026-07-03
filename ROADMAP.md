@@ -216,41 +216,41 @@ output for where the gap actually is.
   `toBytes()` for the winning candidate, which would have corrupted
   everything written after it in the same section once per-pixel
   contexts were involved).
-- 🔲 **Compression efficiency, round 5: AC-side RDOQ (implemented,
-  correctness-verified, off by default — a real win found, but only in
-  a distance range narrower than a shipped default needs to cover.)**
-  Genuine per-AC-coefficient rate-distortion-optimized quantization
-  ("RDOQ" — `_chooseAcRdoq`/`_rdoqBlockChannel`, behind
-  `VardctL0Config.enableRdoq`): a greedy, single reverse-scan-order
+- ✅ **Compression efficiency, round 5: AC-side RDOQ.** Genuine
+  per-AC-coefficient rate-distortion-optimized quantization ("RDOQ" —
+  `_chooseAcRdoq`/`_rdoqBlockChannel`, behind `VardctL0Config.enableRdoq`,
+  **on by default**): a greedy, single reverse-scan-order
   coefficient-dropping pass, chosen over a full per-block DP after a
   back-of-envelope perf estimate ruled the DP out (~60-500x more
   coefficient-decision ops for a 2048x2048 image). Two real bugs in the
   rate-accounting formulas were found and fixed via formal proof *before*
   any code was written (a frozen-table EOB-retreat pricing error; an
-  unnecessarily-frozen `prev` bit at position 0) — but a *third*, larger
-  gap was found only empirically, after both were fixed: dropping any
+  unnecessarily-frozen `prev` bit at position 0); a *third*, larger gap
+  was found only empirically, after both were fixed (dropping any
   coefficient shifts the real bit cost of every surviving lower position
-  in the same block-channel (not just the ones directly affected), an
-  effect too expensive to price exactly without reintroducing the DP's
-  rejected cost. Fixed not by modeling the ripple but by turning the
-  differential test into a real, always-on safety net — every proposed
-  drop set is re-encoded for real before/after and only committed if
-  bits genuinely decreased, making RDOQ providably never-worse-than-off
-  on total bits. Calibrated at `distance=1.0`: a real win on photo
-  content (up to -8.7% size at flat RMSE) and real screentone content, a
-  gradient-banding regression test that stayed safely under its gate,
-  and only a modest trade (not a free win) on one synthetic edge case —
-  by every measure at that one distance, this cleared the bar round 3's
-  hfMult search didn't. **Shipped off anyway**: re-running the standard
-  benchmark across its full distance sweep (not just the single point
-  calibration checked) found the calibrated constant roughly *doubles*
-  RMSE at `distance=8.0` on real content, because `lambda`'s quadratic
-  scaling with the dequant step outpaces what stays safe as quantization
-  coarsens — a distance-dependent failure mode invisible to a
-  single-distance calibration. See doc/spec_notes.md for the full
-  numbers and the two concrete next steps it leaves for a future
-  attempt (a distortion-aware safety net, and calibrating/testing across
-  the whole distance range a default must support, not one point).
+  in the same block-channel) — fixed not by modeling the ripple but by
+  turning the differential test into a real, always-on safety net: every
+  proposed drop set is re-encoded for real before/after and only
+  committed if bits genuinely decreased, making RDOQ provably
+  never-worse-than-off on total bits regardless of estimation error
+  elsewhere. First shipped off by default: a `distance=1.0`-only
+  calibration found a constant that looked perfect there but, caught by
+  re-running the standard benchmark across its *full* distance sweep,
+  roughly doubled RMSE at `distance=8.0` — `lambda`'s `refStep²` scaling
+  turned out to grow in the *opposite* direction from how RDOQ's own
+  distortion metric scales with the dequant weight table. Fixed the very
+  next session by rederiving the correct scaling (`lambda ∝ acScale²`,
+  not `refStep²`) and recalibrating via a genuinely multi-distance sweep
+  (0.5-8.0) — verified safe (no regression beyond a small, bounded RMSE
+  cost) at every distance tested, with a real win concentrated at
+  low-to-mid distance (`color_cover`: -8.8% at `distance=0.5`, -4.0% at
+  `distance=1.0`) shrinking to a negligible-but-never-regressing effect
+  at high distance, where plain rounding already zeros out most marginal
+  AC content before RDOQ gets a chance to. See doc/spec_notes.md for the
+  full derivation, the numbers, and an incidental unrelated finding
+  (the gradient banding-protection test's own RDOQ-off baseline already
+  exceeds its gate above `distance=4` — a pre-existing gap in that
+  heuristic's own validation coverage, left for a future session).
 
 ---
 

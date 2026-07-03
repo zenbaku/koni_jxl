@@ -7,23 +7,26 @@ import 'package:koni_jxl/src/encode/vardct/vardct_l0_encoder.dart';
 /// Calibrates `_kRdoqLambda` (the RDOQ coefficient-dropping pass's
 /// rate/distortion trade-off constant, `VardctL0Config.enableRdoq`) by
 /// sweeping it against real corpus content, manga-typical screentone
-/// content, and the encoder's own synthetic regression-test patterns
-/// (copied in, not imported from test code — see
-/// `test/encode/vardct_l0_test.dart` for the canonical versions). Mirrors
-/// `tool/calibrate_rd_lambda.dart`'s exact structure and bars.
+/// content, and the encoder's own synthetic regression-test patterns —
+/// across the encoder's **full distance range** (0.5-8.0), not a single
+/// point. This is a direct fix for how the previous attempt shipped: a
+/// `distance=1.0`-only calibration found a constant that looked perfect,
+/// but turned out to roughly double RMSE at `distance=8.0` because
+/// `lambda`'s old `refStep^2` scaling grows in the *opposite* direction
+/// from how RDOQ's own distortion metric scales with the dequant weight
+/// table (see doc/spec_notes.md's "why it's off" section for the full
+/// derivation). `lambda` now scales with `acScale^2` instead — verified
+/// empirically (not just derived) to keep RDOQ's aggressiveness roughly
+/// bounded across the full distance range rather than blowing up at
+/// high distance — but a fresh calibration is still required since the
+/// old constant (tuned for the old formula's units) does not transfer.
 ///
-/// Bar to clear (per doc/spec_notes.md's RDOQ section):
-///  (a) beat the RDOQ-off baseline on `color_cover` at distance 1.0, on
-///      both size and RMSE (or a real Pareto improvement);
-///  (b) keep the gradient-banding regression test's RMSE comfortably
-///      under 1.0 (target < 0.8) — RDOQ already skips `hfMult == 4`
-///      blocks (the heuristic's own banding-protection signal) as a
-///      structural mitigation, so this bar should be easier to clear
-///      than round 3's hfMult search was, but must still be measured,
-///      not assumed;
-///  (c) a real win (or at least no regression) on manga-typical
-///      screentone/line-art content, using the grayscale-PGM support
-///      `tool/bench_lossy_vs_cjxl.dart` gained in round 4.
+/// Bar to clear, at **every** tested distance:
+///  (a) no regression vs the RDOQ-off baseline beyond a small, accepted
+///      RMSE cost (a few percent) in exchange for a real size win;
+///  (b) the gradient-banding regression test's RMSE stays comfortably
+///      under its 1.0 gate;
+///  (c) no regression on manga-typical screentone/line-art content.
 ///
 /// Usage: `dart run tool/calibrate_rdoq_lambda.dart`
 void main() {
@@ -34,51 +37,64 @@ void main() {
     exit(1);
   }
   final (cw, ch, corpusPixels) = _readPpm(corpusFile.readAsBytesSync());
+  final palette16File =
+      File('../../third_party/corpus/golden/palette16_d0_e7.ppm');
+  final (pw, ph, palettePixels) = palette16File.existsSync()
+      ? _readPpm(palette16File.readAsBytesSync())
+      : (0, 0, Uint8List(0));
 
-  print('=== Reference point (RDOQ off) ===');
-  final baseline =
-      _encodeAndMeasure(corpusPixels, cw, ch, VardctL0Config.fromDistance(1.0));
-  print('color_cover d=1.0, RDOQ off: '
-      '${baseline.bytes} bytes, rmse=${baseline.rmse.toStringAsFixed(3)}');
-
-  print('\n=== kLambda sweep on color_cover (distance=1.0) ===');
-  print('kLambda      bytes   rmse    vs-baseline-bytes  vs-baseline-rmse');
-  final candidates = <double>[
-    500, 1000, 2000, 3000, 5000, 8000, 12000, 20000, 50000, //
-  ];
-  for (final kLambda in candidates) {
-    final r = _encodeAndMeasure(corpusPixels, cw, ch,
-        VardctL0Config.fromDistance(1.0).withRdoq(lambda: kLambda));
-    final bytesDelta = (r.bytes - baseline.bytes) / baseline.bytes * 100;
-    final rmseDelta = (r.rmse - baseline.rmse) / baseline.rmse * 100;
-    print('${kLambda.toStringAsFixed(0).padLeft(8)}  '
-        '${r.bytes.toString().padLeft(7)}  '
-        '${r.rmse.toStringAsFixed(3).padLeft(6)}  '
-        '${bytesDelta.toStringAsFixed(1).padLeft(10)}%  '
-        '${rmseDelta.toStringAsFixed(1).padLeft(10)}%');
-  }
-
-  print('\n=== Gradient banding gate (must stay well under RMSE 1.0) ===');
+  final distances = <double>[0.5, 1.0, 2.0, 4.0, 8.0];
+  final candidates = <double>[0.01, 0.02, 0.03, 0.05, 0.08, 0.15];
   final gradient = _gradientPattern(256, 256);
-  for (final kLambda in candidates) {
-    final r = _encodeAndMeasure(gradient, 256, 256,
-        VardctL0Config.fromDistance(1.0).withRdoq(lambda: kLambda));
-    print('kLambda=${kLambda.toStringAsFixed(0).padLeft(8)}: '
-        '${r.bytes} bytes, rmse=${r.rmse.toStringAsFixed(3)}'
-        '${r.rmse < 0.8 ? '  OK' : r.rmse < 1.0 ? '  MARGIN' : '  FAIL'}');
-  }
-
-  print('\n=== Manga-content sanity (screentone, line art) ===');
   final screentone = _screentonePattern(256, 256);
   final lineArt = _lineArtPattern(256, 256);
-  for (final kLambda in candidates) {
-    final rs = _encodeAndMeasure(screentone, 256, 256,
-        VardctL0Config.fromDistance(1.0).withRdoq(lambda: kLambda));
-    final rl = _encodeAndMeasure(lineArt, 256, 256,
-        VardctL0Config.fromDistance(1.0).withRdoq(lambda: kLambda));
-    print('kLambda=${kLambda.toStringAsFixed(0).padLeft(8)}: '
-        'screentone ${rs.bytes}B/${rs.rmse.toStringAsFixed(2)}  '
-        'lineArt ${rl.bytes}B/${rl.rmse.toStringAsFixed(2)}');
+
+  for (final distance in distances) {
+    print('\n${'=' * 70}');
+    print('distance = $distance');
+    print('=' * 70);
+
+    final base = VardctL0Config.fromDistance(distance);
+    final corpusBase = _encodeAndMeasure(corpusPixels, cw, ch, base);
+    print('color_cover  RDOQ off: ${corpusBase.bytes} bytes, '
+        'rmse=${corpusBase.rmse.toStringAsFixed(3)}');
+    final gradBase = _encodeAndMeasure(gradient, 256, 256, base);
+    print('gradient     RDOQ off: ${gradBase.bytes} bytes, '
+        'rmse=${gradBase.rmse.toStringAsFixed(3)}');
+    _Measurement? paletteBase;
+    if (pw > 0) {
+      paletteBase = _encodeAndMeasure(palettePixels, pw, ph, base);
+      print('palette16    RDOQ off: ${paletteBase.bytes} bytes, '
+          'rmse=${paletteBase.rmse.toStringAsFixed(3)}');
+    }
+
+    print('\nkLambda   color_cover(B/rmse%)      gradient(B/rmse)   gate');
+    for (final kLambda in candidates) {
+      final cfg = base.withRdoq(lambda: kLambda);
+      final r = _encodeAndMeasure(corpusPixels, cw, ch, cfg);
+      final g = _encodeAndMeasure(gradient, 256, 256, cfg);
+      final bytesDelta = (r.bytes - corpusBase.bytes) / corpusBase.bytes * 100;
+      final rmseDelta = (r.rmse - corpusBase.rmse) / corpusBase.rmse * 100;
+      final gate = g.rmse < 0.8
+          ? 'OK'
+          : g.rmse < 1.0
+              ? 'MARGIN'
+              : 'FAIL';
+      print('${kLambda.toStringAsFixed(3).padLeft(7)}   '
+          '${r.bytes.toString().padLeft(7)} (${bytesDelta.toStringAsFixed(1).padLeft(6)}% / '
+          '${rmseDelta.toStringAsFixed(1).padLeft(6)}%)   '
+          '${g.bytes.toString().padLeft(6)}B/${g.rmse.toStringAsFixed(3).padLeft(6)}   $gate');
+    }
+
+    print('\nManga-content sanity (screentone, line art):');
+    for (final kLambda in candidates) {
+      final cfg = base.withRdoq(lambda: kLambda);
+      final rs = _encodeAndMeasure(screentone, 256, 256, cfg);
+      final rl = _encodeAndMeasure(lineArt, 256, 256, cfg);
+      print('kLambda=${kLambda.toStringAsFixed(3).padLeft(7)}: '
+          'screentone ${rs.bytes}B/${rs.rmse.toStringAsFixed(2)}  '
+          'lineArt ${rl.bytes}B/${rl.rmse.toStringAsFixed(2)}');
+    }
   }
 }
 
@@ -89,8 +105,6 @@ extension on VardctL0Config {
       xqmScale: xqmScale,
       bqmScale: bqmScale,
       acScale: acScale,
-      enableFilters: enableFilters,
-      enableVariableTransforms: enableVariableTransforms,
       enableRdHfMult: enableRdHfMult,
       rdHfMultLambdaOverride: rdHfMultLambdaOverride,
       enableRdoq: true,
