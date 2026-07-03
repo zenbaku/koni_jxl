@@ -293,6 +293,116 @@ This is a real, measured net win on non-gradient content (e.g. one mixed
 synthetic test case dropped from RMSE 16.4 to 15.5 and shrank ~6% at the
 same distance) even without per-region adaptivity.
 
+### Lossy (VarDCT) encoder — L3: filters and variable transform size
+
+Both L3 additions are implemented, verified end-to-end against djxl
+(bitstream decodes correctly in every configuration tested), and **off
+by default** — both are real capabilities that help smooth/photographic
+content but were measured to regress manga's dominant content types
+(screentone, line art), so neither is a net win for this project's
+primary use case without further tuning. This mirrors the shape of
+several L1/L2 bugs: every configuration produces a valid,
+djxl-decodable file with no crash or gate failure, so the "should this
+be on by default" question can only be answered by measuring RMSE/size,
+never by a thrown exception.
+
+**Filters** (`VardctL0Config.enableFilters`). `RestorationFilter`'s own
+library defaults are `gab = true` (Gaborish deringing) and 2 EPF
+(edge-preserving filter) iterations; L0-L2 wrote `all_default = false`
+with every sub-field explicit and off. Turning them on needs no encoder
+compensation — `_writeVardctFrameHeader` just writes the library
+defaults for `gab`/`customGab`/`epfIterations`/`epfSharpCustom`/
+`epfWeightCustom`/`epfSigmaCustom` instead of the all-off values (4 extra
+header bits total). Measured on 256x256 synthetic content at `distance =
+1.0`: gradient RMSE 0.742→0.672, photoish RMSE 1.762→1.683 (both
+improved, as expected — these filters exist to reduce exactly the
+blocking/ringing quantization introduces); screentone RMSE 1.786→23.412,
+line art RMSE 1.275→17.026 (both ~13x *worse* — Gaborish/EPF are
+smoothing filters, and screentone dot patterns / high-contrast line
+edges are made of exactly the sharp, regular high-frequency detail they
+blur). Given manga is this project's primary use case, filters default
+off.
+
+**Variable transform size** (`VardctL0Config.enableVariableTransforms`).
+Adaptively chooses one 16x16 DCT instead of four separate 8x8 DCTs per
+aligned 16x16 pixel region. This is the most cross-cutting change in the
+encoder so far — every subsystem that assumed "one 8x8 block per grid
+cell" needed generalizing:
+
+- **Placement is the wire format, not just bookkeeping.** HfMetadata's
+  block list is a flat sequence that the decoder places greedily,
+  row-major, at the first free cell (`hf_metadata.dart`'s `_placeBlock`);
+  a 16x16 block consumes a 2x2-block footprint in one list entry. The
+  encoder must decide the *entire* layout up front and then walk the
+  block grid in the same raster-scan-with-skip order the decoder would
+  reconstruct, emitting one list entry per placed block (`_PlacedBlock`
+  in `vardct_l0_encoder.dart`). 16x16 blocks are only started at
+  globally-even block coordinates, which turns out to guarantee they
+  never straddle a 32-block-aligned group boundary — one less interlocking
+  constraint to handle explicitly.
+- **A hidden decoder-side field-width dependency.** `HfMetadata.read`
+  sizes the `nbBlocks - 1` field from `ceilLog2(bh * bw)` — the LfGroup's
+  *full* block-grid size — not from `nbBlocks` itself, since the decoder
+  doesn't know `nbBlocks` until after this exact read. This project's own
+  encoder code initially (wrongly) used `ceilLog2(nbBlocks)`, which is
+  numerically smaller whenever any 16x16 blocks are placed and silently
+  desyncs every bit read afterward — caught immediately by the small
+  test suite (`stream uses global tree but no global tree exists`, a
+  downstream symptom of the desync) rather than by any check in this
+  specific field, since both are valid-looking bit counts.
+- **DC/LLF inversion for 16x16 blocks.** DC/LF is always coded at native
+  8x8-cell granularity, regardless of the HF transform covering it. On
+  decode, a 16x16 block's top-left 2x2 "LLF" coefficient corner comes
+  from a *forward* 2x2 DCT of its four underlying 8x8-cell DC values,
+  scaled by `TransformType.llfScale` (`hf_coefficients.dart`'s
+  `_finalizeLLF`) — those 4 positions are never read as AC tokens at all.
+  The encoder must invert this: compute the true 16x16 DCT's own LLF
+  corner, divide out `llfScale`, then solve for the four DC-plane values
+  that will reproduce it — an *exact* algebraic inversion (verified by
+  direct substitution), not an approximation: the forward 2x2 DCT reduces
+  to a 1/4-scaled Hadamard-like transform, `C[k] = (P00±P01±P10±P11)/4`
+  for each sign pattern, and inverting it is the same sign-pattern sum
+  without the 1/4 (a self-inverse structure).
+- **Per-transform-type context/order state.** Block context depends on
+  `orderID` (8x8 is orderID 0, 16x16 is orderID 2 — different values from
+  `HfBlockContext`'s default 39-entry cluster map, so 8x8 and 16x16
+  blocks use *different* context clusters even for corresponding
+  channels), and natural order/weight-table/`numBlocks`-bucketing
+  (`HfCoefficients.getCoefficientContext`'s internal `nonZeroes ~/
+  numBlocks` and `k ~/ numBlocks` normalization) all vary by type. All of
+  this reuses the decoder's own `TransformType` objects
+  (`TransformType.byType(4)` for 16x16) rather than hand-deriving
+  constants like `orderID`/`parameterIndex`/`llfScale` — the same
+  "reuse, don't reimplement" approach already used for
+  `getDCTQuantWeights`/`getNaturalOrder`, extended to the whole
+  `TransformType` object this time, specifically to avoid a repeat of
+  the `nbBlocks` field-width mistake above.
+
+The selection heuristic (`_should16x16`) is a rough proxy — sum of
+log-scaled above-threshold coefficient magnitudes, comparing one 16x16
+DCT of a Y-channel patch against four independent 8x8 DCTs of the same
+patch — evaluated before any real quantization or entropy coding
+happens. This proxy **does not match real end-to-end cost**: on a
+256x256 screentone test pattern it picked 16x16 for 100% of eligible
+regions, yet the actual djxl-verified output was both larger (24761 vs
+20681 bytes) and worse RMSE (1.845 vs 1.786) than plain 8x8; line art
+was similarly worse (18901 vs 14398 bytes, +31%) despite the proxy
+picking 16x16 only ~50% of the time there. Smooth photographic content
+did benefit as expected (~4% smaller at matched RMSE). The gap is that
+the proxy has no visibility into the *entropy coder's* context modeling
+— `getPredictedNonZeroes` predicts each block's non-zero count from its
+already-decoded neighbors, which works better with more numerous,
+correlated small blocks than fewer large ones, and a large DCT applied
+across a sharp discontinuity (a screentone dot edge, a line-art stroke)
+spreads Gibbs-phenomenon ringing across proportionally more frequency
+bins than a small one does — a bit-magnitude proxy computed pre-entropy-
+coding can't see either effect. A higher-fidelity per-region decision
+(e.g. actually assembling both candidates' real bytes and keeping the
+smaller, mirroring `_chooseAcClustering`'s "estimates can't resolve
+near-ties, verify by real assembly" rule) is the natural next step if
+this is revisited, rather than a better closed-form proxy. Given manga
+is this project's primary use case, variable transforms default off.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

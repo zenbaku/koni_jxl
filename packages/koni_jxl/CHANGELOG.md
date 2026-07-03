@@ -22,6 +22,14 @@
   monotonic down to `distance = 0.05` in testing, vs. plateauing around
   0.5-0.8 before), and a global (whole-image) chroma-from-luma fit. See
   ROADMAP.md for the remaining per-region CfL upgrade.
+- **Lossy (VarDCT) — L3 milestone.** Two opt-in additions, both **off by
+  default**: Gaborish + edge-preserving filtering
+  (`VardctL0Config.enableFilters`), and adaptive per-region 8x8/16x16
+  transform size selection (`enableVariableTransforms`). Both are real,
+  djxl-verified working capabilities that help smooth/photographic
+  content but were measured to regress manga's dominant content types
+  (screentone, line art) by a wide margin, so both default off — see
+  doc/spec_notes.md for the full numbers.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).

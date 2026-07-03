@@ -170,6 +170,119 @@ void main() {
     expect(rmse, lessThan(1.0), reason: 'gradient rmse $rmse');
   });
 
+  test('filters default off: line art and screentone RMSE stays low', () {
+    if (!_haveDjxl) return;
+    // Regression guard for the enableFilters default. Gaborish/EPF are
+    // smoothing filters: they measurably help smooth/photographic content
+    // but catastrophically hurt manga's two dominant content types (both
+    // ~13x worse RMSE in testing when filters were on) since they blur
+    // exactly the sharp edges and regular high-frequency detail those are
+    // made of — see VardctL0Config.enableFilters's doc comment. This
+    // checks the *default* (filters off) stays good on that content;
+    // encoder_roundtrip-style tests elsewhere don't exercise line-art-like
+    // high-contrast edges at these dimensions.
+    const w = 256, h = 256;
+    Uint8List lineArt() {
+      final out = Uint8List(w * h * 3);
+      var i = 0;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          final onLine = (x % 40 < 3) || (y % 40 < 3) || ((x + y) % 60 < 3);
+          final v = onLine ? 20 : 250;
+          out[i++] = v;
+          out[i++] = v;
+          out[i++] = v;
+        }
+      }
+      return out;
+    }
+
+    final pixels = lineArt();
+    final encoded = JxlEncoder.encodeLossy(pixels, width: w, height: h);
+    final image = JxlDecoder.decode(encoded);
+    var sumSq = 0.0;
+    for (var c = 0; c < 3; c++) {
+      final ours = channelAsInts(image.channels[c], 255);
+      for (var j = 0; j < w * h; j++) {
+        final d = ours[j] - pixels[j * 3 + c];
+        sumSq += d * d;
+      }
+    }
+    final rmse = math.sqrt(sumSq / (w * h * 3));
+    // Measured ~1.3 with filters off, ~17 with filters on.
+    expect(rmse, lessThan(5.0), reason: 'line art rmse $rmse');
+  });
+
+  test('variable transforms (16x16) decode correctly when enabled', () {
+    if (!_haveDjxl) return;
+    // Exercises the adaptive 8x8/16x16 placement/context-model machinery
+    // end to end: a non-multiple-of-16 dimension forces a mix of paired
+    // (16x16) and leftover single (8x8) blocks in the same image, plus a
+    // multi-group size to check blocks are correctly bucketed by group.
+    for (final (w, h) in [(256, 256), (264, 264), (528, 264)]) {
+      final pixels = _synthetic(w, h, 4);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: w,
+          height: h,
+          config: const VardctL0Config(enableVariableTransforms: true));
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, w);
+      expect(image.height, h);
+      final dir = Directory.systemTemp.createTempSync('koni_vt');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed for ${w}x$h: ${r.stderr}');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  test('variable transforms default off: regresses manga-like content', () {
+    if (!_haveDjxl) return;
+    // Regression guard for the enableVariableTransforms default. The
+    // 8x8-vs-16x16 decision heuristic is a crude bit-cost proxy, not the
+    // real context-adaptive entropy cost: it picks 16x16 100% of the time
+    // on a screentone test pattern, yet real end-to-end output was both
+    // larger *and* worse RMSE than plain 8x8 there — see
+    // VardctL0Config.enableVariableTransforms's doc comment. This checks
+    // the *default* (off) beats explicitly turning it on for this content.
+    const w = 256, h = 256;
+    Uint8List screentone() {
+      final out = Uint8List(w * h * 3);
+      var i = 0;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          final dotX = x % 6, dotY = y % 6;
+          final dist =
+              math.sqrt(math.pow(dotX - 2.5, 2) + math.pow(dotY - 2.5, 2));
+          final v = dist < 2.0 ? 30 : 220;
+          out[i++] = v;
+          out[i++] = v;
+          out[i++] = v;
+        }
+      }
+      return out;
+    }
+
+    final pixels = screentone();
+    final withVt = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: const VardctL0Config(enableVariableTransforms: true));
+    final withoutVt = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: const VardctL0Config(enableVariableTransforms: false));
+    expect(withoutVt.length, lessThan(withVt.length),
+        reason: 'default (${withoutVt.length}B) should beat '
+            'variable transforms (${withVt.length}B) on screentone');
+  });
+
   test('finer quantization improves RMSE', () {
     if (!_haveDjxl) return;
     final pixels = _synthetic(64, 64, 9);

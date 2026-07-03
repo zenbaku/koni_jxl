@@ -73,10 +73,34 @@ quality lives.
   sections (each up to 256x256 blocks), not just multiple 256x256 groups
   within one. Lower priority than L2/L3 — manga pages are well under this
   limit.
-- 🔲 **L3 — transform selection + filters.** Variable block sizes (choose
-  among the 27 varblock transforms per region by a rate-distortion
-  heuristic), and enable Gaborish/EPF with the encoder accounting for
-  them. Approaches cjxl quality.
+- ✅ **L3 — transform selection + filters.** Two independent additions,
+  both opt-in and **off by default** — both are real, djxl-verified,
+  working capabilities that help smooth/photographic content but were
+  measured to *regress* manga's dominant content types, so neither is a
+  net win for this project's primary use case at its current tuning
+  (see doc/spec_notes.md for the full numbers and the two config knobs,
+  `VardctL0Config.enableFilters` / `enableVariableTransforms`):
+  - **Filters** (Gaborish + 2 EPF iterations, the format's own defaults).
+    Helps smooth/photo content a few percent; ~13x *worse* RMSE on
+    screentone and line art (these are smoothing filters, and manga's
+    dominant content is exactly the sharp edges/regular high-frequency
+    detail they blur).
+  - **Variable transform size** (adaptive per-16x16-region 8x8-vs-16x16
+    DCT selection, with placement mirroring the decoder's greedy block
+    layout, per-transform-type context/weight tables, and an exact
+    algebraic inversion of the decoder's LLF-from-DC-plane
+    reconstruction for 16x16 blocks). ~4% smaller at matched quality on
+    smooth photographic content; up to ~31% *larger* on line art and
+    screentone, because the selection heuristic (a cheap bit-cost proxy)
+    doesn't capture the real context-adaptive entropy cost and
+    over-selects 16x16 on regular high-frequency patterns. A
+    higher-fidelity heuristic (or an actual-assembled-bytes comparison,
+    per this project's established "measure, don't estimate" pattern —
+    see `_chooseAcClustering`) could recover this as a real per-region
+    win rather than an all-or-nothing global toggle; not attempted here.
+  Full 27-transform-type support (this encoder only added 8x8/16x16) and
+  a real rate-distortion search remain open if a non-manga use case ever
+  needs them.
 - 🔲 **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)`,
   Flutter helper, a lossy round-trip gate suite, benchmarks vs cjxl at
   matched distances.

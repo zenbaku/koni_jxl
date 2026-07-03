@@ -10,15 +10,16 @@ import '../../vardct/hf_block_context.dart';
 import '../../vardct/hf_coefficients.dart' show HfCoefficients;
 import '../../vardct/hf_global.dart' show defaultDctParams, getDCTQuantWeights;
 import '../../vardct/hf_pass.dart' show getNaturalOrder;
-import '../../vardct/transform_type.dart' show TransformMode;
+import '../../vardct/transform_type.dart' show TransformMode, TransformType;
 import '../entropy_writer.dart';
 import '../headers.dart';
 import 'xyb_forward.dart';
 
-/// Lossy (VarDCT) encoder (doc/lossy_encoder_plan.md's L0/L1/L2): 8x8-DCT
-/// only, real HF coefficient context model, multi-group, adaptive
-/// per-block quantization and a custom per-frequency quant weight table;
-/// still filters-off and single-LfGroup (see ROADMAP.md for what's left).
+/// Lossy (VarDCT) encoder (doc/lossy_encoder_plan.md's L0/L1/L2/L3): 8x8
+/// DCT (plus optional adaptive 16x16 selection), real HF coefficient
+/// context model, multi-group, adaptive per-block quantization, a custom
+/// per-frequency quant weight table and optional filters; still
+/// single-LfGroup (see ROADMAP.md for what's left).
 ///
 /// The overall quantization step is `scaleFactor[c] / rawWeight[c][y][x]`
 /// for AC and `lfDequantDefault[c] / (globalScale * quantLF)` for DC; both
@@ -35,6 +36,8 @@ class VardctL0Config {
     this.xqmScale = 3,
     this.bqmScale = 2,
     this.acScale = 1.0,
+    this.enableFilters = false,
+    this.enableVariableTransforms = false,
   });
 
   /// Derives quantization knobs from a cjxl-like `distance` (butteraugli
@@ -67,11 +70,35 @@ class VardctL0Config {
   final int xqmScale;
   final int bqmScale;
 
-  /// Multiplies the default DCT8x8 quant weight table (written as a custom
-  /// `quant_all_default = false` table rather than relying on
+  /// Multiplies the default DCT quant weight tables (written as custom
+  /// `quant_all_default = false` tables rather than relying on
   /// [globalScale], which has limited fine-quantization headroom). `1.0`
-  /// reproduces the library default table exactly.
+  /// reproduces the library default tables exactly.
   final double acScale;
+
+  /// Whether to enable Gaborish deringing and edge-preserving filtering
+  /// (the format's own defaults: `gab = true`, 2 EPF iterations). Defaults
+  /// to **off**: measured to help smooth/photographic content (a few
+  /// percent RMSE reduction) but to catastrophically hurt manga's two
+  /// dominant content types — screentone patterns and high-contrast line
+  /// art both got ~13x *worse* RMSE in testing, since these filters are
+  /// smoothing filters that blur exactly the sharp edges and regular
+  /// high-frequency detail those content types are made of. See
+  /// doc/spec_notes.md before flipping this on for a non-manga use case.
+  final bool enableFilters;
+
+  /// Whether to adaptively choose between 8x8 and 16x16 DCT per 16x16
+  /// pixel region (a rough bit-cost proxy decides). Defaults to **off**:
+  /// the proxy is a crude per-coefficient magnitude/count estimate, not
+  /// the real context-adaptive entropy cost, and it mispredicts badly on
+  /// regular high-frequency content — it picked 16x16 100% of the time on
+  /// a screentone test pattern, yet the real (entropy-coded, djxl-
+  /// verified) output was both larger *and* worse RMSE than plain 8x8
+  /// there (+20% size) and on line art (+31% size). It's a small, genuine
+  /// win on smooth photographic content (~4% smaller at matched quality
+  /// in testing). See doc/spec_notes.md before flipping this on for a
+  /// non-manga use case.
+  final bool enableVariableTransforms;
 }
 
 int _packSigned(int v) => v >= 0 ? v << 1 : (-v << 1) - 1;
@@ -81,6 +108,9 @@ const _hfConfig = HybridIntegerConfig(4, 1, 0);
 /// Channel processing/bitstream order used throughout VarDCT: Y, X, B
 /// (semantic indices 1, 0, 2 — see `frame/frame.dart`'s `cMap`).
 const _channelOrder = [1, 0, 2];
+
+final _tt8 = TransformType.byType(0); // DCT 8x8: orderID 0, parameterIndex 0
+final _tt16 = TransformType.byType(4); // DCT 16x16: orderID 2, parameterIndex 4
 
 /// Encodes an interleaved 8-bit RGB image as a VarDCT (lossy) JPEG XL
 /// stream. Requires [width] and [height] to be multiples of 8 and at most
@@ -124,22 +154,28 @@ Uint8List encodeLossyVardctL0(
   final bh = height ~/ 8;
   final bw = width ~/ 8;
 
-  // 2. Quantization tables (mirroring the decoder's default DCT8x8 weights
-  // and scale factors exactly; see doc/lossy_encoder_plan.md). Scaling
-  // only the first (lowest-frequency) band by acScale scales the entire
-  // interpolated weight table by the same factor (see
-  // doc/spec_notes.md), giving a fineness knob with no ceiling — unlike
-  // globalScale, whose bitstream field caps how much finer than baseline
-  // it can reach.
-  final customDctParams = [
-    for (var c = 0; c < 3; c++)
-      [
-        defaultDctParams[0].dctParam![c][0] * config.acScale,
-        ...defaultDctParams[0].dctParam![c].skip(1),
-      ],
+  // 2. Quantization tables (mirroring the decoder's default DCT weights and
+  // scale factors exactly; see doc/lossy_encoder_plan.md). Scaling only the
+  // first (lowest-frequency) band by acScale scales the entire interpolated
+  // weight table by the same factor (see doc/spec_notes.md), giving a
+  // fineness knob with no ceiling — unlike globalScale, whose bitstream
+  // field caps how much finer than baseline it can reach.
+  List<List<double>> customParams(TransformType tt) => [
+        for (var c = 0; c < 3; c++)
+          [
+            defaultDctParams[tt.parameterIndex].dctParam![c][0] *
+                config.acScale,
+            ...defaultDctParams[tt.parameterIndex].dctParam![c].skip(1),
+          ],
+      ];
+  final customDctParams8 = customParams(_tt8);
+  final customDctParams16 = customParams(_tt16);
+  final rawWeight8 = [
+    for (var c = 0; c < 3; c++) getDCTQuantWeights(8, 8, customDctParams8[c]),
   ];
-  final rawWeight = [
-    for (var c = 0; c < 3; c++) getDCTQuantWeights(8, 8, customDctParams[c]),
+  final rawWeight16 = [
+    for (var c = 0; c < 3; c++)
+      getDCTQuantWeights(16, 16, customDctParams16[c]),
   ];
   final globalScaleF = 65536.0 / config.globalScale;
   final scaleFactor = [
@@ -153,130 +189,123 @@ Uint8List encodeLossyVardctL0(
       (1 << 16) * lfDequantDefault[c] / (config.globalScale * config.quantLF),
   ];
 
-  // 3. Per-block forward DCT, chroma-from-luma pre-subtraction, adaptive
-  // quantization multiplier and quantization. dcInt/acInt are
-  // semantic-indexed (0=X, 1=Y, 2=B); acInt blocks are flat 64-entry
-  // (row-major y*8+x) grids, DC slot unused. hfMult is per-block, shared
-  // across channels (mirrors HfMetadata's one multiplier per block).
-  final dcInt = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
-  final acInt = [
-    for (var c = 0; c < 3; c++)
-      List<Int32List>.generate(bh * bw, (_) => Int32List(64)),
-  ];
-  final hfMult = Int32List(bh * bw);
-  final coeffBuf = [
-    for (var c = 0; c < 3; c++) List.generate(8, (_) => Float32List(8))
-  ];
-  final scratch0 = List.generate(8, (_) => Float32List(8));
-  final scratch1 = List.generate(8, (_) => Float32List(8));
-  // Global chroma-from-luma: the least-squares-optimal X-on-Y and B-on-Y
+  // 3. Global chroma-from-luma: the least-squares-optimal X-on-Y and B-on-Y
   // slopes, applied uniformly (not yet per 64x64 region — see
   // _writeLfGlobal's doc comment) in place of the format's defaults
   // (kX = 0, kB = 1.0).
-  final (kX, kB) = _globalChromaFromLuma(planes, bh, bw, scratch0, scratch1);
+  final scratch8a = List.generate(8, (_) => Float32List(8));
+  final scratch8b = List.generate(8, (_) => Float32List(8));
+  final scratch16a = List.generate(16, (_) => Float32List(16));
+  final scratch16b = List.generate(16, (_) => Float32List(16));
+  final (kX, kB) = _globalChromaFromLuma(planes, bh, bw, scratch8a, scratch8b);
   // Reference AC step at the first (lowest-frequency, most perceptually
   // important) Y position: the scale against which "how smooth is this
-  // block" is judged, so the heuristic adapts with `distance` instead of
-  // using an absolute threshold tuned for one quantization strength.
-  final refStep = scaleFactor[1] / rawWeight[1][0][1];
-  for (var by = 0; by < bh; by++) {
-    for (var bx = 0; bx < bw; bx++) {
-      final blockIdx = by * bw + bx;
-      for (var c = 0; c < 3; c++) {
-        forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, 8, 8,
-            scratch0, scratch1);
-      }
-      // Chroma-from-luma: the decoder always adds kX/kB times the Y
-      // coefficient into X/B, so that must be pre-subtracted here, at
-      // every position including DC.
-      for (var y = 0; y < 8; y++) {
-        for (var x = 0; x < 8; x++) {
-          final yv = coeffBuf[1][y][x];
-          coeffBuf[0][y][x] -= kX * yv;
-          coeffBuf[2][y][x] -= kB * yv;
-        }
-      }
+  // block" is judged, so heuristics adapt with `distance` instead of using
+  // an absolute threshold tuned for one quantization strength.
+  final refStep = scaleFactor[1] / rawWeight8[1][0][1];
 
-      // Adaptive quantization: hfMultiplier can only refine *finer* than
-      // the baseline (dequant is inversely proportional to it — see
-      // doc/spec_notes.md), so smooth/low-energy blocks (where rounding
-      // AC to zero causes visible banding) get a boost; busy blocks stay
-      // at the baseline multiplier, since masking hides quantization
-      // noise there and they already spend plenty of bits.
-      var acEnergy = 0.0;
-      final y1 = coeffBuf[1];
-      for (var y = 0; y < 8; y++) {
-        final row = y1[y];
-        for (var x = 0; x < 8; x++) {
-          if (y == 0 && x == 0) continue;
-          acEnergy += row[x] * row[x];
+  // 4. Decide the block layout: adaptively 8x8 or 16x16 per aligned 16x16
+  // pixel region (a rough bit-cost proxy, `_should16x16`), in the exact
+  // raster-scan-with-skip order `HfMetadata`'s decoder-side `_placeBlock`
+  // reconstructs from a flat block list — placement order IS the wire
+  // format here, not just a convenience.
+  final placedBlocks = <_PlacedBlock>[];
+  if (config.enableVariableTransforms) {
+    final covered = List<bool>.filled(bh * bw, false);
+    for (var by = 0; by < bh; by++) {
+      for (var bx = 0; bx < bw; bx++) {
+        if (covered[by * bw + bx]) continue;
+        final canPair = by.isEven &&
+            bx.isEven &&
+            by + 1 < bh &&
+            bx + 1 < bw &&
+            !covered[(by + 1) * bw + bx] &&
+            !covered[by * bw + bx + 1] &&
+            !covered[(by + 1) * bw + bx + 1];
+        if (canPair &&
+            _should16x16(planes[1], by, bx, refStep, scratch8a, scratch8b,
+                scratch16a, scratch16b)) {
+          covered[(by + 1) * bw + bx] = true;
+          covered[by * bw + bx + 1] = true;
+          covered[(by + 1) * bw + bx + 1] = true;
+          placedBlocks.add(_PlacedBlock(by, bx, _tt16));
+        } else {
+          placedBlocks.add(_PlacedBlock(by, bx, _tt8));
         }
       }
-      final relEnergy = math.sqrt(acEnergy) / refStep;
-      final mult = relEnergy < 1.0
-          ? 4
-          : relEnergy < 4.0
-              ? 2
-              : 1;
-      hfMult[blockIdx] = mult;
-
-      for (var c = 0; c < 3; c++) {
-        dcInt[c][blockIdx] = (coeffBuf[c][0][0] / sd[c]).round();
-        final ac = acInt[c][blockIdx];
-        final rw = rawWeight[c];
-        final sfc = scaleFactor[c] / mult;
-        for (var y = 0; y < 8; y++) {
-          for (var x = 0; x < 8; x++) {
-            if (y == 0 && x == 0) continue;
-            final step = sfc / rw[y][x];
-            ac[y * 8 + x] = (coeffBuf[c][y][x] / step).round();
-          }
-        }
+    }
+  } else {
+    for (var by = 0; by < bh; by++) {
+      for (var bx = 0; bx < bw; bx++) {
+        placedBlocks.add(_PlacedBlock(by, bx, _tt8));
       }
     }
   }
 
-  // 4. AC coefficient tokens, one group at a time (each group is its own
+  // 5. Per-block forward DCT, chroma-from-luma pre-subtraction, adaptive
+  // quantization multiplier and quantization. dcInt is semantic-indexed
+  // (0=X, 1=Y, 2=B), always at native 8x8-block granularity (DC/LF is
+  // always coded per 8x8 cell regardless of the HF transform covering it —
+  // see _PlacedBlock's doc comment on the LLF relationship for 16x16).
+  final dcInt = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
+  for (final block in placedBlocks) {
+    block.computeAndQuantize(
+        planes,
+        kX,
+        kB,
+        refStep,
+        sd,
+        block.tt == _tt16 ? rawWeight16 : rawWeight8,
+        scaleFactor,
+        dcInt,
+        bw,
+        scratch8a,
+        scratch8b,
+        scratch16a,
+        scratch16b);
+  }
+
+  // 6. AC coefficient tokens, one group at a time (each group is its own
   // 256x256-pixel / 32x32-block tile with an independent non-zero
   // prediction grid, mirroring a fresh HfCoefficients per (pass, group)).
-  final order = getNaturalOrder(0); // DCT 8x8 has orderID 0.
+  // Blocks never straddle a group boundary: groups are 32-block-aligned
+  // (even) and 16x16 blocks only start at globally-even coordinates with a
+  // 2x2 footprint, so a block's origin alone determines its group.
   final hfctx = HfBlockContext.defaults();
-  // blockCtx depends on (channel, orderID, hfMult, lfIndex), but the
-  // default HfBlockContext has empty qfThresholds, so the hfMult argument
-  // is a no-op (getBlockContext's threshold loop never runs) regardless of
-  // the real per-block adaptive multiplier — it's constant per channel.
-  final blockCtx = [
-    for (var c = 0; c < 3; c++)
-      HfCoefficients.getBlockContext(hfctx, c, 0, 1, 0),
-  ];
-  final histCtx = [for (final b in blockCtx) 458 * b + 37 * hfctx.numClusters];
+  final ctxByType = {
+    for (final tt in [_tt8, _tt16]) tt.type: _TransformCtx(tt, hfctx),
+  };
   final groupsX = ceilDiv(width, 256);
   final groupsY = ceilDiv(height, 256);
   final numGroups = groupsX * groupsY;
+  final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
+  for (final block in placedBlocks) {
+    final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);
+    blocksByGroup[g].add(block);
+  }
   final groupTokens = <_GroupTokens>[
     for (var gy = 0; gy < groupsY; gy++)
       for (var gx = 0; gx < groupsX; gx++)
-        _computeGroupTokens(
-            gy * 32,
-            gx * 32,
-            math.min(32, bh - gy * 32),
-            math.min(32, bw - gx * 32),
-            bw,
-            acInt,
-            hfctx,
-            blockCtx,
-            histCtx,
-            order),
+        _computeGroupTokens(gy * 32, gx * 32, blocksByGroup[gy * groupsX + gx],
+            hfctx, ctxByType),
   ];
   final clustering = _chooseAcClustering(groupTokens);
 
-  // 5. Assemble the bitstream: image header, VarDCT frame header, then
+  // 7. Assemble the bitstream: image header, VarDCT frame header, then
   // either the single concatenated section body (numGroups == 1 forces
   // tocEntryCount == 1 — no byte alignment between LfGlobal / LfGroup /
   // HfGlobal+HfPass / PassGroup; see doc/lossy_encoder_plan.md's TOC
   // single-section note) or, for numGroups > 1, one independently
   // byte-aligned section per (LfGlobal, the single LfGroup, HfGlobal+
   // HfPass, and each group's PassGroup).
+  final usesCustomWeights = config.acScale != 1.0;
+  final customParamsByIndex = usesCustomWeights
+      ? {
+          _tt8.parameterIndex: customDctParams8,
+          _tt16.parameterIndex: customDctParams16
+        }
+      : null;
+
   final out = BitWriter();
   writeImageHeader(
       out,
@@ -293,9 +322,8 @@ Uint8List encodeLossyVardctL0(
     final body = BitWriter();
     _writeLfGlobal(body, config, kX, kB);
     _writeLfCoefficients(body, dcInt[0], dcInt[1], dcInt[2]);
-    _writeHfMetadata(body, bh, bw, hfMult);
-    _writeHfGlobalAndPass(
-        body, numGroups, config.acScale == 1.0 ? null : customDctParams);
+    _writeHfMetadata(body, bh, bw, placedBlocks);
+    _writeHfGlobalAndPass(body, numGroups, customParamsByIndex);
     clustering.codes.writeHeader(body, clusterMap: clustering.clusterMap);
     _writeAcGroupPayload(body, clustering.codes,
         clustering.mappedClustersPerGroup[0], groupTokens[0].values);
@@ -308,11 +336,10 @@ Uint8List encodeLossyVardctL0(
 
     final lfGroupW = BitWriter();
     _writeLfCoefficients(lfGroupW, dcInt[0], dcInt[1], dcInt[2]);
-    _writeHfMetadata(lfGroupW, bh, bw, hfMult);
+    _writeHfMetadata(lfGroupW, bh, bw, placedBlocks);
 
     final hfGlobalW = BitWriter();
-    _writeHfGlobalAndPass(
-        hfGlobalW, numGroups, config.acScale == 1.0 ? null : customDctParams);
+    _writeHfGlobalAndPass(hfGlobalW, numGroups, customParamsByIndex);
     clustering.codes.writeHeader(hfGlobalW, clusterMap: clustering.clusterMap);
 
     final sections = <Uint8List>[
@@ -329,6 +356,201 @@ Uint8List encodeLossyVardctL0(
     }
   }
   return out.toBytes();
+}
+
+/// Rough bit-cost proxy (count of above-threshold coefficients, log-weighted
+/// by magnitude) comparing one 16x16 DCT against four independent 8x8 DCTs
+/// over the same 16x16 pixel region, on the Y channel only (the dominant
+/// perceptual signal). Measured to favor 16x16 on every content type tried
+/// (smooth gradients, screentone, line art, noise) in ad hoc testing before
+/// this was wired in — see doc/spec_notes.md.
+bool _should16x16(
+    List<Float32List> yPlane,
+    int by,
+    int bx,
+    double refStep,
+    List<Float32List> scratch8a,
+    List<Float32List> scratch8b,
+    List<Float32List> scratch16a,
+    List<Float32List> scratch16b) {
+  final c8 = List.generate(8, (_) => Float32List(8));
+  var cost8 = 0.0;
+  for (final oy in [by * 8, by * 8 + 8]) {
+    for (final ox in [bx * 8, bx * 8 + 8]) {
+      forwardDCT2D(yPlane, c8, oy, ox, 0, 0, 8, 8, scratch8a, scratch8b);
+      cost8 += _bitProxy(c8, 8, 8, 1, refStep);
+    }
+  }
+  final c16 = List.generate(16, (_) => Float32List(16));
+  forwardDCT2D(
+      yPlane, c16, by * 8, bx * 8, 0, 0, 16, 16, scratch16a, scratch16b);
+  final cost16 = _bitProxy(c16, 16, 16, 4, refStep);
+  return cost16 < cost8;
+}
+
+double _bitProxy(
+    List<Float32List> coeffs, int h, int w, int numLlf, double thresh) {
+  var cost = 0.0;
+  var llfSeen = 0;
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      if (y < 2 && x < 2 && llfSeen < numLlf) {
+        llfSeen++;
+        continue; // LLF/DC positions are quantized separately.
+      }
+      final v = coeffs[y][x].abs();
+      if (v > thresh) cost += 1 + math.log(v / thresh) / math.ln2;
+    }
+  }
+  return cost;
+}
+
+/// One placed HF block: either an 8x8 or 16x16 DCT at block-grid origin
+/// ([by], [bx]) (8x8-cell units). The DC/LF (coarse) plane is always at
+/// native 8x8-cell granularity regardless of [tt] — a 16x16 block's four
+/// underlying DC values combine via a forward 2x2 DCT on the *decode* side
+/// (`hf_coefficients.dart`'s `_finalizeLLF`) to produce its top-left 2x2
+/// "LLF" coefficient corner (scaled by `tt.llfScale`), so this encoder must
+/// invert that relationship: compute the true 16x16 DCT's own LLF corner,
+/// divide out `llfScale`, then apply the algebraic inverse of the forward
+/// 2x2 DCT (a self-inverse Hadamard-like transform up to the same 1/4
+/// scaling either direction cancels) to recover the four DC-plane values
+/// that will reconstruct it. For an 8x8 block this degenerates to the
+/// trivial 1x1 case (`llfScale[0] == 1.0`, no inversion needed).
+class _PlacedBlock {
+  _PlacedBlock(this.by, this.bx, this.tt);
+
+  final int by, bx;
+  final TransformType tt;
+  int hfMult = 1;
+
+  /// Per semantic channel (X, Y, B): flat, row-major
+  /// (`tt.pixelHeight` x `tt.pixelWidth`) quantized AC coefficients. The
+  /// LLF corner (`tt.dctSelectHeight` x `tt.dctSelectWidth` positions) is
+  /// unused here — those come from the DC plane on decode.
+  late final List<Int32List> acInt;
+
+  void computeAndQuantize(
+      List<List<Float32List>> planes,
+      double kX,
+      double kB,
+      double refStep,
+      List<double> sd,
+      List<List<Float32List>> rawWeight,
+      List<double> scaleFactor,
+      List<Int32List> dcInt,
+      int bw,
+      List<Float32List> scratch8a,
+      List<Float32List> scratch8b,
+      List<Float32List> scratch16a,
+      List<Float32List> scratch16b) {
+    final n = tt.pixelHeight; // == pixelWidth for both 8x8 and 16x16
+    final coeffBuf = [
+      for (var c = 0; c < 3; c++) List.generate(n, (_) => Float32List(n))
+    ];
+    final scratchA = n == 8 ? scratch8a : scratch16a;
+    final scratchB = n == 8 ? scratch8b : scratch16b;
+    for (var c = 0; c < 3; c++) {
+      forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, n, n, scratchA,
+          scratchB);
+    }
+    // Chroma-from-luma: the decoder always adds kX/kB times the Y
+    // coefficient into X/B, so that must be pre-subtracted here, at every
+    // position including the LLF corner.
+    for (var y = 0; y < n; y++) {
+      for (var x = 0; x < n; x++) {
+        final yv = coeffBuf[1][y][x];
+        coeffBuf[0][y][x] -= kX * yv;
+        coeffBuf[2][y][x] -= kB * yv;
+      }
+    }
+
+    final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+    final numBlocks = llfH * llfW;
+
+    // Adaptive quantization: hfMultiplier can only refine *finer* than the
+    // baseline (dequant is inversely proportional to it — see
+    // doc/spec_notes.md), so smooth/low-energy blocks (where rounding AC to
+    // zero causes visible banding) get a boost; busy blocks stay at the
+    // baseline multiplier, since masking hides quantization noise there and
+    // they already spend plenty of bits.
+    var acEnergy = 0.0;
+    final y1 = coeffBuf[1];
+    for (var y = 0; y < n; y++) {
+      final row = y1[y];
+      for (var x = 0; x < n; x++) {
+        if (y < llfH && x < llfW) continue;
+        acEnergy += row[x] * row[x];
+      }
+    }
+    final relEnergy = math.sqrt(acEnergy) / refStep;
+    hfMult = relEnergy < 1.0
+        ? 4
+        : relEnergy < 4.0
+            ? 2
+            : 1;
+
+    // DC/LLF: invert the decoder's forward-DCT-of-DC-values relationship
+    // (trivial identity when numBlocks == 1).
+    if (numBlocks == 1) {
+      for (var c = 0; c < 3; c++) {
+        dcInt[c][by * bw + bx] = (coeffBuf[c][0][0] / sd[c]).round();
+      }
+    } else {
+      // numBlocks == 4 (16x16): coeffBuf[c][0][0..1] and [1][0..1] are the
+      // true LLF corner (row-major); llfScale is also row-major.
+      for (var c = 0; c < 3; c++) {
+        final pre00 = coeffBuf[c][0][0] / tt.llfScale[0];
+        final pre01 = coeffBuf[c][0][1] / tt.llfScale[1];
+        final pre10 = coeffBuf[c][1][0] / tt.llfScale[2];
+        final pre11 = coeffBuf[c][1][1] / tt.llfScale[3];
+        final p00 = pre00 + pre01 + pre10 + pre11;
+        final p01 = pre00 - pre01 + pre10 - pre11;
+        final p10 = pre00 + pre01 - pre10 - pre11;
+        final p11 = pre00 - pre01 - pre10 + pre11;
+        dcInt[c][by * bw + bx] = (p00 / sd[c]).round();
+        dcInt[c][by * bw + bx + 1] = (p01 / sd[c]).round();
+        dcInt[c][(by + 1) * bw + bx] = (p10 / sd[c]).round();
+        dcInt[c][(by + 1) * bw + bx + 1] = (p11 / sd[c]).round();
+      }
+    }
+
+    acInt = [for (var c = 0; c < 3; c++) Int32List(n * n)];
+    for (var c = 0; c < 3; c++) {
+      final ac = acInt[c];
+      final rw = rawWeight[c];
+      final sfc = scaleFactor[c] / hfMult;
+      for (var y = 0; y < n; y++) {
+        for (var x = 0; x < n; x++) {
+          if (y < llfH && x < llfW) continue;
+          final step = sfc / rw[y][x];
+          ac[y * n + x] = (coeffBuf[c][y][x] / step).round();
+        }
+      }
+    }
+  }
+}
+
+/// Per-transform-type context/order data, shared by every block of that
+/// type (`blockCtx` only depends on channel/orderID/hfMult/lfIndex, and the
+/// default HfBlockContext's empty qfThresholds make the hfMult argument a
+/// no-op regardless of the real per-block adaptive multiplier).
+class _TransformCtx {
+  _TransformCtx(this.tt, HfBlockContext hfctx)
+      : blockCtx = [
+          for (var c = 0; c < 3; c++)
+            HfCoefficients.getBlockContext(hfctx, c, tt.orderID, 1, 0),
+        ],
+        order = getNaturalOrder(tt.orderID) {
+    histCtx = [for (final b in blockCtx) 458 * b + 37 * hfctx.numClusters];
+  }
+
+  final TransformType tt;
+  final List<int> blockCtx;
+  late final List<int> histCtx;
+  final Int32List order;
+  int get numBlocks => tt.dctSelectHeight * tt.dctSelectWidth;
+  int get orderSize => tt.pixelHeight * tt.pixelWidth;
 }
 
 Uint8List _assembleGroupSection(
@@ -362,12 +584,22 @@ void _writeVardctFrameHeader(BitWriter w, VardctL0Config config) {
   w.writeBool(true); // is_last
   // save_as_reference / save_before_ct: not present (isLast == true).
   w.writeU32(0, 0, 0, 0, 4, 16, 5, 48, 10); // name_length = 0
-  // RestorationFilter: explicit, everything off (defaults() has Gaborish
-  // and 2 EPF iterations on, so the top-level all_default shortcut can't
-  // be used).
+  // RestorationFilter: explicit (the frame header's own all_default is
+  // already false for other reasons, so this can't use its shortcut
+  // either way). When enabled, every sub-field still takes its own
+  // library default (customGab/epfSharpCustom/epfWeightCustom/
+  // epfSigmaCustom all false) — only gab and epfIterations flip on.
   w.writeBool(false); // restoration_filter.all_default
-  w.writeBool(false); // gab
-  w.writeBits(0, 2); // epf_iterations
+  w.writeBool(config.enableFilters); // gab
+  if (config.enableFilters) {
+    w.writeBool(false); // customGab -> default gab1/gab2 weights
+    w.writeBits(2, 2); // epf_iterations = 2 (library default)
+    w.writeBool(false); // epfSharpCustom -> default sharpLut
+    w.writeBool(false); // epfWeightCustom -> default channel scale
+    w.writeBool(false); // epfSigmaCustom -> default sigma scales
+  } else {
+    w.writeBits(0, 2); // epf_iterations = 0
+  }
   w.writeU64(0); // restoration_filter extensions
   w.writeU64(0); // frame extensions
 }
@@ -397,10 +629,12 @@ void _writeLfGlobal(BitWriter w, VardctL0Config config, double kX, double kB) {
 }
 
 /// Finds the globally-optimal linear chroma-from-luma coefficients
-/// (least-squares slope of X on Y, and B on Y) over every block's raw
+/// (least-squares slope of X on Y, and B on Y) over every 8x8 block's raw
 /// (pre-correlation) DCT coefficients, DC included — the decoder applies
 /// the same `baseCorrelationX`/`baseCorrelationB` uniformly to DC
-/// (`lf_coefficients.dart`) and HF (`hf_coefficients.dart`) alike.
+/// (`lf_coefficients.dart`) and HF (`hf_coefficients.dart`) alike. Uses the
+/// native 8x8 grid regardless of the eventual HF transform layout, since
+/// this is a whole-image fit either way.
 (double, double) _globalChromaFromLuma(List<List<Float32List>> planes, int bh,
     int bw, List<Float32List> scratch0, List<Float32List> scratch1) {
   var sumYX = 0.0, sumYB = 0.0, sumYY = 0.0;
@@ -464,64 +698,66 @@ void _writeLfCoefficients(
   _writeTrivialModularStream(w, [dcY, dcX, dcB]);
 }
 
-/// LfGroup section, part 2: HfMetadata — every block is a plain 8x8 DCT
-/// (transform type id 0) with a real (adaptive) quant multiplier and zero
-/// chroma-from-luma.
-void _writeHfMetadata(BitWriter w, int bh, int bw, Int32List hfMult) {
-  final nbBlocks = bh * bw;
-  final n = ceilLog2(nbBlocks);
+/// LfGroup section, part 2: HfMetadata — the placed block list (8x8 and/or
+/// 16x16, in raster-scan-with-skip order) with each block's real (adaptive)
+/// quant multiplier, and zero (global-only) chroma-from-luma.
+void _writeHfMetadata(
+    BitWriter w, int bh, int bw, List<_PlacedBlock> placedBlocks) {
+  final nbBlocks = placedBlocks.length;
+  // The decoder doesn't know nbBlocks until *after* this read, so it sizes
+  // the field from the LfGroup's full block count (bh * bw) — an upper
+  // bound it does know ahead of time (nbBlocks <= bh * bw always, since
+  // larger transforms only reduce the block count) — not from nbBlocks
+  // itself (see hf_metadata.dart's `ceilLog2(bh * bw)`).
+  final n = ceilLog2(bh * bw);
   w.writeBits(nbBlocks - 1, n);
   final corrH = (bh + 7) ~/ 8;
   final corrW = (bw + 7) ~/ 8;
   final xFromY = List<int>.filled(corrH * corrW, 0);
   final bFromY = List<int>.filled(corrH * corrW, 0);
-  final blockInfo = List<int>.filled(2 * nbBlocks, 0); // row0: type = 0
+  final blockInfo = List<int>.filled(2 * nbBlocks, 0);
   for (var i = 0; i < nbBlocks; i++) {
-    blockInfo[nbBlocks + i] = hfMult[i] - 1; // row1: multiplier - 1
+    blockInfo[i] = placedBlocks[i].tt.type; // row0: transform type id
+    blockInfo[nbBlocks + i] = placedBlocks[i].hfMult - 1; // row1: mult - 1
   }
   final sharpness = List<int>.filled(bh * bw, 0);
   _writeTrivialModularStream(w, [xFromY, bFromY, blockInfo, sharpness]);
 }
 
 /// HfGlobal + the single HfPass: quant weight tables (the library default
-/// for every one of the 17 parameter slots when [customDctParams] is
-/// null, since this encoder only ever emits transform type 0 (DCT8x8);
-/// otherwise a custom `TransformMode.dct` table for slot 0 — the only one
-/// that matters — with the library default for the other 16, which costs
-/// 0 further bits each), a single HF preset shared by every group
-/// (cheapest choice; costs 0 bits only when [numGroups] == 1), and
-/// natural (unpermuted) coefficient order.
-void _writeHfGlobalAndPass(
-    BitWriter w, int numGroups, List<List<double>>? customDctParams) {
-  w.writeBool(customDctParams == null); // quant_all_default
-  if (customDctParams != null) {
-    w.writeBits(TransformMode.dct, 3); // encoding_mode for parameter slot 0
-    w.writeBits(customDctParams[0].length - 1, 4); // num_params - 1 (= 5)
-    for (final params in customDctParams) {
-      // vals[0] is divided by 64 on read (hf_global.dart's _readDCTParams).
-      w.writeF16(params[0] / 64.0);
-      for (final p in params.skip(1)) {
-        w.writeF16(p);
+/// for every one of the 17 parameter slots when [customParamsByIndex] is
+/// null; otherwise a custom `TransformMode.dct` table for each entry in
+/// [customParamsByIndex] — this encoder only ever emits transform types
+/// 0 (DCT8x8, parameter slot 0) and 4 (DCT16x16, parameter slot 4) — with
+/// the library default for the other 15/16 slots, which costs 0 further
+/// bits each), a single HF preset shared by every group (cheapest choice;
+/// costs 0 bits only when [numGroups] == 1), and natural (unpermuted)
+/// coefficient order.
+void _writeHfGlobalAndPass(BitWriter w, int numGroups,
+    Map<int, List<List<double>>>? customParamsByIndex) {
+  w.writeBool(customParamsByIndex == null); // quant_all_default
+  if (customParamsByIndex != null) {
+    for (var index = 0; index < 17; index++) {
+      final params = customParamsByIndex[index];
+      if (params == null) {
+        w.writeBits(TransformMode.library, 3); // 0 further bits
+        continue;
       }
-    }
-    for (var index = 1; index < 17; index++) {
-      w.writeBits(TransformMode.library, 3); // 0 further bits
+      w.writeBits(TransformMode.dct, 3);
+      w.writeBits(params[0].length - 1, 4); // num_params - 1
+      for (final p in params) {
+        // p[0] is divided by 64 on read (hf_global.dart's _readDCTParams).
+        w.writeF16(p[0] / 64.0);
+        for (final v in p.skip(1)) {
+          w.writeF16(v);
+        }
+      }
     }
   }
   w.writeBits(0, ceilLog1p(numGroups - 1)); // num_hf_presets = 1
   w.writeU32(0, 0x5F, 0, 0x13, 0, 0, 0, 0, 13); // usedOrders = 0
 }
 
-/// PassGroup: the AC (HF) coefficients for every block/channel, entropy
-/// coded. [acInt] is semantic-channel-indexed; each block is a flat
-/// 64-entry (row-major y*8+x) grid (position 0 unused).
-///
-/// The real HF context model (`vardct/hf_coefficients.dart`) spans 495
-/// contexts per (HF preset, block-context cluster); L0 collapses that
-/// entire space onto a single shared histogram (still bit-exact — see
-/// `EntropyCodes.writeHeader`'s `clusterMapDomainSize`) since context
-/// selection has no effect on which VALUES are legal to decode, only on
-/// compression ratio.
 /// numHfPresets(1) * default HfBlockContext.numClusters(15) * 495 contexts
 /// per (preset, cluster) — the domain size the decoder's cluster map
 /// expects for the shared HfPass.contextStream (`hf_pass.dart:80-83`).
@@ -538,68 +774,75 @@ class _GroupTokens {
   final List<int> values = [];
 }
 
-/// Computes one group's AC coefficient tokens. [blockYStart]/[blockXStart]
-/// are this group's origin in the whole image's block grid (row-major,
-/// stride [bwFull]); [groupBh]/[groupBw] are this group's block extent
-/// (up to 32x32, less at the image's right/bottom edge). The non-zero
-/// prediction grid is local to the group, mirroring a fresh
-/// `HfCoefficients` per (pass, group) in the decoder.
+/// Computes one group's AC coefficient tokens, iterating [blocksInGroup] in
+/// their global raster-scan-with-skip (placement) order — the decoder's
+/// `HfCoefficients` iterates every block in that same global order,
+/// skipping ones outside its own group, so relative order within a group
+/// is preserved by construction. The non-zero prediction grid is local to
+/// the group (in 8x8-cell units relative to the group's own origin,
+/// [groupOriginY]/[groupOriginX]), mirroring a fresh `HfCoefficients` per
+/// (pass, group) in the decoder.
 _GroupTokens _computeGroupTokens(
-    int blockYStart,
-    int blockXStart,
-    int groupBh,
-    int groupBw,
-    int bwFull,
-    List<List<Int32List>> acInt,
+    int groupOriginY,
+    int groupOriginX,
+    List<_PlacedBlock> blocksInGroup,
     HfBlockContext hfctx,
-    List<int> blockCtx,
-    List<int> histCtx,
-    Int32List order) {
+    Map<int, _TransformCtx> ctxByType) {
   final nonZeroesGrid = Int32List(3 * 32 * 32);
   final tokens = _GroupTokens();
-  for (var y = 0; y < groupBh; y++) {
-    for (var x = 0; x < groupBw; x++) {
-      final blockIdx = (blockYStart + y) * bwFull + (blockXStart + x);
-      for (final c in _channelOrder) {
-        final block = acInt[c][blockIdx];
-        var countNonZero = 0;
-        var lastNonZeroK = -1;
-        final vals = List<int>.filled(63, 0);
-        for (var k = 0; k < 63; k++) {
-          final o = order[k + 1];
-          final oy = o >> 16, ox = o & 0xFFFF;
-          // flip == true for plain 8x8 DCT (transform_type.dart): the
-          // scan's (y, x) is transposed relative to the coefficient grid.
-          final v = block[ox * 8 + oy];
-          vals[k] = v;
-          if (v != 0) {
-            countNonZero++;
-            lastNonZeroK = k;
-          }
+  for (final block in blocksInGroup) {
+    final ctx = ctxByType[block.tt.type]!;
+    final localY = block.by - groupOriginY;
+    final localX = block.bx - groupOriginX;
+    final numBlocks = ctx.numBlocks;
+    final orderSize = ctx.orderSize;
+    final ucoeffLen = orderSize - numBlocks;
+    final n = block.tt.pixelWidth;
+    for (final c in _channelOrder) {
+      final acData = block.acInt[c];
+      var countNonZero = 0;
+      var lastNonZeroK = -1;
+      final vals = List<int>.filled(ucoeffLen, 0);
+      for (var k = 0; k < ucoeffLen; k++) {
+        final o = ctx.order[k + numBlocks];
+        final oy = o >> 16, ox = o & 0xFFFF;
+        // flip == true for every square DCT this encoder emits: the scan's
+        // (y, x) is transposed relative to the coefficient grid.
+        final v = acData[ox * n + oy];
+        vals[k] = v;
+        if (v != 0) {
+          countNonZero++;
+          lastNonZeroK = k;
         }
+      }
 
-        final predicted =
-            HfCoefficients.getPredictedNonZeroes(nonZeroesGrid, c, y, x);
-        final nonZeroCtx =
-            HfCoefficients.getNonZeroContext(hfctx, predicted, blockCtx[c]);
-        tokens.contexts.add(nonZeroCtx);
-        tokens.values.add(countNonZero);
-        nonZeroesGrid[c * 1024 + y * 32 + x] = countNonZero;
-
-        var remaining = countNonZero;
-        var prevNonzero = false;
-        for (var k = 0; k <= lastNonZeroK; k++) {
-          final prev = k == 0
-              ? (remaining > 4 ? 0 : 1) // orderSize(64) ~/ 16 == 4
-              : (prevNonzero ? 1 : 0);
-          final coefCtx = histCtx[c] +
-              HfCoefficients.getCoefficientContext(k + 1, remaining, 1, prev);
-          final u = _packSigned(vals[k]);
-          tokens.contexts.add(coefCtx);
-          tokens.values.add(u);
-          prevNonzero = u != 0;
-          if (prevNonzero) remaining--;
+      final predicted = HfCoefficients.getPredictedNonZeroes(
+          nonZeroesGrid, c, localY, localX);
+      final nonZeroCtx =
+          HfCoefficients.getNonZeroContext(hfctx, predicted, ctx.blockCtx[c]);
+      tokens.contexts.add(nonZeroCtx);
+      tokens.values.add(countNonZero);
+      final fill = (countNonZero + numBlocks - 1) ~/ numBlocks;
+      for (var iy = 0; iy < block.tt.dctSelectHeight; iy++) {
+        for (var ix = 0; ix < block.tt.dctSelectWidth; ix++) {
+          nonZeroesGrid[c * 1024 + (localY + iy) * 32 + (localX + ix)] = fill;
         }
+      }
+
+      var remaining = countNonZero;
+      var prevNonzero = false;
+      for (var k = 0; k <= lastNonZeroK; k++) {
+        final prev = k == 0
+            ? (remaining > orderSize ~/ 16 ? 0 : 1)
+            : (prevNonzero ? 1 : 0);
+        final coefCtx = ctx.histCtx[c] +
+            HfCoefficients.getCoefficientContext(
+                k + numBlocks, remaining, numBlocks, prev);
+        final u = _packSigned(vals[k]);
+        tokens.contexts.add(coefCtx);
+        tokens.values.add(u);
+        prevNonzero = u != 0;
+        if (prevNonzero) remaining--;
       }
     }
   }
