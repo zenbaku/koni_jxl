@@ -403,6 +403,64 @@ near-ties, verify by real assembly" rule) is the natural next step if
 this is revisited, rather than a better closed-form proxy. Given manga
 is this project's primary use case, variable transforms default off.
 
+### Lossy (VarDCT) encoder — per-region chroma-from-luma
+
+Upgrades L2's global-only chroma-from-luma fit to the spec's real
+per-64x64-region granularity, and — unlike filters/variable-transforms —
+is a genuine, on-by-default win: it only ever adds precision the global
+fit didn't have, at a small, mostly-self-limiting bit cost (see below).
+
+**Two separate correlation values, only one of which varies per region.**
+`LfChannelCorrelation` has exactly one pair of per-frame fields for DC/LF
+(`xFactorLF`/`bFactorLF`, read once, applied to every DC value uniformly
+— `lf_coefficients.dart`) and a *separate* per-64x64-region pair for HF/AC
+(`HfMetadata`'s `xFromY`/`bFromY`, one integer per region — read once per
+LfGroup, applied in `hf_coefficients.dart`'s `_chromaFromLuma`). Both are
+offsets from the same `baseCorrelationX`/`baseCorrelationB` "center"
+values scaled by `colorFactor`, but they're otherwise independent: this
+encoder keeps `xFactorLF`/`bFactorLF` at their neutral value (128, an
+offset of 0) as before, so DC/LF always uses exactly the whole-image
+global fit, and only writes real per-region deltas into `xFromY`/`bFromY`.
+
+**Confirmed no double-counting with the LLF corner, by call order.**
+`HfCoefficients.decode` calls `_chromaFromLuma()` *before*
+`_finalizeLLF()`. At the time `_chromaFromLuma` runs, a block's LLF/DC
+coefficient positions are still zero (AC token decoding never touches
+them), so its per-region correction there is a no-op (`0 += kX_region *
+0`), and `_finalizeLLF` immediately overwrites those same positions with
+the true DC-derived value afterward. So the per-region delta only ever
+has a real effect on true AC coefficients — this confirms (rather than
+assumes) that `_PlacedBlock.computeAndQuantize`'s 16x16 LLF-corner
+inversion should keep using the *global* fit for the LLF corner while
+every other (true AC) position in the same block uses that block's own
+region's fit; this was verified by reading the exact call sequence before
+writing any code, not inferred from matching test output.
+
+**One combined pass, not two.** The per-region fit is computed in the
+same forward-DCT sweep that produces the global fit (`_chromaFromLumaFit`,
+replacing the former `_globalChromaFromLuma`) — the global sums are just
+the region sums added together — so this added no measurable encode-time
+regression (1064x1600 synthetic: 1611ms before, 1631ms after). A region
+with too little AC energy to fit reliably (`sumYY < 1e-6`) falls back to
+the global slope, which costs nothing (rounds to a `0` delta, the
+cheapest symbol in the trivial modular stream).
+
+**Measured trade-off.** On synthetic content with genuinely different
+color relationships in different regions (a reddish left half, a bluish
+right half, both textured), per-region CfL improved RMSE ~26% (3.261 →
+2.403) at essentially the same file size (13632 → 13588 bytes) versus the
+prior global-only fit. On content with no real regional color variation
+(a checkerboard of unrelated gradient/noise/ramp patterns, deliberately
+adversarial), it cost ~1% more bytes (47633 → 48160) for a negligible
+RMSE change — the per-region deltas there are fitting genuine but
+not-worth-encoding local differences, since a region's few encoded
+symbols cost more than the marginal quality they buy on this specific
+synthetic stress test. Real images almost always have at least some
+regional color structure (distinct panels, subjects, backgrounds), so
+this is kept on by default rather than gated like L3's two additions —
+the potential downside is much smaller (~1% vs. 13-31%) and the upside is
+larger and more broadly applicable.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

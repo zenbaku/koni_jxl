@@ -64,10 +64,16 @@ quality lives.
   — a deliberate scope cut (see doc/spec_notes.md); still a real,
   measured win on non-gradient content. `BitWriter` gained `writeF16`
   (mirror of `BitReader.readF16`) to support both of the above.
-- 🔲 **Per-region chroma-from-luma.** Upgrade L2's global CfL to the
+- ✅ **Per-region chroma-from-luma.** Upgraded L2's global-only CfL to the
   spec's real per-64x64-region granularity (`xFromY`/`bFromY` in
-  HfMetadata, currently always 0) for a further, currently-unclaimed
-  quality win, especially on images with spatially-varying color content.
+  HfMetadata, a least-squares fit per region instead of always 0), layered
+  on top of the still-global DC/LF correlation (which the format only
+  ever applies as one frame-wide value — DC has no per-region field).
+  Measured a real, on-by-default win: ~26% RMSE reduction at roughly the
+  same file size on synthetic content with genuinely different color
+  relationships in different regions (e.g. a reddish region next to a
+  bluish one), vs. only ~1% size overhead on content with no real
+  regional color variation to exploit. See doc/spec_notes.md.
 - 🔲 **Multi-LfGroup support.** `encodeLossy` currently caps at 2048x2048
   (single LF group); images larger than that need multiple LfGroup
   sections (each up to 256x256 blocks), not just multiple 256x256 groups

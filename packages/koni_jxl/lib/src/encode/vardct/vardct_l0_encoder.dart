@@ -112,6 +112,13 @@ const _channelOrder = [1, 0, 2];
 final _tt8 = TransformType.byType(0); // DCT 8x8: orderID 0, parameterIndex 0
 final _tt16 = TransformType.byType(4); // DCT 16x16: orderID 2, parameterIndex 4
 
+/// `LfChannelCorrelation.colorFactor`: the resolution of the per-region HF
+/// correlation delta (`xFromY`/`bFromY` in `_writeHfMetadata` — a stored
+/// integer divided by this). 84 is the format's own default; shared here
+/// so `_writeLfGlobal` (which writes it) and the per-region fit (which
+/// must quantize deltas against the exact same value) can't drift apart.
+const _colorFactor = 84;
+
 /// Encodes an interleaved 8-bit RGB image as a VarDCT (lossy) JPEG XL
 /// stream. Requires [width] and [height] to be multiples of 8 and at most
 /// 2048 (single LF group; multi-LfGroup is not yet implemented — see
@@ -189,15 +196,16 @@ Uint8List encodeLossyVardctL0(
       (1 << 16) * lfDequantDefault[c] / (config.globalScale * config.quantLF),
   ];
 
-  // 3. Global chroma-from-luma: the least-squares-optimal X-on-Y and B-on-Y
-  // slopes, applied uniformly (not yet per 64x64 region — see
-  // _writeLfGlobal's doc comment) in place of the format's defaults
-  // (kX = 0, kB = 1.0).
+  // 3. Chroma-from-luma: a global (whole-image) least-squares X-on-Y/B-on-Y
+  // fit (used for baseCorrelationX/B and always for DC/LLF), plus a
+  // per-64x64-region fit layered on top for true AC coefficients (see
+  // _ChromaFromLumaFit's doc comment for why DC can't use the per-region
+  // value) — replacing the format's neutral defaults (kX = 0, kB = 1.0).
   final scratch8a = List.generate(8, (_) => Float32List(8));
   final scratch8b = List.generate(8, (_) => Float32List(8));
   final scratch16a = List.generate(16, (_) => Float32List(16));
   final scratch16b = List.generate(16, (_) => Float32List(16));
-  final (kX, kB) = _globalChromaFromLuma(planes, bh, bw, scratch8a, scratch8b);
+  final cfl = _chromaFromLumaFit(planes, bh, bw, scratch8a, scratch8b);
   // Reference AC step at the first (lowest-frequency, most perceptually
   // important) Y position: the scale against which "how smooth is this
   // block" is judged, so heuristics adapt with `distance` instead of using
@@ -251,8 +259,7 @@ Uint8List encodeLossyVardctL0(
   for (final block in placedBlocks) {
     block.computeAndQuantize(
         planes,
-        kX,
-        kB,
+        cfl,
         refStep,
         sd,
         block.tt == _tt16 ? rawWeight16 : rawWeight8,
@@ -320,9 +327,9 @@ Uint8List encodeLossyVardctL0(
 
   if (numGroups == 1) {
     final body = BitWriter();
-    _writeLfGlobal(body, config, kX, kB);
+    _writeLfGlobal(body, config, cfl.kXGlobal, cfl.kBGlobal);
     _writeLfCoefficients(body, dcInt[0], dcInt[1], dcInt[2]);
-    _writeHfMetadata(body, bh, bw, placedBlocks);
+    _writeHfMetadata(body, bh, bw, placedBlocks, cfl);
     _writeHfGlobalAndPass(body, numGroups, customParamsByIndex);
     clustering.codes.writeHeader(body, clusterMap: clustering.clusterMap);
     _writeAcGroupPayload(body, clustering.codes,
@@ -332,11 +339,11 @@ Uint8List encodeLossyVardctL0(
     out.writeBytes(bodyBytes);
   } else {
     final lfGlobalW = BitWriter();
-    _writeLfGlobal(lfGlobalW, config, kX, kB);
+    _writeLfGlobal(lfGlobalW, config, cfl.kXGlobal, cfl.kBGlobal);
 
     final lfGroupW = BitWriter();
     _writeLfCoefficients(lfGroupW, dcInt[0], dcInt[1], dcInt[2]);
-    _writeHfMetadata(lfGroupW, bh, bw, placedBlocks);
+    _writeHfMetadata(lfGroupW, bh, bw, placedBlocks, cfl);
 
     final hfGlobalW = BitWriter();
     _writeHfGlobalAndPass(hfGlobalW, numGroups, customParamsByIndex);
@@ -432,8 +439,7 @@ class _PlacedBlock {
 
   void computeAndQuantize(
       List<List<Float32List>> planes,
-      double kX,
-      double kB,
+      _ChromaFromLumaFit cfl,
       double refStep,
       List<double> sd,
       List<List<Float32List>> rawWeight,
@@ -454,19 +460,28 @@ class _PlacedBlock {
       forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, n, n, scratchA,
           scratchB);
     }
+
+    final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+    final numBlocks = llfH * llfW;
+
     // Chroma-from-luma: the decoder always adds kX/kB times the Y
-    // coefficient into X/B, so that must be pre-subtracted here, at every
-    // position including the LLF corner.
+    // coefficient into X/B, so that must be pre-subtracted here. The LLF
+    // corner uses the *global* slope (DC/LF never varies per region — see
+    // _ChromaFromLumaFit's doc comment); true AC positions use this
+    // block's own 64x64-pixel region slope.
+    final regionIdx = cfl.regionIndexOf(by, bx);
+    final kXAc = cfl.kXRegion[regionIdx], kBAc = cfl.kBRegion[regionIdx];
     for (var y = 0; y < n; y++) {
+      final isLlfRow = y < llfH;
       for (var x = 0; x < n; x++) {
         final yv = coeffBuf[1][y][x];
+        final isLlf = isLlfRow && x < llfW;
+        final kX = isLlf ? cfl.kXGlobal : kXAc;
+        final kB = isLlf ? cfl.kBGlobal : kBAc;
         coeffBuf[0][y][x] -= kX * yv;
         coeffBuf[2][y][x] -= kB * yv;
       }
     }
-
-    final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
-    final numBlocks = llfH * llfW;
 
     // Adaptive quantization: hfMultiplier can only refine *finer* than the
     // baseline (dequant is inversely proportional to it — see
@@ -605,44 +620,85 @@ void _writeVardctFrameHeader(BitWriter w, VardctL0Config config) {
 }
 
 /// [kX]/[kB] are this image's globally-optimal chroma-from-luma
-/// coefficients (see `_globalChromaFromLuma`), written as a custom (not
-/// default) LfChannelCorrelation with `colorFactor`/`xFactorLF`/
-/// `bFactorLF` left at their neutral defaults so `baseCorrelationX`/
-/// `baseCorrelationB` (the only F16 fields) equal [kX]/[kB] exactly at
-/// both the DC (`lf_coefficients.dart`) and HF (`hf_coefficients.dart`)
-/// stages — this encoder does not yet vary the correlation per 64x64
-/// region (`xFromY`/`bFromY` stay 0 in `_writeHfMetadata`), only globally.
+/// coefficients (see `_chromaFromLumaFit`), written as a custom (not
+/// default) LfChannelCorrelation with `xFactorLF`/`bFactorLF` left at
+/// their neutral defaults so `baseCorrelationX`/`baseCorrelationB` (the
+/// only F16 fields) equal [kX]/[kB] exactly at the DC
+/// (`lf_coefficients.dart`) stage — DC/LF never varies per region (see
+/// `_ChromaFromLumaFit`'s doc comment) — and serve as the *base* that HF's
+/// per-64x64-region delta (`xFromY`/`bFromY`, written in
+/// `_writeHfMetadata`) is layered on top of.
 void _writeLfGlobal(BitWriter w, VardctL0Config config, double kX, double kB) {
   w.writeBool(true); // LfChannelDequantization.all_default
   w.writeU32(config.globalScale, 1, 11, 2049, 11, 4097, 12, 8193, 16);
   w.writeU32(config.quantLF, 16, 0, 1, 5, 1, 8, 1, 16);
   w.writeBool(true); // HfBlockContext default
   w.writeBool(false); // LfChannelCorrelation.all_default
-  w.writeU32(84, 84, 0, 256, 0, 2, 8, 258, 16); // colorFactor = 84 (default)
+  w.writeU32(_colorFactor, 84, 0, 256, 0, 2, 8, 258, 16);
   w.writeF16(kX); // baseCorrelationX
   w.writeF16(kB); // baseCorrelationB
-  w.writeBits(128, 8); // xFactorLF = 128 (neutral: (128-128)/84 == 0)
+  w.writeBits(128, 8); // xFactorLF = 128 (neutral: (128-128)/colorFactor == 0)
   w.writeBits(128, 8); // bFactorLF = 128 (neutral)
   w.writeBool(false); // hasGlobalTree
   // Global modular stream: 0 extra channels -> 0 bits (ModularStream.read
   // short-circuits when channelCount == 0).
 }
 
-/// Finds the globally-optimal linear chroma-from-luma coefficients
-/// (least-squares slope of X on Y, and B on Y) over every 8x8 block's raw
-/// (pre-correlation) DCT coefficients, DC included — the decoder applies
-/// the same `baseCorrelationX`/`baseCorrelationB` uniformly to DC
-/// (`lf_coefficients.dart`) and HF (`hf_coefficients.dart`) alike. Uses the
-/// native 8x8 grid regardless of the eventual HF transform layout, since
-/// this is a whole-image fit either way.
-(double, double) _globalChromaFromLuma(List<List<Float32List>> planes, int bh,
+/// Result of [_chromaFromLumaFit]: a global (whole-image) fit, used for
+/// `baseCorrelationX`/`baseCorrelationB` and always for DC/LLF (the
+/// decoder's `xFactorLF` stays a single per-frame value — see
+/// `_writeLfGlobal`'s doc comment), plus a per-region fit for every
+/// `corrH x corrW` 64x64-pixel region, used for true AC coefficients only
+/// (see `_ChromaFromLumaFit`'s doc comment on why DC never sees the
+/// per-region value).
+class _ChromaFromLumaFit {
+  _ChromaFromLumaFit(
+      this.kXGlobal, this.kBGlobal, this.kXRegion, this.kBRegion, this.corrW);
+  final double kXGlobal;
+  final double kBGlobal;
+  final Float64List kXRegion;
+  final Float64List kBRegion;
+  final int corrW;
+
+  int regionIndexOf(int by, int bx) => (by >> 3) * corrW + (bx >> 3);
+}
+
+/// Finds the least-squares-optimal linear chroma-from-luma slopes (X on Y,
+/// B on Y) both globally (whole image) and per 64x64-pixel (8x8-block)
+/// region, over every native 8x8 block's raw (pre-correlation) AC DCT
+/// coefficients (DC excluded — see doc/spec_notes.md's note on why DC
+/// pollutes an AC-relevant fit) — one forward-DCT pass serves both, since
+/// the per-region sums are simply a finer-grained partition of the same
+/// terms the global sums accumulate.
+///
+/// The decoder only ever varies chroma-from-luma per-region at the HF (AC)
+/// stage (`hf_coefficients.dart`'s `_chromaFromLuma`, driven by
+/// `HfMetadata`'s `xFromY`/`bFromY`); DC/LF always uses the single global
+/// `baseCorrelationX`/`baseCorrelationB` (`lf_coefficients.dart`), and
+/// critically `_chromaFromLuma` runs *before* `_finalizeLLF` in the
+/// decoder, at which point a block's LLF/DC positions are still zero — so
+/// the per-region correction is a no-op there and gets overwritten by the
+/// DC-derived LLF value immediately after. This encoder's own 16x16 LLF
+/// inversion (`_PlacedBlock.computeAndQuantize`) must therefore keep using
+/// the *global* slope for the LLF corner even though true AC coefficients
+/// in the same block use the region's slope. Regions with too little AC
+/// energy to fit reliably fall back to the global slope (a zero
+/// `xFromY`/`bFromY` delta).
+_ChromaFromLumaFit _chromaFromLumaFit(List<List<Float32List>> planes, int bh,
     int bw, List<Float32List> scratch0, List<Float32List> scratch1) {
-  var sumYX = 0.0, sumYB = 0.0, sumYY = 0.0;
+  final corrH = (bh + 7) ~/ 8;
+  final corrW = (bw + 7) ~/ 8;
+  var sumYXGlobal = 0.0, sumYBGlobal = 0.0, sumYYGlobal = 0.0;
+  final sumYXRegion = Float64List(corrH * corrW);
+  final sumYBRegion = Float64List(corrH * corrW);
+  final sumYYRegion = Float64List(corrH * corrW);
   final coeff = [
     for (var c = 0; c < 3; c++) List.generate(8, (_) => Float32List(8))
   ];
   for (var by = 0; by < bh; by++) {
+    final regionRow = by >> 3;
     for (var bx = 0; bx < bw; bx++) {
+      final regionIdx = regionRow * corrW + (bx >> 3);
       for (var c = 0; c < 3; c++) {
         forwardDCT2D(planes[c], coeff[c], by * 8, bx * 8, 0, 0, 8, 8, scratch0,
             scratch1);
@@ -652,15 +708,36 @@ void _writeLfGlobal(BitWriter w, VardctL0Config config, double kX, double kB) {
         for (var x = 0; x < 8; x++) {
           if (y == 0 && x == 0) continue; // DC has its own dedicated scale
           final yv = yRow[x];
-          sumYX += yv * xRow[x];
-          sumYB += yv * bRow[x];
-          sumYY += yv * yv;
+          final yx = yv * xRow[x], yb = yv * bRow[x], yy = yv * yv;
+          sumYXGlobal += yx;
+          sumYBGlobal += yb;
+          sumYYGlobal += yy;
+          sumYXRegion[regionIdx] += yx;
+          sumYBRegion[regionIdx] += yb;
+          sumYYRegion[regionIdx] += yy;
         }
       }
     }
   }
-  if (sumYY < 1e-12) return (0.0, 1.0); // flat image: fall back to defaults
-  return (sumYX / sumYY, sumYB / sumYY);
+  // Flat image: fall back to the format's own neutral defaults.
+  final (kXGlobal, kBGlobal) = sumYYGlobal < 1e-12
+      ? (0.0, 1.0)
+      : (sumYXGlobal / sumYYGlobal, sumYBGlobal / sumYYGlobal);
+  final kXRegion = Float64List(corrH * corrW);
+  final kBRegion = Float64List(corrH * corrW);
+  for (var i = 0; i < corrH * corrW; i++) {
+    // A region with little AC energy has too few (or too small) samples to
+    // fit a reliable slope; falling back to the global value costs nothing
+    // (a zero xFromY/bFromY delta) and avoids fitting noise.
+    if (sumYYRegion[i] < 1e-6) {
+      kXRegion[i] = kXGlobal;
+      kBRegion[i] = kBGlobal;
+    } else {
+      kXRegion[i] = sumYXRegion[i] / sumYYRegion[i];
+      kBRegion[i] = sumYBRegion[i] / sumYYRegion[i];
+    }
+  }
+  return _ChromaFromLumaFit(kXGlobal, kBGlobal, kXRegion, kBRegion, corrW);
 }
 
 /// Writes a modular sub-stream whose bitstream contents are simply
@@ -700,9 +777,11 @@ void _writeLfCoefficients(
 
 /// LfGroup section, part 2: HfMetadata — the placed block list (8x8 and/or
 /// 16x16, in raster-scan-with-skip order) with each block's real (adaptive)
-/// quant multiplier, and zero (global-only) chroma-from-luma.
-void _writeHfMetadata(
-    BitWriter w, int bh, int bw, List<_PlacedBlock> placedBlocks) {
+/// quant multiplier, and the per-64x64-region chroma-from-luma delta
+/// (`xFromY`/`bFromY`, an integer offset from `baseCorrelationX`/`B` scaled
+/// by `colorFactor` — see `_ChromaFromLumaFit`'s doc comment).
+void _writeHfMetadata(BitWriter w, int bh, int bw,
+    List<_PlacedBlock> placedBlocks, _ChromaFromLumaFit cfl) {
   final nbBlocks = placedBlocks.length;
   // The decoder doesn't know nbBlocks until *after* this read, so it sizes
   // the field from the LfGroup's full block count (bh * bw) — an upper
@@ -711,10 +790,17 @@ void _writeHfMetadata(
   // itself (see hf_metadata.dart's `ceilLog2(bh * bw)`).
   final n = ceilLog2(bh * bw);
   w.writeBits(nbBlocks - 1, n);
-  final corrH = (bh + 7) ~/ 8;
-  final corrW = (bw + 7) ~/ 8;
-  final xFromY = List<int>.filled(corrH * corrW, 0);
-  final bFromY = List<int>.filled(corrH * corrW, 0);
+  // cfl.kXRegion/kBRegion are already sized corrH * corrW (see
+  // _chromaFromLumaFit) — the same (bh+7)~/8 x (bw+7)~/8 grid HfMetadata's
+  // xFromY/bFromY channels use.
+  final xFromY = [
+    for (var i = 0; i < cfl.kXRegion.length; i++)
+      ((cfl.kXRegion[i] - cfl.kXGlobal) * _colorFactor).round(),
+  ];
+  final bFromY = [
+    for (var i = 0; i < cfl.kBRegion.length; i++)
+      ((cfl.kBRegion[i] - cfl.kBGlobal) * _colorFactor).round(),
+  ];
   final blockInfo = List<int>.filled(2 * nbBlocks, 0);
   for (var i = 0; i < nbBlocks; i++) {
     blockInfo[i] = placedBlocks[i].tt.type; // row0: transform type id

@@ -170,6 +170,43 @@ void main() {
     expect(rmse, lessThan(1.0), reason: 'gradient rmse $rmse');
   });
 
+  test('per-region chroma-from-luma helps spatially-varying color content', () {
+    if (!_haveDjxl) return;
+    // A single global CfL slope is a poor compromise when different parts
+    // of the image have genuinely different color relationships (e.g. a
+    // reddish region next to a bluish one); per-region CfL (HfMetadata's
+    // xFromY/bFromY) should noticeably improve on the global-only fit
+    // here. Measured ~26% RMSE reduction (3.261 -> 2.403) at roughly the
+    // same file size when this was implemented — see doc/spec_notes.md.
+    const w = 256, h = 256;
+    final pixels = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final texture = (x * 7 + y * 3) & 63;
+        final left = x < w / 2;
+        final r = left ? 200 + texture ~/ 4 : 40 + texture ~/ 2;
+        final g = 80 + texture ~/ 3;
+        final b = left ? 40 + texture ~/ 2 : 200 + texture ~/ 4;
+        pixels[i++] = r.clamp(0, 255);
+        pixels[i++] = g.clamp(0, 255);
+        pixels[i++] = b.clamp(0, 255);
+      }
+    }
+    final encoded = JxlEncoder.encodeLossy(pixels, width: w, height: h);
+    final image = JxlDecoder.decode(encoded);
+    var sumSq = 0.0;
+    for (var c = 0; c < 3; c++) {
+      final ours = channelAsInts(image.channels[c], 255);
+      for (var j = 0; j < w * h; j++) {
+        final d = ours[j] - pixels[j * 3 + c];
+        sumSq += d * d;
+      }
+    }
+    final rmse = math.sqrt(sumSq / (w * h * 3));
+    expect(rmse, lessThan(3.0), reason: 'split-color rmse $rmse');
+  });
+
   test('filters default off: line art and screentone RMSE stays low', () {
     if (!_haveDjxl) return;
     // Regression guard for the enableFilters default. Gaborish/EPF are

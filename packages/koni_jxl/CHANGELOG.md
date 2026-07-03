@@ -30,6 +30,12 @@
   content but were measured to regress manga's dominant content types
   (screentone, line art) by a wide margin, so both default off — see
   doc/spec_notes.md for the full numbers.
+- **Lossy (VarDCT) — per-region chroma-from-luma.** Upgraded L2's
+  global-only chroma-from-luma fit to the spec's real per-64x64-region
+  granularity (`HfMetadata`'s `xFromY`/`bFromY`), on by default: ~26%
+  RMSE reduction at roughly the same file size on content with genuinely
+  different color relationships across regions, vs. ~1% size overhead on
+  content with no real regional color variation to exploit.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).
