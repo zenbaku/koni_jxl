@@ -80,9 +80,9 @@ Modular images have no DC image and stream straight to complete.
 ## Encoder
 
 The lossless encoder emits: explicit image metadata (the all-default
-header implies XYB), a modular frame with a frame-level global MA tree
-(7 gradient-activity contexts over properties 11 and 10, all leaves
-clamped-gradient), YCoCg RCT (type 6) for color, prefix-coded residuals,
+header implies XYB), a modular frame with a per-image LEARNED global MA
+tree (greedy entropy-minimizing splits, clamped-gradient or weighted
+leaves), YCoCg RCT (type 6) for color, prefix-coded residuals,
 one section per 256x256 group with the histograms shared via the
 LfGlobal tree stream. Per image the encoder chooses between LZ77
 (hash-chain matcher over the token-value stream, linear distances
