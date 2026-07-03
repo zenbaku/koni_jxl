@@ -521,6 +521,55 @@ only `HfMetadata`'s per-region `xFromY`/`bFromY` varies by LF group, since
 that's the only field the format itself scopes to the LF group's own
 correlation-region grid rather than the whole frame.
 
+### Lossy (VarDCT) encoder — L4: API, arbitrary dimensions, gates, benchmark
+
+**Arbitrary width/height, not just multiples of 8.** VarDCT always
+operates on an 8-pixel-block-aligned canvas internally regardless of the
+frame's *true* dimensions — confirmed by `writeImageHeader`'s
+`SizeHeader`, which already writes an arbitrary width/height independent
+of any block alignment (the `div8` shortcut is purely a smaller encoding
+for the common case, not a format requirement) and by the decoder's
+`paddedFrameSize` rounding up internally then cropping the output buffer
+at the end. `encodeLossyVardctL0` previously required exact 8-alignment
+purely as an implementation simplification (its own pixel/plane arrays
+were sized to the true dimensions with no separate "padded" concept).
+Fixed by allocating the XYB planes at the padded size and edge-replicating
+the last true row/column into the padding (rather than a black/zero fill,
+which would introduce a sharp, bit-costly edge right at the padding
+boundary), while continuing to write the *true* width/height to the image
+header — exactly how real-world JPEG XL files (almost never exactly
+block-aligned) already work on the decode side. Verified against the
+corpus's `odd_*` goldens (down to a 1x1 image) as well as hand-written
+sizes in `vardct_l0_test.dart`.
+
+**Real-corpus lossy gate** (`test/encode/encoder_lossy_corpus_test.dart`).
+`_d0_` (distance 0) goldens are lossless cjxl re-encodes, so their pixels
+are the exact original source; re-encoding those same pixels lossily at a
+few distances and checking both this decoder and djxl accept the result
+(within a generous RMSE bound) exercises real (if still synthetic —
+`manga_samples/`'s real content can never be used for repo fixtures)
+image statistics that hand-written test patterns don't necessarily cover,
+complementing `vardct_l0_test.dart`'s gradient/screentone/line-art cases.
+Grayscale goldens are replicated to RGB (this encoder is RGB-only) purely
+for test coverage of the corpus's non-block-aligned `odd_*` sizes.
+
+**`tool/bench_lossy_vs_cjxl.dart`**: matches `distance` between this
+encoder and `cjxl`, decodes both through `djxl`, and reports size/RMSE/
+time. Honest result: at every distance tried (0.5-8.0) on both corpus RGB
+sources, this encoder produces files **1.5-5x larger** than even
+`cjxl -e1` (its fastest, least-optimized mode) — the RMSE is often
+comparable or better at the same nominal distance (this encoder's
+`distance`-to-quantizer curve isn't calibrated to match cjxl's specific
+curve — see `VardctL0Config.fromDistance`'s doc comment — so a lower
+apparent RMSE at the same `distance` value doesn't mean better
+compression efficiency at matched quality). The gap is expected and
+matches what's actually implemented: no rate-distortion search (every
+quantization/CfL/transform-size decision here is a cheap heuristic, not
+an optimize-over-real-bytes search) and only 2 of the format's 27
+transform types. This is now a concrete, reproducible number instead of
+an assumption — worth re-running after any future work on transform
+selection or RD search to see whether it actually closes the gap.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

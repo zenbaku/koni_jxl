@@ -3,6 +3,7 @@ library;
 
 export 'src/decoder.dart' show JxlDecoder;
 export 'src/encode/encoder.dart' show JxlEncoder;
+export 'src/encode/vardct/vardct_l0_encoder.dart' show VardctL0Config;
 export 'src/exceptions.dart';
 export 'src/jxl_image.dart' show JxlAnimation, JxlImage;
 export 'src/jxl_info.dart' show JxlInfo;

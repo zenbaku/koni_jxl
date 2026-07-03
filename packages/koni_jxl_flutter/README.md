@@ -32,12 +32,16 @@ normally.
   the sharp final image.
 - **`encodeJxlFromRgba` / `encodeJxlFromUiImage`** — lossless JPEG XL
   encoding in a background isolate.
+- **`encodeJxlLossyFromRgba` / `encodeJxlLossyFromUiImage`** — lossy
+  (VarDCT) encoding in a background isolate (RGB-only; alpha is dropped).
 
 Full lossless (bit-exact) and lossy (VarDCT) decoding, animation,
 splines and streaming come from the underlying
-[`koni_jxl`](https://pub.dev/packages/koni_jxl) package. Unsupported
-files throw `JxlUnsupportedException` with a stable feature id, so you
-can fall back to another pipeline per file.
+[`koni_jxl`](https://pub.dev/packages/koni_jxl) package, which also has
+the details on lossy encoding's current trade-offs (correct and
+djxl-verified, but not yet compression-competitive with cjxl).
+Unsupported files throw `JxlUnsupportedException` with a stable feature
+id, so you can fall back to another pipeline per file.
 
 See the `example/` app for a small gallery.
 

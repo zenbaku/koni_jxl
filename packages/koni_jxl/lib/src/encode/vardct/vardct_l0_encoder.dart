@@ -125,8 +125,15 @@ const _lfGroupBlockDim = 256;
 const _colorFactor = 84;
 
 /// Encodes an interleaved 8-bit RGB image as a VarDCT (lossy) JPEG XL
-/// stream. Requires [width] and [height] to be multiples of 8. Multiple
-/// 256x256 groups and multiple 2048x2048 LF groups are both supported for
+/// stream. [width]/[height] may be any positive size — VarDCT always
+/// operates on an 8-pixel-block-aligned canvas internally, so a size
+/// that isn't already a multiple of 8 is padded up to the next multiple
+/// by replicating the last row/column of pixels (avoiding a sharp,
+/// bit-costly edge at the padding boundary); the true (unpadded)
+/// [width]/[height] is what's written to the image header and what
+/// decoders report/crop to, matching how real-world JPEG XL files
+/// (almost never exactly block-aligned) already work. Multiple 256x256
+/// groups and multiple 2048x2048 LF groups are both supported for
 /// arbitrarily large images.
 Uint8List encodeLossyVardctL0(
   Uint8List rgbPixels, {
@@ -134,22 +141,27 @@ Uint8List encodeLossyVardctL0(
   required int height,
   VardctL0Config config = const VardctL0Config(),
 }) {
-  if (width % 8 != 0 || height % 8 != 0) {
-    throw ArgumentError('requires width and height to be multiples of 8');
+  if (width <= 0 || height <= 0) {
+    throw ArgumentError('empty image');
   }
   if (rgbPixels.length != width * height * 3) {
     throw ArgumentError('expected ${width * height * 3} bytes of RGB');
   }
+  final paddedWidth = (width + 7) & ~7;
+  final paddedHeight = (height + 7) & ~7;
 
-  // 1. Deinterleave, linearize (sRGB EOTF) and transform to XYB in place.
+  // 1. Deinterleave, linearize (sRGB EOTF) and transform to XYB in place,
+  // onto the padded canvas (edge-replicated beyond the true width/height).
   final planes = [
     for (var c = 0; c < 3; c++)
-      List.generate(height, (_) => Float32List(width)),
+      List.generate(paddedHeight, (_) => Float32List(paddedWidth)),
   ];
-  for (var y = 0; y < height; y++) {
+  for (var y = 0; y < paddedHeight; y++) {
+    final srcY = y < height ? y : height - 1;
     final rRow = planes[0][y], gRow = planes[1][y], bRow = planes[2][y];
-    for (var x = 0; x < width; x++) {
-      final o = (y * width + x) * 3;
+    for (var x = 0; x < paddedWidth; x++) {
+      final srcX = x < width ? x : width - 1;
+      final o = (srcY * width + srcX) * 3;
       rRow[x] = rgbPixels[o].toDouble();
       gRow[x] = rgbPixels[o + 1].toDouble();
       bRow[x] = rgbPixels[o + 2].toDouble();
@@ -160,8 +172,8 @@ Uint8List encodeLossyVardctL0(
   }
   XybForward().forward(planes[0], planes[1], planes[2]);
 
-  final bh = height ~/ 8;
-  final bw = width ~/ 8;
+  final bh = paddedHeight ~/ 8;
+  final bw = paddedWidth ~/ 8;
 
   // 2. Quantization tables (mirroring the decoder's default DCT weights and
   // scale factors exactly; see doc/lossy_encoder_plan.md). Scaling only the
@@ -284,8 +296,13 @@ Uint8List encodeLossyVardctL0(
   final ctxByType = {
     for (final tt in [_tt8, _tt16]) tt.type: _TransformCtx(tt, hfctx),
   };
-  final groupsX = ceilDiv(width, 256);
-  final groupsY = ceilDiv(height, 256);
+  // ceilDiv(trueSize, 256) == ceilDiv(paddedSize, 256) always (padding adds
+  // at most 7 pixels, far short of a 256 boundary, and true/padded sizes
+  // coincide exactly whenever trueSize is already a multiple of 256 since
+  // 256 is itself a multiple of 8) — using the padded size here is just
+  // the more directly available one (matches bw/bh already in scope).
+  final groupsX = ceilDiv(paddedWidth, 256);
+  final groupsY = ceilDiv(paddedHeight, 256);
   final numGroups = groupsX * groupsY;
   final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
   for (final block in placedBlocks) {

@@ -112,14 +112,22 @@ void main() {
     _check(8, 160, seed: 1);
   });
 
-  test('rejects sizes that are not multiples of 8', () {
-    expect(
-        () =>
-            JxlEncoder.encodeLossy(Uint8List(32 * 8 * 3), width: 32, height: 8),
-        returnsNormally);
-    expect(
-        () =>
-            JxlEncoder.encodeLossy(Uint8List(31 * 8 * 3), width: 31, height: 8),
+  test('non-multiple-of-8 sizes are padded internally, not rejected', () {
+    // VarDCT always operates on an 8-block-aligned canvas internally; a
+    // size that isn't already a multiple of 8 gets edge-replicated up to
+    // the next one, but the *true* (unpadded) size is what's written to
+    // the header and what decoders report/crop to — _check already
+    // verifies image.width/height match the requested (unpadded) size.
+    _check(31, 8, seed: 30);
+    _check(8, 31, seed: 31);
+    _check(31, 31, seed: 32);
+    _check(1, 1, seed: 33); // smallest possible: pads up to a full 8x8.
+  });
+
+  test('rejects non-positive sizes', () {
+    expect(() => JxlEncoder.encodeLossy(Uint8List(0), width: 0, height: 8),
+        throwsArgumentError);
+    expect(() => JxlEncoder.encodeLossy(Uint8List(0), width: 8, height: -1),
         throwsArgumentError);
   });
 

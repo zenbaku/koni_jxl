@@ -1,9 +1,9 @@
 # koni_jxl
 
-A pure-Dart **JPEG XL (`.jxl`) codec** — decode and losslessly encode,
-with **zero native dependencies** and zero runtime package dependencies.
-Works on every platform Dart runs on: Android, iOS, macOS, Windows,
-Linux, and (with reduced lossy speed) the web.
+A pure-Dart **JPEG XL (`.jxl`) codec** — decode and encode, lossless or
+lossy, with **zero native dependencies** and zero runtime package
+dependencies. Works on every platform Dart runs on: Android, iOS, macOS,
+Windows, Linux, and (with reduced lossy speed) the web.
 
 Correctness is verified **bit-exact against libjxl's `djxl`** on a
 generated corpus, the official conformance suite, and real-world
@@ -26,6 +26,10 @@ final anim = JxlDecoder.decodeAnimation(bytes);
 // Lossless encode from raw RGBA:
 final jxl = JxlEncoder.encodeLossless(rgba,
     width: image.width, height: image.height, hasAlpha: true);
+
+// Lossy (VarDCT) encode from raw RGB, cjxl-like distance knob:
+final lossy = JxlEncoder.encodeLossy(rgb,
+    width: image.width, height: image.height, distance: 1.0);
 ```
 
 For Flutter widgets (`JxlImageProvider`, animation and progressive
@@ -45,7 +49,7 @@ playback, background-isolate encode), use
 - Grayscale/RGB, palette, alpha, 8/16-bit, EXIF orientation
 - Embedded ICC profiles; header-only `JxlInfo.parse`
 
-**Encoding** (lossless)
+**Encoding — lossless** (bit-exact)
 
 - `JxlEncoder.encodeLossless` / `encodeLossless16` from raw pixels
 - `JxlEncoder.encodeImage` for JXL→JXL transcodes
@@ -53,13 +57,29 @@ playback, background-isolate encode), use
   of four entropy modes ({plain, LZ77} x {prefix, ANS}); every output is
   verified bit-exact through this decoder **and** `djxl`
 
+**Encoding — lossy** (VarDCT, `JxlEncoder.encodeLossy`)
+
+- RGB 8-bit input, any width/height (padded internally to the 8-pixel
+  block grid VarDCT requires)
+- Real HF coefficient context model, adaptive per-block quantization,
+  per-region chroma-from-luma, multi-group and multi-LF-group support
+- Gaborish/EPF filters and adaptive 8x8/16x16 transform size are
+  implemented but **off by default** — both help photographic content
+  but measurably hurt manga's screentone/line-art content (see
+  [doc/spec_notes.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/spec_notes.md)
+  in the repository)
+- Correctness is djxl-verified; **compression efficiency is not yet
+  competitive** — currently 1.5-5x larger than `cjxl -e1` at matched
+  `distance` (no rate-distortion search yet, only 2 of 27 transform
+  types), see `tool/bench_lossy_vs_cjxl.dart`
+
 **Robustness** — all decode surfaces throw only `JxlException` on
 malformed input (mutation-fuzz verified); `JxlLimits` caps
 header-driven allocations.
 
 Not yet supported (decoding throws `JxlUnsupportedException` with a
 stable feature id): spot-color rendering, JPEG bitstream reconstruction,
-and float (HDR) sample formats. Encoding is lossless-only.
+and float (HDR) sample formats.
 
 ## Performance
 

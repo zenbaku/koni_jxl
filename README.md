@@ -1,13 +1,13 @@
 # koni_jxl
 
-**Pure Dart JPEG XL (JXL) decoder** — render `.jxl` images in Dart and
-Flutter with **zero native dependencies**. Works on every platform Dart
-runs on: Android, iOS, macOS, Windows, Linux.
+**Pure Dart JPEG XL (JXL) codec** — decode and encode `.jxl` images in
+Dart and Flutter with **zero native dependencies**. Works on every
+platform Dart runs on: Android, iOS, macOS, Windows, Linux.
 
 | Package | Description |
 |---|---|
-| [`packages/koni_jxl`](packages/koni_jxl) | The decoder: pure Dart, zero runtime dependencies |
-| [`packages/koni_jxl_flutter`](packages/koni_jxl_flutter) | Flutter bindings: `JxlImageProvider`, isolate decoding |
+| [`packages/koni_jxl`](packages/koni_jxl) | The codec: pure Dart, zero runtime dependencies |
+| [`packages/koni_jxl_flutter`](packages/koni_jxl_flutter) | Flutter bindings: `JxlImageProvider`, isolate decode/encode |
 
 ## Quick start (Flutter)
 
@@ -93,29 +93,49 @@ large DCTs, dequantization, XYB inverse, gaborish and EPF filters.
 Flutter Web (dart2js) emulates SIMD and decodes lossy images noticeably
 slower.
 
-## Encoding (new)
+## Encoding
 
-`JxlEncoder` provides pure-Dart **lossless encoding** (modular, prefix
-codes, fixed gradient-context tree, YCoCg RCT for color):
+`JxlEncoder` provides pure-Dart **lossless** (modular) and **lossy**
+(VarDCT) encoding:
 
 ```dart
 final jxl = JxlEncoder.encodeLossless(rgbaBytes,
     width: w, height: h, hasAlpha: true);
 final again = JxlEncoder.encodeImage(decodedImage);  // JXL -> JXL transcode
+
+final lossy = JxlEncoder.encodeLossy(rgbBytes,
+    width: w, height: h, distance: 1.0);  // cjxl-like quality knob
 ```
 
-Every encoded file is gated bit-exact through **both** this package's
-decoder and djxl. The encoder picks per image between LZ77, palette
-(≤256 colors) and YCoCg RCT by exact coded-size estimates. It learns a per-image context tree (the biggest lever for lossless
-size), a modular transform (palette / YCoCg RCT), and the smallest of
-four entropy modes ({plain, LZ77} x {prefix, ANS}). Real manga pages
-now land near or below `cjxl -e3` — e.g. a B/W page at ~99% of cjxl -e3
-and a color page at ~81% of cjxl -e3, at ~2 s/page.
-~0.3–1 s/page single-threaded. 8/16-bit gray/RGB with optional alpha;
-lossy encoding is not implemented (use cjxl for that).
+Every encoded file is gated (lossless: bit-exact; lossy: within an RMSE
+threshold) through **both** this package's decoder and djxl.
 
-Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` run the encoder in
-a background isolate.
+**Lossless**: picks per image between LZ77, palette (≤256 colors) and
+YCoCg RCT by exact coded-size estimates. It learns a per-image context
+tree (the biggest lever for lossless size), a modular transform (palette
+/ YCoCg RCT), and the smallest of four entropy modes ({plain, LZ77} x
+{prefix, ANS}). Real manga pages land near or below `cjxl -e3` — e.g. a
+B/W page at ~99% of cjxl -e3 and a color page at ~81% of cjxl -e3, at
+~0.3-1 s/page single-threaded. 8/16-bit gray/RGB with optional alpha.
+
+**Lossy** (`encodeLossy`, RGB 8-bit, any width/height): real HF
+coefficient context model, adaptive per-block quantization, per-region
+chroma-from-luma, multi-group/multi-LF-group support for arbitrarily
+large images. Gaborish/EPF filters and adaptive 8x8/16x16 transform size
+are available but off by default — both measurably help smooth
+photographic content but hurt manga's screentone/line-art content, so
+they're opt-in (see `doc/spec_notes.md` for the numbers). Correctness is
+solid (djxl-verified against the shared corpus and hand-written test
+patterns), but **compression efficiency is not yet competitive**: at
+matched `distance`, files currently run 1.5-5x larger than even
+`cjxl -e1` (see `packages/koni_jxl/tool/bench_lossy_vs_cjxl.dart`), since
+there's no rate-distortion search yet and only 2 of the format's 27
+transform types are implemented — real quality/compactness work, tracked
+in ROADMAP.md, rather than a missing capability.
+
+Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` (lossless) and
+`encodeJxlLossyFromRgba` / `encodeJxlLossyFromUiImage` (lossy, alpha
+dropped) run the encoder in a background isolate.
 
 ## Robustness
 
@@ -127,9 +147,10 @@ legitimately decode very large images).
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). The headline next item is **lossy (VarDCT)
-encoding** — making koni_jxl a complete codec — plus lossless-encoder
-refinements and the remaining decoder gaps.
+See [ROADMAP.md](ROADMAP.md). Lossy (VarDCT) encoding is now implemented
+end to end; what's left there is compression efficiency (a real
+rate-distortion search, full 27-transform-type support), plus
+lossless-encoder refinements and the remaining decoder gaps.
 
 ## Development
 

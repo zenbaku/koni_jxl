@@ -42,6 +42,18 @@
   coding path required no changes — groups were already numbered
   independent of LF groups end-to-end — so this only needed splitting
   DC/HfMetadata into per-LF-group sections and restructuring the TOC.
+- **Lossy (VarDCT) — L4 milestone.** `encodeLossy` now accepts *any*
+  positive width/height, not just multiples of 8 (padded internally via
+  edge replication, true size written to the header — see
+  doc/spec_notes.md). New `encodeJxlLossyFromRgba`/
+  `encodeJxlLossyFromUiImage` Flutter helpers (`koni_jxl_flutter`, alpha
+  dropped). New real-corpus lossy round-trip gate
+  (`test/encode/encoder_lossy_corpus_test.dart`) and a `cjxl`-comparison
+  benchmark (`tool/bench_lossy_vs_cjxl.dart`) — this encoder currently
+  produces files 1.5-5x larger than `cjxl -e1` at matched `distance`,
+  expected given no rate-distortion search and only 2 of 27 transform
+  types, now measured concretely rather than assumed. `VardctL0Config` is
+  now exported from the public API.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).

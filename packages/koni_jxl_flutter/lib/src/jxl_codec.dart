@@ -166,3 +166,50 @@ Future<Uint8List> encodeJxlFromUiImage(ui.Image image) async {
   return Isolate.run(() => JxlEncoder.encodeLossless(rgba,
       width: width, height: height, hasAlpha: true));
 }
+
+/// Lossily (VarDCT) encodes raw RGBA pixels to JPEG XL in a background
+/// isolate. Alpha is dropped: `JxlEncoder.encodeLossy` is RGB-only (see
+/// its doc comment) — use [encodeJxlFromRgba] instead for content where
+/// transparency matters. [distance] is a cjxl-like quality knob (larger =
+/// smaller/lower quality); pass [config] instead for direct control over
+/// the quantizer knobs, e.g. to opt into filters or variable transform
+/// size (both off by default — see `VardctL0Config`'s doc comments for
+/// why: they help photographic content but measurably hurt manga's
+/// screentone/line-art content).
+Future<Uint8List> encodeJxlLossyFromRgba(
+  Uint8List rgba, {
+  required int width,
+  required int height,
+  double distance = 1.0,
+  VardctL0Config? config,
+}) {
+  final rgb = Uint8List(width * height * 3);
+  for (var i = 0, j = 0; i < rgb.length; i += 3, j += 4) {
+    rgb[i] = rgba[j];
+    rgb[i + 1] = rgba[j + 1];
+    rgb[i + 2] = rgba[j + 2];
+  }
+  return Isolate.run(() => JxlEncoder.encodeLossy(rgb,
+      width: width, height: height, distance: distance, config: config));
+}
+
+/// Lossily (VarDCT) encodes a [ui.Image] to JPEG XL (reads back RGBA,
+/// drops alpha, encodes in a background isolate). See
+/// [encodeJxlLossyFromRgba]'s doc comment for the alpha and [config]
+/// caveats.
+Future<Uint8List> encodeJxlLossyFromUiImage(
+  ui.Image image, {
+  double distance = 1.0,
+  VardctL0Config? config,
+}) async {
+  final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (data == null) {
+    throw StateError('could not read pixels from the ui.Image');
+  }
+  final rgba = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+  return encodeJxlLossyFromRgba(rgba,
+      width: image.width,
+      height: image.height,
+      distance: distance,
+      config: config);
+}

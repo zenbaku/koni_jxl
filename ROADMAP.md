@@ -111,9 +111,24 @@ quality lives.
   Full 27-transform-type support (this encoder only added 8x8/16x16) and
   a real rate-distortion search remain open if a non-manga use case ever
   needs them.
-- 🔲 **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)`,
-  Flutter helper, a lossy round-trip gate suite, benchmarks vs cjxl at
-  matched distances.
+- ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
+  since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
+  Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
+  the core encoder); a real-corpus lossy round-trip gate
+  (`test/encode/encoder_lossy_corpus_test.dart`, complementing the
+  hand-written synthetic patterns in `vardct_l0_test.dart`); a
+  `cjxl`-comparison benchmark (`tool/bench_lossy_vs_cjxl.dart`, matched
+  distances, both decoded via `djxl` for size/RMSE/time). The benchmark's
+  honest finding: koni_jxl is 1.5-5x larger than even `cjxl -e1` at the
+  same `distance`, though often at comparable-or-better RMSE — expected,
+  since this encoder has no rate-distortion search and only 2 of 27
+  transform types, but now concretely measured rather than assumed.
+  Also removed an incidental limitation found while building the
+  Flutter helper: `encodeLossyVardctL0` now accepts *any* positive
+  width/height (previously required multiples of 8), padding internally
+  via edge replication and writing the true size to the header — real
+  manga pages are very unlikely to be exactly block-aligned, so this was
+  a real gap for a "Flutter helper" to paper over rather than fix.
 
 Open question to settle before L0: target the **VarDCT** path (the real
 lossy format, big but correct) vs a **lossy-modular** shortcut (quantize
@@ -121,9 +136,12 @@ then encode with the existing modular encoder — far less work, worse
 quality, still "lossy"). Decided: **VarDCT** (a true codec). Detailed implementation plan in
 [doc/lossy_encoder_plan.md](doc/lossy_encoder_plan.md).
 
-L0 is done (see above); L1 (real distance→quant mapping, the actual HF
-context model instead of one collapsed cluster, multi-group support) is
-next.
+L0 through L4 are done (see above), along with per-region chroma-from-luma
+and multi-LF-group support — everything originally scoped in
+doc/lossy_encoder_plan.md. What's left is real quality/compactness work
+(27-transform-type support and a genuine rate-distortion search, tracked
+in L3's write-up above) rather than missing capabilities — see
+`tool/bench_lossy_vs_cjxl.dart`'s output for where the gap actually is.
 
 ---
 

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/painting.dart';
@@ -118,6 +119,36 @@ void main() {
       expect(image.width, w);
       expect(image.height, h);
       expect(image.toRgba8(), rgba);
+    });
+  });
+
+  group('encodeJxlLossyFromRgba', () {
+    test('decodes to approximately the source pixels, alpha dropped', () async {
+      // Not a multiple of 8: exercises encodeLossyVardctL0's internal
+      // padding (see its doc comment) through the Flutter helper too.
+      const w = 37, h = 29;
+      final rgba = Uint8List(w * h * 4);
+      for (var i = 0; i < w * h; i++) {
+        rgba[i * 4] = (i * 3) & 255;
+        rgba[i * 4 + 1] = (i * 5) & 255;
+        rgba[i * 4 + 2] = (i * 7) & 255;
+        rgba[i * 4 + 3] = 128; // alpha must not survive the round-trip
+      }
+      final encoded = await encodeJxlLossyFromRgba(rgba, width: w, height: h);
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, w);
+      expect(image.height, h);
+      final decodedRgba = image.toRgba8();
+      var sumSq = 0.0;
+      for (var i = 0; i < w * h; i++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decodedRgba[i * 4 + c] - rgba[i * 4 + c];
+          sumSq += d * d;
+        }
+        expect(decodedRgba[i * 4 + 3], 255, reason: 'alpha at pixel $i');
+      }
+      final rmse = math.sqrt(sumSq / (w * h * 3));
+      expect(rmse, lessThan(40));
     });
   });
 
