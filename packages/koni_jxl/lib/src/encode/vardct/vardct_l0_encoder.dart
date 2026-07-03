@@ -112,6 +112,11 @@ const _channelOrder = [1, 0, 2];
 final _tt8 = TransformType.byType(0); // DCT 8x8: orderID 0, parameterIndex 0
 final _tt16 = TransformType.byType(4); // DCT 16x16: orderID 2, parameterIndex 4
 
+/// LF groups are 256x256 blocks (2048x2048 pixels) — `frame.dart`'s
+/// `header.lfGroupDim` (`groupDim << 3`, `groupDim` hardcoded to 256 for
+/// VarDCT).
+const _lfGroupBlockDim = 256;
+
 /// `LfChannelCorrelation.colorFactor`: the resolution of the per-region HF
 /// correlation delta (`xFromY`/`bFromY` in `_writeHfMetadata` — a stored
 /// integer divided by this). 84 is the format's own default; shared here
@@ -120,9 +125,9 @@ final _tt16 = TransformType.byType(4); // DCT 16x16: orderID 2, parameterIndex 4
 const _colorFactor = 84;
 
 /// Encodes an interleaved 8-bit RGB image as a VarDCT (lossy) JPEG XL
-/// stream. Requires [width] and [height] to be multiples of 8 and at most
-/// 2048 (single LF group; multi-LfGroup is not yet implemented — see
-/// ROADMAP.md). Multiple 256x256 groups are supported.
+/// stream. Requires [width] and [height] to be multiples of 8. Multiple
+/// 256x256 groups and multiple 2048x2048 LF groups are both supported for
+/// arbitrarily large images.
 Uint8List encodeLossyVardctL0(
   Uint8List rgbPixels, {
   required int width,
@@ -131,9 +136,6 @@ Uint8List encodeLossyVardctL0(
 }) {
   if (width % 8 != 0 || height % 8 != 0) {
     throw ArgumentError('requires width and height to be multiples of 8');
-  }
-  if (width > 2048 || height > 2048) {
-    throw ArgumentError('supports at most 2048x2048 (single LF group)');
   }
   if (rgbPixels.length != width * height * 3) {
     throw ArgumentError('expected ${width * height * 3} bytes of RGB');
@@ -298,13 +300,49 @@ Uint8List encodeLossyVardctL0(
   ];
   final clustering = _chooseAcClustering(groupTokens);
 
+  // 6b. Partition into LF groups (each up to 2048x2048 pixels / 256x256
+  // blocks — `_lfGroupBlockDim`), matching `frame.dart`'s
+  // lfGroupRowStride/numLfGroups exactly. Blocks never straddle an LF
+  // group boundary either (256 blocks is even; same argument as the group
+  // boundary above), so filtering the *global* placedBlocks list down to
+  // one LF group's blocks — in the same relative order — reproduces
+  // exactly the raster-scan-with-skip order that LF group's own
+  // independent placement decoding expects; no separate per-LF-group
+  // placement pass is needed.
+  final lfGroupsX = ceilDiv(bw, _lfGroupBlockDim);
+  final lfGroupsY = ceilDiv(bh, _lfGroupBlockDim);
+  final numLfGroups = lfGroupsX * lfGroupsY;
+  final lfGroupOriginBy = List<int>.filled(numLfGroups, 0);
+  final lfGroupOriginBx = List<int>.filled(numLfGroups, 0);
+  final lfGroupBh = List<int>.filled(numLfGroups, 0);
+  final lfGroupBw = List<int>.filled(numLfGroups, 0);
+  for (var id = 0; id < numLfGroups; id++) {
+    final row = id ~/ lfGroupsX, col = id % lfGroupsX;
+    final originBy = row * _lfGroupBlockDim;
+    final originBx = col * _lfGroupBlockDim;
+    lfGroupOriginBy[id] = originBy;
+    lfGroupOriginBx[id] = originBx;
+    lfGroupBh[id] = math.min(_lfGroupBlockDim, bh - originBy);
+    lfGroupBw[id] = math.min(_lfGroupBlockDim, bw - originBx);
+  }
+  final blocksByLfGroup =
+      List<List<_PlacedBlock>>.generate(numLfGroups, (_) => []);
+  for (final block in placedBlocks) {
+    final id = (block.by ~/ _lfGroupBlockDim) * lfGroupsX +
+        (block.bx ~/ _lfGroupBlockDim);
+    blocksByLfGroup[id].add(block);
+  }
+
   // 7. Assemble the bitstream: image header, VarDCT frame header, then
-  // either the single concatenated section body (numGroups == 1 forces
-  // tocEntryCount == 1 — no byte alignment between LfGlobal / LfGroup /
-  // HfGlobal+HfPass / PassGroup; see doc/lossy_encoder_plan.md's TOC
-  // single-section note) or, for numGroups > 1, one independently
-  // byte-aligned section per (LfGlobal, the single LfGroup, HfGlobal+
-  // HfPass, and each group's PassGroup).
+  // either the single concatenated section body (numGroups == 1 and
+  // numLfGroups == 1 forces tocEntryCount == 1 — no byte alignment
+  // between LfGlobal / LfGroup / HfGlobal+HfPass / PassGroup; see
+  // doc/lossy_encoder_plan.md's TOC single-section note) or, otherwise,
+  // one independently byte-aligned section per (LfGlobal, each LF
+  // group's LfCoefficients+HfMetadata, HfGlobal+HfPass, and each group's
+  // PassGroup) — matching `frame.dart`'s exact TOC section ordering:
+  // LfGlobal, one section per LF group, HfGlobal+passes, then one
+  // PassGroup section per group.
   final usesCustomWeights = config.acScale != 1.0;
   final customParamsByIndex = usesCustomWeights
       ? {
@@ -325,11 +363,11 @@ Uint8List encodeLossyVardctL0(
       xybEncoded: true);
   _writeVardctFrameHeader(out, config);
 
-  if (numGroups == 1) {
+  if (numGroups == 1 && numLfGroups == 1) {
     final body = BitWriter();
     _writeLfGlobal(body, config, cfl.kXGlobal, cfl.kBGlobal);
     _writeLfCoefficients(body, dcInt[0], dcInt[1], dcInt[2]);
-    _writeHfMetadata(body, bh, bw, placedBlocks, cfl);
+    _writeHfMetadata(body, bh, bw, placedBlocks, 0, 0, cfl);
     _writeHfGlobalAndPass(body, numGroups, customParamsByIndex);
     clustering.codes.writeHeader(body, clusterMap: clustering.clusterMap);
     _writeAcGroupPayload(body, clustering.codes,
@@ -341,9 +379,18 @@ Uint8List encodeLossyVardctL0(
     final lfGlobalW = BitWriter();
     _writeLfGlobal(lfGlobalW, config, cfl.kXGlobal, cfl.kBGlobal);
 
-    final lfGroupW = BitWriter();
-    _writeLfCoefficients(lfGroupW, dcInt[0], dcInt[1], dcInt[2]);
-    _writeHfMetadata(lfGroupW, bh, bw, placedBlocks, cfl);
+    final lfGroupSections = <Uint8List>[
+      for (var id = 0; id < numLfGroups; id++)
+        _assembleLfGroupSection(
+            dcInt,
+            bw,
+            lfGroupOriginBy[id],
+            lfGroupOriginBx[id],
+            lfGroupBh[id],
+            lfGroupBw[id],
+            blocksByLfGroup[id],
+            cfl),
+    ];
 
     final hfGlobalW = BitWriter();
     _writeHfGlobalAndPass(hfGlobalW, numGroups, customParamsByIndex);
@@ -351,7 +398,7 @@ Uint8List encodeLossyVardctL0(
 
     final sections = <Uint8List>[
       lfGlobalW.toBytes(),
-      lfGroupW.toBytes(), // numLfGroups == 1 (width/height <= 2048)
+      ...lfGroupSections,
       hfGlobalW.toBytes(),
       for (var g = 0; g < numGroups; g++)
         _assembleGroupSection(clustering.codes,
@@ -363,6 +410,37 @@ Uint8List encodeLossyVardctL0(
     }
   }
   return out.toBytes();
+}
+
+/// One LF group's section: its own slice of the DC/LF plane (extracted
+/// from the whole-image [dcInt], row-major within this LF group's own
+/// [lfGroupBh] x [lfGroupBw] extent) plus HfMetadata for its own blocks
+/// ([blocksInLfGroup], already in this LF group's local raster-scan-with-
+/// skip order — see the comment where `blocksByLfGroup` is built).
+Uint8List _assembleLfGroupSection(
+    List<Int32List> dcInt,
+    int bwFull,
+    int originBy,
+    int originBx,
+    int lfGroupBh,
+    int lfGroupBw,
+    List<_PlacedBlock> blocksInLfGroup,
+    _ChromaFromLumaFit cfl) {
+  Int32List extractLocal(Int32List global) {
+    final out = Int32List(lfGroupBh * lfGroupBw);
+    for (var ly = 0; ly < lfGroupBh; ly++) {
+      final srcRow = (originBy + ly) * bwFull + originBx;
+      out.setRange(ly * lfGroupBw, ly * lfGroupBw + lfGroupBw, global, srcRow);
+    }
+    return out;
+  }
+
+  final w = BitWriter();
+  _writeLfCoefficients(w, extractLocal(dcInt[0]), extractLocal(dcInt[1]),
+      extractLocal(dcInt[2]));
+  _writeHfMetadata(
+      w, lfGroupBh, lfGroupBw, blocksInLfGroup, originBy, originBx, cfl);
+  return w.toBytes();
 }
 
 /// Rough bit-cost proxy (count of above-threshold coefficients, log-weighted
@@ -779,9 +857,20 @@ void _writeLfCoefficients(
 /// 16x16, in raster-scan-with-skip order) with each block's real (adaptive)
 /// quant multiplier, and the per-64x64-region chroma-from-luma delta
 /// (`xFromY`/`bFromY`, an integer offset from `baseCorrelationX`/`B` scaled
-/// by `colorFactor` — see `_ChromaFromLumaFit`'s doc comment).
-void _writeHfMetadata(BitWriter w, int bh, int bw,
-    List<_PlacedBlock> placedBlocks, _ChromaFromLumaFit cfl) {
+/// by `colorFactor` — see `_ChromaFromLumaFit`'s doc comment). [bh]/[bw]
+/// are this *LF group's own* (possibly edge-clamped) block extent;
+/// [originBy]/[originBx] are its block-grid origin in the whole image,
+/// used to slice the matching sub-rectangle out of [cfl]'s whole-image
+/// per-region fit (region boundaries always align with LF group
+/// boundaries: both are multiples of 8 blocks).
+void _writeHfMetadata(
+    BitWriter w,
+    int bh,
+    int bw,
+    List<_PlacedBlock> placedBlocks,
+    int originBy,
+    int originBx,
+    _ChromaFromLumaFit cfl) {
   final nbBlocks = placedBlocks.length;
   // The decoder doesn't know nbBlocks until *after* this read, so it sizes
   // the field from the LfGroup's full block count (bh * bw) — an upper
@@ -790,16 +879,27 @@ void _writeHfMetadata(BitWriter w, int bh, int bw,
   // itself (see hf_metadata.dart's `ceilLog2(bh * bw)`).
   final n = ceilLog2(bh * bw);
   w.writeBits(nbBlocks - 1, n);
-  // cfl.kXRegion/kBRegion are already sized corrH * corrW (see
-  // _chromaFromLumaFit) — the same (bh+7)~/8 x (bw+7)~/8 grid HfMetadata's
-  // xFromY/bFromY channels use.
+  final corrH = (bh + 7) ~/ 8;
+  final corrW = (bw + 7) ~/ 8;
+  final regionRowOffset = originBy >> 3;
+  final regionColOffset = originBx >> 3;
   final xFromY = [
-    for (var i = 0; i < cfl.kXRegion.length; i++)
-      ((cfl.kXRegion[i] - cfl.kXGlobal) * _colorFactor).round(),
+    for (var ry = 0; ry < corrH; ry++)
+      for (var rx = 0; rx < corrW; rx++)
+        ((cfl.kXRegion[(regionRowOffset + ry) * cfl.corrW +
+                        (regionColOffset + rx)] -
+                    cfl.kXGlobal) *
+                _colorFactor)
+            .round(),
   ];
   final bFromY = [
-    for (var i = 0; i < cfl.kBRegion.length; i++)
-      ((cfl.kBRegion[i] - cfl.kBGlobal) * _colorFactor).round(),
+    for (var ry = 0; ry < corrH; ry++)
+      for (var rx = 0; rx < corrW; rx++)
+        ((cfl.kBRegion[(regionRowOffset + ry) * cfl.corrW +
+                        (regionColOffset + rx)] -
+                    cfl.kBGlobal) *
+                _colorFactor)
+            .round(),
   ];
   final blockInfo = List<int>.filled(2 * nbBlocks, 0);
   for (var i = 0; i < nbBlocks; i++) {

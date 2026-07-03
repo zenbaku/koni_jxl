@@ -123,11 +123,13 @@ void main() {
         throwsArgumentError);
   });
 
-  test('rejects sizes larger than 2048 (single LF group only)', () {
-    expect(
-        () => JxlEncoder.encodeLossy(Uint8List(2056 * 8 * 3),
-            width: 2056, height: 8),
-        throwsArgumentError);
+  test('multi-LF-group images (width or height > 2048)', () {
+    // LF groups are 2048x2048 pixels; these exercise 2 LF groups in one
+    // dimension, 2 in the other, and 2x2 (four) LF groups respectively,
+    // including a non-2048-aligned edge (a partial, clamped LF group).
+    _check(2056, 8, seed: 20);
+    _check(8, 2056, seed: 21);
+    _check(2056, 2056, seed: 22);
   });
 
   test('multi-group images (width or height > 256)', () {

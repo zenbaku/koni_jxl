@@ -461,6 +461,66 @@ this is kept on by default rather than gated like L3's two additions —
 the potential downside is much smaller (~1% vs. 13-31%) and the upside is
 larger and more broadly applicable.
 
+### Lossy (VarDCT) encoder — multi-LF-group support
+
+Removes the 2048x2048 ceiling by splitting images of any size into
+multiple LF groups (`frame.dart`'s `header.lfGroupDim`, `groupDim << 3` =
+2048px, hardcoded `groupDim` = 256 for VarDCT — this project's encoder
+never varies either). The key research finding that made this a small
+change rather than a large one: **the AC entropy coding path needed zero
+modifications.**
+
+**Groups are already numbered independent of LF groups.** `frame.dart`'s
+`numGroups`/`groupRowStride` are computed purely from the *frame's*
+dimensions (`ceilDiv(boundsWidth, groupDim)` etc.), with no reference to
+LF groups at all; a group's owning LF group is a derived, secondary fact
+(`getLFGroupForGroup`). This project's `_computeGroupTokens` already used
+purely global (whole-image) group/block coordinates throughout — it never
+needed to know about LF groups to begin with, so multi-LF-group support
+required no changes there.
+
+**Confirmed algebraically, not assumed, that HfMetadata's LF-group-local
+block coordinates don't change the group-relative math.** `HfCoefficients`
+computes `groupY = posY - groupPosY` where `posY = meta.blockY[i]` is
+LF-group-*local* (`HfMetadata`'s own block positions are relative to its
+owning LF group's origin) and `groupPosY = frame.groupPosInLFGroup(...)`
+is the group's position *within* its LF group. Substituting definitions:
+`groupY = (globalBlockY - lfGroupOriginY) - (groupGlobalOriginY -
+lfGroupOriginY) = globalBlockY - groupGlobalOriginY` — the LF-group-local
+indirection cancels exactly, leaving the same formula this project's
+`_computeGroupTokens` already used with purely global coordinates. This
+was verified by writing out the substitution before touching any code,
+not inferred from test results passing.
+
+**Blocks never straddle an LF group boundary,** by the same argument
+already used for the 32-block group boundary (see the L3 write-up above):
+LF groups are 256 blocks (even), 16x16 blocks only start at globally-even
+coordinates with a 2-block footprint, and a footprint starting at an even
+position can never straddle an even-aligned boundary. Consequently,
+filtering the *global* placed-block list down to one LF group's blocks —
+in the same relative order — reproduces exactly the raster-scan-with-skip
+order that LF group's own independent placement decoding expects. No
+separate per-LF-group placement pass was needed; the existing whole-image
+layout decision (`_should16x16`, unchanged) is simply partitioned by LF
+group afterward.
+
+**What actually needed new code:** splitting the whole-image DC (LF)
+plane and per-region chroma-from-luma fit into per-LF-group slices
+(`_assembleLfGroupSection`, extracting each LF group's own rectangular
+sub-array from the whole-image `dcInt` and `_ChromaFromLumaFit`'s
+`kXRegion`/`kBRegion` via an origin offset — region boundaries always
+align with LF group boundaries, both being multiples of 8 blocks), and
+restructuring the TOC/section assembly to match `frame.dart`'s exact
+layout: LfGlobal, one section per LF group, HfGlobal+passes, then one
+PassGroup section per group (`1 + numLfGroups + 1 + numGroups` sections
+when not using the single-section shortcut, which now additionally
+requires `numLfGroups == 1`, not just `numGroups == 1`). `LfGlobal`
+(`baseCorrelationX`/`B`, `globalScale`, `quantLF`, quant weight tables)
+all stay genuinely frame-wide, read once regardless of LF group count —
+only `HfMetadata`'s per-region `xFromY`/`bFromY` varies by LF group, since
+that's the only field the format itself scopes to the LF group's own
+correlation-region grid rather than the whole frame.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

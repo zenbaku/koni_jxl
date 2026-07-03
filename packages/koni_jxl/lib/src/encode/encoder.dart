@@ -116,12 +116,14 @@ final class JxlEncoder {
     return _encodeModular(setup, planes);
   }
 
-  /// Lossily (VarDCT) encodes an interleaved 8-bit RGB image (L0/L1 of
-  /// doc/lossy_encoder_plan.md: 8x8-DCT-only, real HF coefficient context
-  /// model, multi-group; still filters-off and single-LfGroup). [width]
-  /// and [height] must be multiples of 8 and at most 2048. [distance] is a
-  /// cjxl-like quality knob (larger = smaller/lower quality); pass [config]
-  /// instead for direct control over the quantizer knobs.
+  /// Lossily (VarDCT) encodes an interleaved 8-bit RGB image
+  /// (doc/lossy_encoder_plan.md's L0-L3 plus per-region chroma-from-luma:
+  /// real HF coefficient context model, multi-group, multi-LF-group,
+  /// adaptive quantization; filters and variable transform size are
+  /// opt-in via [config], off by default). [width] and [height] must be
+  /// multiples of 8. [distance] is a cjxl-like quality knob (larger =
+  /// smaller/lower quality); pass [config] instead for direct control
+  /// over the quantizer knobs.
   static Uint8List encodeLossy(
     Uint8List rgbPixels, {
     required int width,

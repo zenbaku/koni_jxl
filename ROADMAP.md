@@ -49,8 +49,8 @@ quality lives.
   (a hard, empirically-discovered bitstream limit — see doc/spec_notes.md)
   with the smallest-actual-bytes choice made per image rather than a fixed
   budget. Multi-group support removed the 256x256 ceiling — up to
-  2048x2048 (single LF group; true multi-LfGroup is still open, tracked
-  below).
+  2048x2048 (single LF group at the time; multi-LfGroup, removing that
+  ceiling too, followed later — see below).
 - ✅ **L2 — perceptual quantization.** Adaptive per-block quant multiplier
   from a Y AC-energy heuristic (smooth/low-energy blocks get boosted
   precision to avoid banding — measured ~65-70% RMSE reduction on smooth
@@ -74,11 +74,15 @@ quality lives.
   relationships in different regions (e.g. a reddish region next to a
   bluish one), vs. only ~1% size overhead on content with no real
   regional color variation to exploit. See doc/spec_notes.md.
-- 🔲 **Multi-LfGroup support.** `encodeLossy` currently caps at 2048x2048
-  (single LF group); images larger than that need multiple LfGroup
-  sections (each up to 256x256 blocks), not just multiple 256x256 groups
-  within one. Lower priority than L2/L3 — manga pages are well under this
-  limit.
+- ✅ **Multi-LfGroup support.** Removed the 2048x2048 ceiling: images of
+  any size now split into multiple LF groups (each up to 2048x2048
+  pixels / 256x256 blocks), not just multiple 256x256 groups within one.
+  A key simplification made this tractable: since blocks never straddle
+  an LF group boundary (the same even-block-alignment argument used for
+  group boundaries — see doc/spec_notes.md), and groups are already
+  numbered independent of LF groups end-to-end, the *only* new work was
+  splitting DC/HfMetadata into per-LF-group sections and restructuring
+  the TOC; the AC entropy coding path needed zero changes.
 - ✅ **L3 — transform selection + filters.** Two independent additions,
   both opt-in and **off by default** — both are real, djxl-verified,
   working capabilities that help smooth/photographic content but were

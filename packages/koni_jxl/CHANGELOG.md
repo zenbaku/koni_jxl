@@ -36,6 +36,12 @@
   RMSE reduction at roughly the same file size on content with genuinely
   different color relationships across regions, vs. ~1% size overhead on
   content with no real regional color variation to exploit.
+- **Lossy (VarDCT) — multi-LF-group support.** `encodeLossy` no longer
+  caps at 2048x2048: images of any size now split into multiple LF
+  groups as needed, matching the format's own structure. The AC entropy
+  coding path required no changes — groups were already numbered
+  independent of LF groups end-to-end — so this only needed splitting
+  DC/HfMetadata into per-LF-group sections and restructuring the TOC.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).
