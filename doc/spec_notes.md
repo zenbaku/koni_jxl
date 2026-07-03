@@ -622,17 +622,88 @@ histogram already compresses them well — not the next priority.
 impact, least risky first): a real per-pixel context tree for DC
 (spatial-correlation-aware context splitting, mirroring the lossless
 encoder's `learnContextTree`, could extract more from the *residual*
-distribution than a single shared histogram does); trying the
-self-correcting weighted predictor for DC too (predictor 6, `encoder.dart`
-already implements it for lossless — DC may behave more like photographic
-content, where WP tends to win over plain gradient in the lossless
-encoder's own A/B testing); a similar gradient-style predictor for
-`blockInfo`'s `hfMult` row specifically (spatially correlated but a much
-smaller absolute win than DC was); and, on the AC side (now the dominant
-term again post-fix), replacing the crude 3-bucket adaptive-quantization
-heuristic and the cheap bit-cost transform-size proxy (see the L3
-write-up above) with something closer to real rate-distortion search —
-the largest remaining lever, and the most implementation work.
+distribution than a single shared histogram does); a similar
+gradient-style predictor for `blockInfo`'s `hfMult` row specifically
+(spatially correlated but a much smaller absolute win than DC was); and,
+on the AC side (now the dominant term again post-fix), replacing the
+crude 3-bucket adaptive-quantization heuristic and the cheap bit-cost
+transform-size proxy (see the L3 write-up above) with something closer
+to real rate-distortion search — the largest remaining lever, and the
+most implementation work.
+
+### Lossy (VarDCT) encoder — compression efficiency: weighted predictor for DC
+
+Follow-up to the gradient-prediction fix above: `_writeLfCoefficients`
+now tries predictor 6 (the self-correcting weighted predictor, "WP") in
+addition to predictor 5 (clamped gradient) for all three DC channels
+together, and keeps whichever assembles smaller real bytes — the exact
+same "try gradient and WP, keep the smaller actual output" pattern
+`encoder.dart`'s lossless `bestForPredictor` already uses. `wpTileResiduals`
+(`encode/wp_predictor.dart`) already existed as a decoder-verified,
+directly-callable forward mirror of predictor 6's decode-side state
+machine (built for the lossless encoder), so this needed no new
+prediction logic — only wiring it up as a second candidate alongside the
+existing gradient path, with the winner decided by two cheap probe writes
+(`BitWriter.bitsWritten`, no `toBytes()` side effects) before the real one.
+
+**Measured effect**: content-dependent, as expected (this mirrors the
+lossless encoder's own experience — WP tends to win on photographic/
+tonal content, gradient on flatter or line-art-like content). On
+`color_cover` (a real photo) WP wins and shaves a further ~5% off the
+already-fixed size (172830 → 164230 bytes at distance 0.5, cutting the
+`cjxl -e1` ratio from 1.59x to 1.51x); on `palette16` (a low-color-count
+synthetic image) gradient already wins and WP never gets chosen, so the
+output is byte-identical to the gradient-only version. Since the choice
+is "try both, keep smaller," there's no downside case — output can only
+get smaller or stay the same, never worse — so no size-based regression
+test was added for this specifically (a synthetic test pattern that
+reliably shows WP's win by more than ~1% wasn't easy to construct by
+hand; the real-corpus gate exercises this path's *correctness* already,
+which is what would actually break if this regressed).
+
+### Lossy (VarDCT) encoder — investigated but not changed: adaptive-quant heuristic tuning
+
+After the two DC fixes above, re-measuring the per-section byte
+breakdown on `color_cover` showed AC coefficients are again clearly the
+dominant term (57% of total at distance 0.5, DC down to 34%) — so the
+next investigation targeted the adaptive per-block quantization
+heuristic (`hfMult`'s 3-bucket `relEnergy<1.0→4, <4.0→2, else 1`
+threshold, from L2), on the theory that a heuristic tuned specifically to
+prevent banding on smooth *gradients* might be over-triggering (spending
+extra bits) on general photographic content that doesn't have the same
+banding risk.
+
+**What was tried, empirically, without changing any shipped code**:
+disabling the boost entirely (`hfMult` forced to 1 always) on
+`color_cover` at distance 1.0 dropped size from 133295 → 114580 bytes
+while RMSE only rose 1.78 → 2.10 (still better than `cjxl -e1`'s 2.70 at
+that distance) — confirming the heuristic *is* spending real bits on this
+content for a quality margin beyond what's needed to match cjxl's own
+apparent target quality at that label. A narrower 2-bucket version
+(`relEnergy<1.0→4, else 1`, dropping the middle `2x` bucket) landed
+in between (119141 bytes, RMSE 2.06) — not a clear improvement over
+either extreme, and it pushed the smooth-gradient regression test's RMSE
+from a comfortable margin under 1.0 up to 0.940, uncomfortably close to
+that threshold. Separately, reducing `acScale` alone (coarsening AC
+quantization uniformly, independent of the adaptive heuristic) showed
+strongly diminishing returns: even a 70% reduction in fineness
+(`acScale * 0.3`) only cut size by 21% while RMSE was still better than
+`cjxl -e1`'s — the gap isn't fixable by just "quantize coarser" either.
+
+**Why nothing shipped from this**: every variant tried is a different
+point on roughly the same rate-distortion curve, not a strictly better
+one — the *shape* of the curve is what would need to improve, which
+means the fix is a real per-block cost/benefit heuristic (does this
+block's specific content actually risk visible banding at the baseline
+step, weighed against its bit cost) or an actual rate-distortion search,
+not a threshold tweak. The current 3-bucket heuristic stays as-is: it's
+verified to fix the specific banding case it was built for
+(`vardct_l0_test.dart`'s smooth-gradient RMSE-under-1.0 gate), and
+none of the alternatives tried were unambiguously better across both
+that case and general photo content. This is recorded here specifically
+so a future attempt doesn't have to rediscover it — the real fix belongs
+with a genuine RD search (see the L3 write-up above), not another
+threshold adjustment.
 
 ## Robustness
 

@@ -128,7 +128,7 @@ manga's screentone/line-art content, so they're opt-in (see
 `doc/spec_notes.md` for the numbers). Correctness is solid
 (djxl-verified against the shared corpus and hand-written test
 patterns); **compression efficiency is improving but not yet
-competitive**: at matched `distance`, files currently run 1.2-2.8x
+competitive**: at matched `distance`, files currently run 1.2-2.5x
 larger than `cjxl -e1` (see
 `packages/koni_jxl/tool/bench_lossy_vs_cjxl.dart`), since there's no
 rate-distortion search yet and only 2 of the format's 27 transform types

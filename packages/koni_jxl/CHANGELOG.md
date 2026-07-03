@@ -61,6 +61,11 @@
   encoder already uses, cutting DC size 49-75% and total file size 25-27%
   on the corpus's two RGB test images, roughly halving the size gap vs
   `cjxl -e1`.
+- **Lossy (VarDCT) — weighted predictor for DC.** DC coefficients now
+  also try the self-correcting weighted predictor (predictor 6) alongside
+  the clamped-gradient predictor, keeping whichever compresses smaller —
+  a further ~5% reduction on real photo content where WP wins, no change
+  where gradient already wins.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).

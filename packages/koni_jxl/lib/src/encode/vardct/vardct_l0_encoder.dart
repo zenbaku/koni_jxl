@@ -13,6 +13,7 @@ import '../../vardct/hf_pass.dart' show getNaturalOrder;
 import '../../vardct/transform_type.dart' show TransformMode, TransformType;
 import '../entropy_writer.dart';
 import '../headers.dart';
+import '../wp_predictor.dart';
 import 'xyb_forward.dart';
 
 /// Lossy (VarDCT) encoder (doc/lossy_encoder_plan.md's L0/L1/L2/L3): 8x8
@@ -925,19 +926,42 @@ List<int> _gradientResiduals(Int32List values, int width) {
 /// are semantic-channel-indexed, block-raster-order (by * bw + bx) integer
 /// DC values, [width] wide; the modular sub-stream itself is written in
 /// the decoder's Y, X, B channel order (`vardct/lf_coefficients.dart`'s
-/// `cMap`), gradient-predicted (see `_gradientResiduals`) rather than
-/// coded raw.
+/// `cMap`). Tries predictor 5 (clamped gradient, `_gradientResiduals`)
+/// and predictor 6 (self-correcting weighted, `wpTileResiduals` — the
+/// exact same decoder-verified computation `encoder.dart`'s lossless
+/// path already uses) for all three channels together and keeps whichever
+/// assembles smaller real bytes, mirroring that same lossless encoder's
+/// "try gradient and WP, keep the smaller actual output" pattern
+/// (`bestForPredictor` in `encoder.dart`) — WP tends to win on
+/// photographic/tonal content, gradient on flatter content, and DC
+/// planes see both depending on image and channel (X/B are
+/// chroma-from-luma residuals, often flatter than Y).
 void _writeLfCoefficients(
     BitWriter w, Int32List dcX, Int32List dcY, Int32List dcB, int width) {
   w.writeBits(0, 2); // extraPrecision = 0
-  _writeModularStream(
-      w,
-      [
-        _gradientResiduals(dcY, width),
-        _gradientResiduals(dcX, width),
-        _gradientResiduals(dcB, width),
-      ],
-      predictor: 5);
+  final height = dcY.length ~/ width;
+  final gradResiduals = [
+    _gradientResiduals(dcY, width),
+    _gradientResiduals(dcX, width),
+    _gradientResiduals(dcB, width),
+  ];
+  Int32List wpOf(Int32List values) {
+    final out = Int32List(values.length);
+    wpTileResiduals(values, width, height, out);
+    return out;
+  }
+
+  final wpResiduals = [wpOf(dcY), wpOf(dcX), wpOf(dcB)];
+
+  final gradProbe = BitWriter();
+  _writeModularStream(gradProbe, gradResiduals, predictor: 5);
+  final wpProbe = BitWriter();
+  _writeModularStream(wpProbe, wpResiduals, predictor: 6);
+  if (wpProbe.bitsWritten < gradProbe.bitsWritten) {
+    _writeModularStream(w, wpResiduals, predictor: 6);
+  } else {
+    _writeModularStream(w, gradResiduals, predictor: 5);
+  }
 }
 
 /// LfGroup section, part 2: HfMetadata — the placed block list (8x8 and/or

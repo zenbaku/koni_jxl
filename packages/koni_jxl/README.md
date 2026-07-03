@@ -70,7 +70,7 @@ playback, background-isolate encode), use
   [doc/spec_notes.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/spec_notes.md)
   in the repository)
 - Correctness is djxl-verified; **compression efficiency is improving
-  but not yet competitive** — currently 1.2-2.8x larger than `cjxl -e1`
+  but not yet competitive** — currently 1.2-2.5x larger than `cjxl -e1`
   at matched `distance` (no rate-distortion search yet, only 2 of 27
   transform types), see `tool/bench_lossy_vs_cjxl.dart`
 

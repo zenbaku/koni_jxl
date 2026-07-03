@@ -156,6 +156,17 @@ output for where the gap actually is.
   the ranked list of what's likely next (a DC context tree, the
   self-correcting weighted predictor for DC, then AC-side rate-distortion
   search — the largest remaining lever and the most work).
+- ✅ **Compression efficiency, round 2: weighted predictor for DC.**
+  `_writeLfCoefficients` now tries predictor 6 (self-correcting weighted,
+  reusing `encode/wp_predictor.dart`'s already decoder-verified,
+  lossless-encoder-shared `wpTileResiduals`) alongside predictor 5
+  (clamped gradient) and keeps whichever assembles smaller real bytes —
+  the same "try both, keep smaller" pattern the lossless encoder already
+  uses. Content-dependent, no-downside win: ~5% smaller on real photo
+  content where WP wins (`color_cover`: 1.59x → 1.51x vs `cjxl -e1`),
+  byte-identical where gradient already wins (`palette16`, no regression).
+  A DC context tree and AC-side rate-distortion search remain the larger
+  levers — see doc/spec_notes.md.
 
 ---
 
