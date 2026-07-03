@@ -570,6 +570,70 @@ transform types. This is now a concrete, reproducible number instead of
 an assumption — worth re-running after any future work on transform
 selection or RD search to see whether it actually closes the gap.
 
+### Lossy (VarDCT) encoder — compression efficiency: DC gradient prediction
+
+The first (and by far largest) fix found by instrumenting
+`tool/bench_lossy_vs_cjxl.dart`'s gap with a per-section byte breakdown
+(`jxl.encdebug`'s new `lfGroup: dc=... meta=...` line): **DC (LF)
+coefficients alone accounted for more than half this encoder's total
+output size** on real photo content (127697 of 235904 bytes, 54%, on the
+corpus's `color_cover` at `distance = 0.5`) — more than the AC
+coefficients, which is where essentially all of this project's tuning
+effort had gone. The cause: every prior phase (L0-L4) wrote DC through
+`_writeTrivialModularStream`'s single-leaf, predictor-0 ("Zero", i.e. no
+prediction at all) MA tree — every DC value was entropy-coded as an
+independent symbol through one shared histogram, with none of the strong
+block-to-block spatial correlation real image content has (neighboring
+8x8 blocks rarely differ much in average brightness/color) being
+exploited at all.
+
+**Fix**: `_gradientResiduals` computes predictor 5 (clamped gradient:
+`clamp(w + n - nw, min(w, n), max(w, n))`) residuals for each DC channel
+before entropy coding, and `_writeLfCoefficients` writes predictor 5 (not
+0) in the MA tree leaf. This predictor was not written from scratch: it's
+the *exact* formula `modular/modular_channel.dart`'s decode-side
+`prediction(y, x, 5)` already implements (verified position-by-position,
+including all four x=0/y=0 edge-case combinations, against `_west`/
+`_north`/`_northWest`'s exact fallback behavior before writing any code)
+and the same one `encoder.dart`'s lossless `_tileResiduals` already uses
+and gates bit-exact against djxl — so this carried no risk of a new,
+unverified decode-side assumption. The context/entropy model itself is
+still a single shared histogram per DC channel (no per-pixel property
+tree, unlike the lossless encoder's `learnContextTree`) — the predictor
+alone removes the bulk of the redundancy; a context tree remains a
+possible follow-up (see below) but wasn't needed to capture the bulk of
+this win.
+
+**Measured effect**: on `color_cover` at distance 0.5, DC dropped
+127697 → 64623 bytes (49%), and *total file size* dropped 235904 → 172830
+bytes (27%). On `palette16` at distance 0.5, DC dropped 20833 → 5259
+bytes (75%), total 61057 → 45483 (25%). Against `cjxl -e1` at matched
+distance, the size ratio improved from 2.17-4.88x down to 1.59-2.79x on
+`color_cover`, and from 1.55-2.34x down to 1.16-1.52x on `palette16` (see
+`tool/bench_lossy_vs_cjxl.dart`) — roughly halving the gap with a single,
+narrowly-scoped, already-decoder-verified change. `HfMetadata`'s other
+channels (`xFromY`/`bFromY`, `blockInfo`, `sharpness`) were left on
+predictor 0: they're a much smaller absolute contribution (11-14KB vs.
+DC's 40-130KB in the same files) and mostly near-constant (block type is
+always 0 with variable transforms off; sharpness is always 0), so a flat
+histogram already compresses them well — not the next priority.
+
+**What's next for compression efficiency** (in rough order of expected
+impact, least risky first): a real per-pixel context tree for DC
+(spatial-correlation-aware context splitting, mirroring the lossless
+encoder's `learnContextTree`, could extract more from the *residual*
+distribution than a single shared histogram does); trying the
+self-correcting weighted predictor for DC too (predictor 6, `encoder.dart`
+already implements it for lossless — DC may behave more like photographic
+content, where WP tends to win over plain gradient in the lossless
+encoder's own A/B testing); a similar gradient-style predictor for
+`blockInfo`'s `hfMult` row specifically (spatially correlated but a much
+smaller absolute win than DC was); and, on the AC side (now the dominant
+term again post-fix), replacing the crude 3-bucket adaptive-quantization
+heuristic and the cheap bit-cost transform-size proxy (see the L3
+write-up above) with something closer to real rate-distortion search —
+the largest remaining lever, and the most implementation work.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

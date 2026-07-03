@@ -180,6 +180,33 @@ void main() {
     expect(rmse, lessThan(1.0), reason: 'gradient rmse $rmse');
   });
 
+  test('DC gradient prediction shrinks smooth-content file size', () {
+    if (!_haveDjxl) return;
+    // Regression guard for _gradientResiduals (DC/LF coefficients use
+    // predictor 5, clamped gradient, instead of predictor 0/no
+    // prediction). DC dominates file size on smooth content since almost
+    // no AC survives quantization there — measured 7295 bytes with
+    // predictor 0 (the previous behavior) vs 3115 bytes with predictor 5
+    // for this exact image. A silent regression back to no prediction
+    // would roughly double this file's size without failing any
+    // correctness check (both are valid, djxl-decodable bitstreams — see
+    // doc/spec_notes.md).
+    const w = 256, h = 256;
+    final pixels = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final v = (x * 255 / w).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final encoded = JxlEncoder.encodeLossy(pixels, width: w, height: h);
+    expect(encoded.length, lessThan(5000),
+        reason: 'gradient file size ${encoded.length}');
+  });
+
   test('per-region chroma-from-luma helps spatially-varying color content', () {
     if (!_haveDjxl) return;
     // A single global CfL slope is a poor compromise when different parts

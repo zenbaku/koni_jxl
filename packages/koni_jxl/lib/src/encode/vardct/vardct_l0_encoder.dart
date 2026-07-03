@@ -383,7 +383,7 @@ Uint8List encodeLossyVardctL0(
   if (numGroups == 1 && numLfGroups == 1) {
     final body = BitWriter();
     _writeLfGlobal(body, config, cfl.kXGlobal, cfl.kBGlobal);
-    _writeLfCoefficients(body, dcInt[0], dcInt[1], dcInt[2]);
+    _writeLfCoefficients(body, dcInt[0], dcInt[1], dcInt[2], bw);
     _writeHfMetadata(body, bh, bw, placedBlocks, 0, 0, cfl);
     _writeHfGlobalAndPass(body, numGroups, customParamsByIndex);
     clustering.codes.writeHeader(body, clusterMap: clustering.clusterMap);
@@ -413,14 +413,25 @@ Uint8List encodeLossyVardctL0(
     _writeHfGlobalAndPass(hfGlobalW, numGroups, customParamsByIndex);
     clustering.codes.writeHeader(hfGlobalW, clusterMap: clustering.clusterMap);
 
-    final sections = <Uint8List>[
-      lfGlobalW.toBytes(),
-      ...lfGroupSections,
-      hfGlobalW.toBytes(),
+    final passGroupSections = [
       for (var g = 0; g < numGroups; g++)
         _assembleGroupSection(clustering.codes,
             clustering.mappedClustersPerGroup[g], groupTokens[g].values),
     ];
+    final sections = <Uint8List>[
+      lfGlobalW.toBytes(),
+      ...lfGroupSections,
+      hfGlobalW.toBytes(),
+      ...passGroupSections,
+    ];
+    if (const bool.fromEnvironment('jxl.encdebug')) {
+      final lfGroupBytes = lfGroupSections.fold(0, (a, s) => a + s.length);
+      final acBytes = passGroupSections.fold(0, (a, s) => a + s.length);
+      // ignore: avoid_print
+      print('vardct sections: lfGlobal=${lfGlobalW.toBytes().length} '
+          'lfGroups(dc+meta)=$lfGroupBytes hfGlobal=${hfGlobalW.toBytes().length} '
+          'ac=$acBytes total=${sections.fold(0, (a, s) => a + s.length)}');
+    }
     writeToc(out, [for (final s in sections) s.length]);
     for (final s in sections) {
       out.writeBytes(s);
@@ -454,9 +465,15 @@ Uint8List _assembleLfGroupSection(
 
   final w = BitWriter();
   _writeLfCoefficients(w, extractLocal(dcInt[0]), extractLocal(dcInt[1]),
-      extractLocal(dcInt[2]));
+      extractLocal(dcInt[2]), lfGroupBw);
+  final dcBits = w.bitsWritten;
   _writeHfMetadata(
       w, lfGroupBh, lfGroupBw, blocksInLfGroup, originBy, originBx, cfl);
+  if (const bool.fromEnvironment('jxl.encdebug')) {
+    // ignore: avoid_print
+    print(
+        '  lfGroup: dc=${dcBits ~/ 8}B meta=${(w.bitsWritten - dcBits) ~/ 8}B');
+  }
   return w.toBytes();
 }
 
@@ -835,18 +852,22 @@ _ChromaFromLumaFit _chromaFromLumaFit(List<List<Float32List>> planes, int bh,
   return _ChromaFromLumaFit(kXGlobal, kBGlobal, kXRegion, kBRegion, corrW);
 }
 
-/// Writes a modular sub-stream whose bitstream contents are simply
-/// `packSigned(value)` per pixel, in channel-then-raster order: a
-/// single-leaf MA tree (predictor 0 == Zero, so `prediction == 0` always;
-/// offset 0; multiplier 1) makes every decoded pixel equal exactly
-/// `unpackSigned(symbol)` (`modular/modular_channel.dart`'s decode loop).
-void _writeTrivialModularStream(BitWriter w, List<List<int>> channelsInOrder) {
+/// Writes a modular sub-stream with a single-leaf MA tree (no per-pixel
+/// property splitting — one shared histogram per stream) using [predictor]
+/// (default 0 == Zero, so `prediction == 0` always and every decoded pixel
+/// equals exactly `unpackSigned(symbol)`; see `_gradientResiduals` for the
+/// non-zero-predictor case). Offset 0, multiplier 1 always: the decoder
+/// reconstructs `trueValue = unpackSigned(symbol) + prediction(...)`
+/// (`modular/modular_channel.dart`'s decode loop), so [channelsInOrder]
+/// must already be in that residual domain for [predictor] != 0.
+void _writeModularStream(BitWriter w, List<List<int>> channelsInOrder,
+    {int predictor = 0}) {
   w.writeBool(false); // use_global_tree
   w.writeBool(true); // wp_params default
   w.writeU32(0, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 0
   final treeTokens = EntropyWriter(6);
   treeTokens.write(1, 0); // property + 1 == 0 -> leaf
-  treeTokens.write(2, 0); // predictor = 0 (Zero)
+  treeTokens.write(2, predictor);
   treeTokens.write(3, 0); // offset = packSigned(0) = 0
   treeTokens.write(4, 0); // mulLog = 0
   treeTokens.write(5, 0); // mulBits = 0 -> multiplier = 1
@@ -860,14 +881,63 @@ void _writeTrivialModularStream(BitWriter w, List<List<int>> channelsInOrder) {
   residuals.finalize(w);
 }
 
+/// Computes predictor-5 (clamped gradient: `clamp(w + n - nw, min(w, n),
+/// max(w, n))`, with the same edge-of-image fallbacks as
+/// `modular_channel.dart`'s `prediction(y, x, 5)`) residuals for a flat,
+/// row-major `width`-wide grid — the *exact* mirror of that decode-side
+/// formula (verified directly against `_west`/`_north`/`_northWest`'s edge
+/// cases; also the same formula `encoder.dart`'s lossless `_tileResiduals`
+/// already uses and gates bit-exact against djxl). DC (LF) values are
+/// highly spatially correlated between neighboring blocks — real image
+/// content rarely jumps in average brightness/color block to block — so
+/// this alone removes most of the redundancy the previous predictor-0
+/// (no prediction at all) left on the table; see doc/spec_notes.md for
+/// the measured effect (DC was over half of total file size on
+/// photographic content before this).
+List<int> _gradientResiduals(Int32List values, int width) {
+  final height = values.length ~/ width;
+  final residuals = List<int>.filled(values.length, 0);
+  for (var y = 0; y < height; y++) {
+    for (var x = 0; x < width; x++) {
+      final o = y * width + x;
+      final w = x > 0
+          ? values[o - 1]
+          : y > 0
+              ? values[o - width]
+              : 0;
+      final n = y > 0 ? values[o - width] : w;
+      final nw = x > 0 && y > 0 ? values[o - width - 1] : w;
+      final grad = w + n - nw;
+      final lo = w < n ? w : n;
+      final hi = w > n ? w : n;
+      final pred = grad < lo
+          ? lo
+          : grad > hi
+              ? hi
+              : grad;
+      residuals[o] = values[o] - pred;
+    }
+  }
+  return residuals;
+}
+
 /// LfGroup section, part 1: the DC/LF coefficient image. [dcX]/[dcY]/[dcB]
 /// are semantic-channel-indexed, block-raster-order (by * bw + bx) integer
-/// DC values; the modular sub-stream itself is written in the decoder's Y,
-/// X, B channel order (`vardct/lf_coefficients.dart`'s `cMap`).
+/// DC values, [width] wide; the modular sub-stream itself is written in
+/// the decoder's Y, X, B channel order (`vardct/lf_coefficients.dart`'s
+/// `cMap`), gradient-predicted (see `_gradientResiduals`) rather than
+/// coded raw.
 void _writeLfCoefficients(
-    BitWriter w, Int32List dcX, Int32List dcY, Int32List dcB) {
+    BitWriter w, Int32List dcX, Int32List dcY, Int32List dcB, int width) {
   w.writeBits(0, 2); // extraPrecision = 0
-  _writeTrivialModularStream(w, [dcY, dcX, dcB]);
+  _writeModularStream(
+      w,
+      [
+        _gradientResiduals(dcY, width),
+        _gradientResiduals(dcX, width),
+        _gradientResiduals(dcB, width),
+      ],
+      predictor: 5);
 }
 
 /// LfGroup section, part 2: HfMetadata — the placed block list (8x8 and/or
@@ -924,7 +994,7 @@ void _writeHfMetadata(
     blockInfo[nbBlocks + i] = placedBlocks[i].hfMult - 1; // row1: mult - 1
   }
   final sharpness = List<int>.filled(bh * bw, 0);
-  _writeTrivialModularStream(w, [xFromY, bFromY, blockInfo, sharpness]);
+  _writeModularStream(w, [xFromY, bFromY, blockInfo, sharpness]);
 }
 
 /// HfGlobal + the single HfPass: quant weight tables (the library default

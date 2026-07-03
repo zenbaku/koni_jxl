@@ -139,9 +139,23 @@ quality, still "lossy"). Decided: **VarDCT** (a true codec). Detailed implementa
 L0 through L4 are done (see above), along with per-region chroma-from-luma
 and multi-LF-group support — everything originally scoped in
 doc/lossy_encoder_plan.md. What's left is real quality/compactness work
-(27-transform-type support and a genuine rate-distortion search, tracked
-in L3's write-up above) rather than missing capabilities — see
-`tool/bench_lossy_vs_cjxl.dart`'s output for where the gap actually is.
+rather than missing capabilities — see `tool/bench_lossy_vs_cjxl.dart`'s
+output for where the gap actually is.
+
+- ✅ **Compression efficiency, round 1: DC gradient prediction.** Found by
+  instrumenting the benchmark's output with a per-section byte breakdown:
+  DC (LF) coefficients — encoded with *zero* spatial prediction since L0 —
+  were over half this encoder's total output size on real photo content,
+  more than the AC coefficients every prior phase had focused on tuning.
+  Fixed by writing DC through the same clamped-gradient predictor
+  (predictor 5) the lossless encoder already uses and gates bit-exact
+  against djxl, instead of predictor 0 (no prediction). Cut DC size by
+  49-75% and total file size by 25-27% on the two corpus test images,
+  roughly halving the size gap vs `cjxl -e1` (2.17-4.88x → 1.59-2.79x and
+  1.55-2.34x → 1.16-1.52x). See doc/spec_notes.md for the full numbers and
+  the ranked list of what's likely next (a DC context tree, the
+  self-correcting weighted predictor for DC, then AC-side rate-distortion
+  search — the largest remaining lever and the most work).
 
 ---
 

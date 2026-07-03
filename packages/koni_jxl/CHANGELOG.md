@@ -54,6 +54,13 @@
   expected given no rate-distortion search and only 2 of 27 transform
   types, now measured concretely rather than assumed. `VardctL0Config` is
   now exported from the public API.
+- **Lossy (VarDCT) — DC gradient prediction.** DC (LF) coefficients were
+  being encoded with zero spatial prediction — over half this encoder's
+  total output size on real photo content, more than the AC coefficients.
+  Now uses the same clamped-gradient predictor (predictor 5) the lossless
+  encoder already uses, cutting DC size 49-75% and total file size 25-27%
+  on the corpus's two RGB test images, roughly halving the size gap vs
+  `cjxl -e1`.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).
