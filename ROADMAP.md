@@ -50,7 +50,8 @@ quality lives.
 Open question to settle before L0: target the **VarDCT** path (the real
 lossy format, big but correct) vs a **lossy-modular** shortcut (quantize
 then encode with the existing modular encoder — far less work, worse
-quality, still "lossy"). The plan above assumes VarDCT.
+quality, still "lossy"). Decided: **VarDCT** (a true codec). Detailed implementation plan in
+[doc/lossy_encoder_plan.md](doc/lossy_encoder_plan.md).
 
 ---
 
