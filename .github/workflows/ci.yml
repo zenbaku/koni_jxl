@@ -5,17 +5,62 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # tool/gen_corpus.py hard-requires this cjxl version; bump both together.
+  LIBJXL_VERSION: v0.11.2
+  # Pinned commit of github.com/libjxl/conformance (testcases are plain files,
+  # no LFS). Matches the local third_party/conformance checkout.
+  CONFORMANCE_REF: 4bf053529c7cefd2951be453475bb3dccc7e7be8
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest): the libjxl release .debs target 24.04.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+
       - run: flutter pub get
       - run: dart format --output=none --set-exit-if-changed packages/koni_jxl packages/koni_jxl_flutter
       - run: dart analyze --fatal-infos
+
+      # --- differential-gate prerequisites: without these, ~half the suite
+      # --- (djxl bit-exactness, lossy rmse, encoder round-trips, conformance)
+      # --- silently skips. See CLAUDE.md "Gates auto-skip" caveat.
+      - name: Install cjxl/djxl ${{ env.LIBJXL_VERSION }}
+        run: |
+          curl -fsSL -o /tmp/jxl-debs.zip \
+            "https://github.com/libjxl/libjxl/releases/download/${LIBJXL_VERSION}/jxl-debs-amd64-ubuntu-24.04.zip"
+          unzip -o /tmp/jxl-debs.zip -d /tmp/jxl-debs
+          sudo apt-get update -qq
+          sudo apt-get install -y $(find /tmp/jxl-debs -name '*.deb')
+          cjxl --version
+          djxl --version
+          cjxl --version 2>&1 | grep -q "${LIBJXL_VERSION#v}" || {
+            echo "cjxl version mismatch"; exit 1; }
+
+      - name: Check out conformance testcases
+        uses: actions/checkout@v5
+        with:
+          repository: libjxl/conformance
+          ref: ${{ env.CONFORMANCE_REF }}
+          path: third_party/conformance
+
+      - name: Restore corpus cache
+        id: corpus-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/corpus
+          key: corpus-${{ env.LIBJXL_VERSION }}-${{ hashFiles('tool/gen_corpus.py') }}
+
+      - name: Generate corpus
+        if: steps.corpus-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -m pip install --break-system-packages pillow
+          python3 tool/gen_corpus.py
+
       - run: dart test
         working-directory: packages/koni_jxl
       - run: flutter test
