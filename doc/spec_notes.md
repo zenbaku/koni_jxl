@@ -705,6 +705,106 @@ so a future attempt doesn't have to rediscover it — the real fix belongs
 with a genuine RD search (see the L3 write-up above), not another
 threshold adjustment.
 
+### Lossy (VarDCT) encoder — a genuine RD search for hfMult, and why it's still off
+
+Following through on the previous section's conclusion, this implements
+an actual per-block rate-distortion (RD) search replacing the 3-bucket
+`hfMult` heuristic — scoped, designed, and reviewed via two independent
+research agents before any code was written (the scoping document is
+this feature's real design rationale; summarized here). The RD machinery
+is implemented, unit-tested, and djxl-verified correct in every
+configuration tried — but calibration found no single global trade-off
+constant that both beats the heuristic on real photo content *and*
+preserves the heuristic's own smooth-gradient banding protection. This
+is the "honest failure mode" the scoping explicitly planned for, not an
+oversight: `VardctL0Config.enableRdHfMult` stays off by default,
+documented here so the infrastructure isn't wasted and a future
+attempt starts from the actual finding instead of re-deriving it.
+
+**One grounding fact made the design tractable.**
+`HfCoefficients.getBlockContext` only lets `hfMult` shift which context
+cluster a token routes to via `HfBlockContext.qfThresholds`, which this
+encoder's always-used `HfBlockContext.defaults()` leaves empty — so
+`hfMult` never changes which histogram a block's tokens land in, only
+what values land there. This means candidates can be scored against a
+single, shared, frozen Huffman code-length table without a chicken-and-
+egg problem: build a real `_AcClustering` from a bootstrap pass (the
+heuristic's own already-committed choices), extract a real per-cluster
+code-length table (`EntropyCodes.tokenBitLengths()`, a new accessor
+reusing the exact same `huffmanLengths()` call `estimatedBits()` already
+uses — unit-tested to reproduce `estimatedBits()`'s internal computation
+exactly), and freeze both that table and the non-zero-count prediction
+grid (`_computeGroupTokens`'s `predictedOut`) for scoring every
+candidate afterward.
+
+**Distortion**: weighted squared error using the existing `rawWeight`
+per-frequency table (`_PlacedBlock.quantizeCandidate`) — no new table,
+weights error exactly where quantization already considers a coefficient
+perceptually important. **Rate**: `codeLength[cluster][token]` (from the
+frozen bootstrap table) `+ exactExtraBits` (`tokenizeHybrid`'s closed-form
+suffix-bit count — no table needed) per token, summed over a block's
+non-zero-count and coefficient tokens (`_blockRate`). **Cost**:
+`distortion + lambda * rate`, `lambda = kLambda * refStep^2` (standard
+scalar-quantizer RD theory — the trade-off's slope near a step size
+scales with `step^2`).
+
+**Calibration (`tool/calibrate_rd_lambda.dart`) found a real, informative
+negative result, not a bug.** An early sanity sweep of `kLambda ∈
+[0.02, 10]` (the range a superficial reading of the `lambda = kLambda *
+refStep^2` formula might suggest) showed *zero* observable effect —
+`refStep` is tiny in this encoder's units (~0.0018 at `distance = 1.0`,
+so `refStep^2 ≈ 3e-6`) while `distortion`/`rate` are both O(1)-to-O(100),
+so `lambda * rate` stayed negligible regardless of `kLambda` in that
+range; the real sweep needed `kLambda` in the thousands (confirmed
+correct-by-construction once found: sweeping 100-100000 produced the
+expected monotonic size/RMSE trade-off). With the right range:
+
+- `kLambda ≈ 12000`: beats the heuristic on `color_cover` at
+  `distance = 1.0` on *both* axes simultaneously (129607 vs 133295 bytes,
+  RMSE 1.762 vs 1.805) — a genuine, non-marginal win on real photo
+  content.
+- The *same* `kLambda ≈ 12000` pushes the smooth-gradient banding test's
+  RMSE to 0.946 — the same uncomfortable-near-miss territory a prior,
+  much cruder threshold tweak hit (0.940), this time from a supposedly
+  more principled mechanism.
+- `kLambda ≈ 500` keeps the gradient test comfortably safe (RMSE 0.615)
+  but makes `color_cover` 44.5% *larger* than the heuristic — not a win,
+  a straightforward quality-for-size trade in the wrong direction for a
+  compression-efficiency feature.
+- No value in between (1000-8000 tested) beats the heuristic on
+  `color_cover` while keeping gradient RMSE comfortably under 1.0 —
+  every value is a different point on roughly one curve, exactly the
+  same shape of outcome the earlier threshold-tuning investigation found,
+  just shifted.
+
+**Root cause, confirmed by direct measurement (`jxl.encdebug`'s hfMult
+histogram), not inferred.** At `kLambda = 500` (gradient-safe), the
+gradient image's 1024 blocks split `{1: 32, 2: 256, 4: 736}` — mostly the
+heuristic's own aggressive `4x` banding protection. At `kLambda = 12000`
+(photo-favorable), the *same* image's blocks split `{1: 320, 2: 544, 4:
+160}` — the RD search actively *removes* most of that protection,
+because weighted-squared-error judges the absolute distortion a near-
+zero-AC-energy block saves by boosting as not worth the bit cost, even
+though banding is far more perceptually objectionable than its raw MSE
+contribution suggests. This is a real modeling gap: weighted MSE (or any
+plain per-pixel error metric) structurally cannot see banding sensitivity
+the way a real perceptual metric (butteraugli-class, well out of scope
+here) or an explicit banding-aware distortion term would. Closing this
+gap needs a better *model*, not a better constant — re-sweeping `kLambda`
+further would not help, and isn't worth repeating without first changing
+the distortion metric itself.
+
+**What's shipped despite the negative result**: `EntropyCodes.
+tokenBitLengths()` (correctness-verified, independently useful for any
+future per-block rate-estimation work), the full RD-search machinery
+behind `VardctL0Config.enableRdHfMult` (default `false`, `_kRdLambda =
+3000.0` as a documented, not-fully-satisfactory placeholder for anyone
+experimenting), and `tool/calibrate_rd_lambda.dart` for re-running this
+analysis after any future model change. Correctness (djxl round-trip) is
+verified for the opt-in path across single-group, multi-group, multi-LF-
+group and 16x16-block-mixed configurations
+(`vardct_l0_test.dart`'s "RD hfMult search (opt-in) decodes correctly").
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

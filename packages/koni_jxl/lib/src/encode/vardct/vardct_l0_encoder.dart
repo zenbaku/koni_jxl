@@ -39,6 +39,8 @@ class VardctL0Config {
     this.acScale = 1.0,
     this.enableFilters = false,
     this.enableVariableTransforms = false,
+    this.enableRdHfMult = false,
+    this.rdHfMultLambdaOverride,
   });
 
   /// Derives quantization knobs from a cjxl-like `distance` (butteraugli
@@ -100,6 +102,20 @@ class VardctL0Config {
   /// in testing). See doc/spec_notes.md before flipping this on for a
   /// non-manga use case.
   final bool enableVariableTransforms;
+
+  /// Whether to replace the default 3-bucket adaptive-quantization
+  /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
+  /// with a real per-block rate-distortion search over the same
+  /// candidate multipliers ({1, 2, 4}). Defaults to **off** — see
+  /// `_chooseHfMultRd`'s doc comment and doc/spec_notes.md for the
+  /// calibration status and measured numbers before enabling.
+  final bool enableRdHfMult;
+
+  /// Overrides the rate/distortion trade-off constant `_kRdLambda` used
+  /// by [enableRdHfMult] (a runtime knob rather than a recompile, purely
+  /// so `tool/calibrate_rd_lambda.dart` can sweep it in one process).
+  /// Null (the default) uses the shipped, calibrated constant.
+  final double? rdHfMultLambdaOverride;
 }
 
 int _packSigned(int v) => v >= 0 ? v << 1 : (-v << 1) - 1;
@@ -265,6 +281,28 @@ Uint8List encodeLossyVardctL0(
     }
   }
 
+  // 4.5. Context/grouping setup: hoisted ahead of quantization since it
+  // only depends on which transform types are placed and where — not on
+  // any block's chosen hfMult — and the RD-hfMult search (step 5.5) needs
+  // it for its bootstrap pass before step 6's real one.
+  final hfctx = HfBlockContext.defaults();
+  final ctxByType = {
+    for (final tt in [_tt8, _tt16]) tt.type: _TransformCtx(tt, hfctx),
+  };
+  // ceilDiv(trueSize, 256) == ceilDiv(paddedSize, 256) always (padding adds
+  // at most 7 pixels, far short of a 256 boundary, and true/padded sizes
+  // coincide exactly whenever trueSize is already a multiple of 256 since
+  // 256 is itself a multiple of 8) — using the padded size here is just
+  // the more directly available one (matches bw/bh already in scope).
+  final groupsX = ceilDiv(paddedWidth, 256);
+  final groupsY = ceilDiv(paddedHeight, 256);
+  final numGroups = groupsX * groupsY;
+  final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
+  for (final block in placedBlocks) {
+    final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);
+    blocksByGroup[g].add(block);
+  }
+
   // 5. Per-block forward DCT, chroma-from-luma pre-subtraction, adaptive
   // quantization multiplier and quantization. dcInt is semantic-indexed
   // (0=X, 1=Y, 2=B), always at native 8x8-block granularity (DC/LF is
@@ -287,29 +325,40 @@ Uint8List encodeLossyVardctL0(
         scratch16b);
   }
 
+  // 5.5. Optional: replace the L2 heuristic's per-block hfMult choice
+  // (just committed above) with a real rate-distortion search — see
+  // _chooseHfMultRd's doc comment. Off by default pending calibration
+  // (doc/spec_notes.md).
+  if (config.enableRdHfMult) {
+    _chooseHfMultRd(
+        placedBlocks,
+        planes,
+        cfl,
+        refStep,
+        sd,
+        rawWeight8,
+        rawWeight16,
+        scaleFactor,
+        dcInt,
+        bw,
+        scratch8a,
+        scratch8b,
+        scratch16a,
+        scratch16b,
+        hfctx,
+        ctxByType,
+        groupsX,
+        groupsY,
+        blocksByGroup,
+        config.rdHfMultLambdaOverride);
+  }
+
   // 6. AC coefficient tokens, one group at a time (each group is its own
   // 256x256-pixel / 32x32-block tile with an independent non-zero
   // prediction grid, mirroring a fresh HfCoefficients per (pass, group)).
   // Blocks never straddle a group boundary: groups are 32-block-aligned
   // (even) and 16x16 blocks only start at globally-even coordinates with a
   // 2x2 footprint, so a block's origin alone determines its group.
-  final hfctx = HfBlockContext.defaults();
-  final ctxByType = {
-    for (final tt in [_tt8, _tt16]) tt.type: _TransformCtx(tt, hfctx),
-  };
-  // ceilDiv(trueSize, 256) == ceilDiv(paddedSize, 256) always (padding adds
-  // at most 7 pixels, far short of a 256 boundary, and true/padded sizes
-  // coincide exactly whenever trueSize is already a multiple of 256 since
-  // 256 is itself a multiple of 8) — using the padded size here is just
-  // the more directly available one (matches bw/bh already in scope).
-  final groupsX = ceilDiv(paddedWidth, 256);
-  final groupsY = ceilDiv(paddedHeight, 256);
-  final numGroups = groupsX * groupsY;
-  final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
-  for (final block in placedBlocks) {
-    final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);
-    blocksByGroup[g].add(block);
-  }
   final groupTokens = <_GroupTokens>[
     for (var gy = 0; gy < groupsY; gy++)
       for (var gx = 0; gx < groupsX; gx++)
@@ -547,18 +596,19 @@ class _PlacedBlock {
   /// Per semantic channel (X, Y, B): flat, row-major
   /// (`tt.pixelHeight` x `tt.pixelWidth`) quantized AC coefficients. The
   /// LLF corner (`tt.dctSelectHeight` x `tt.dctSelectWidth` positions) is
-  /// unused here — those come from the DC plane on decode.
-  late final List<Int32List> acInt;
+  /// unused here — those come from the DC plane on decode. Set only by
+  /// [commit] (never re-set directly), so a block can be re-quantized
+  /// with several candidate multipliers (see `_chooseHfMultRd`) before
+  /// committing to one without violating single-assignment expectations.
+  List<Int32List> acInt = const [];
 
-  void computeAndQuantize(
+  /// Forward DCT + chroma-from-luma pre-subtraction for this block: the
+  /// shared first step of both [computeAndQuantize] (the default path)
+  /// and the RD-hfMult search (`_chooseHfMultRd`, which needs to try
+  /// several quantization candidates against the *same* coefficients).
+  List<List<Float32List>> computeCoeffBuf(
       List<List<Float32List>> planes,
       _ChromaFromLumaFit cfl,
-      double refStep,
-      List<double> sd,
-      List<List<Float32List>> rawWeight,
-      List<double> scaleFactor,
-      List<Int32List> dcInt,
-      int bw,
       List<Float32List> scratch8a,
       List<Float32List> scratch8b,
       List<Float32List> scratch16a,
@@ -575,7 +625,6 @@ class _PlacedBlock {
     }
 
     final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
-    final numBlocks = llfH * llfW;
 
     // Chroma-from-luma: the decoder always adds kX/kB times the Y
     // coefficient into X/B, so that must be pre-subtracted here. The LLF
@@ -595,13 +644,121 @@ class _PlacedBlock {
         coeffBuf[2][y][x] -= kB * yv;
       }
     }
+    return coeffBuf;
+  }
 
-    // Adaptive quantization: hfMultiplier can only refine *finer* than the
-    // baseline (dequant is inversely proportional to it — see
-    // doc/spec_notes.md), so smooth/low-energy blocks (where rounding AC to
-    // zero causes visible banding) get a boost; busy blocks stay at the
-    // baseline multiplier, since masking hides quantization noise there and
-    // they already spend plenty of bits.
+  /// Quantizes an already-computed [coeffBuf] with a specific candidate
+  /// [mult], *without* committing anything (no mutation of this block or
+  /// any output array) — used by the RD-hfMult search to score several
+  /// candidates before picking one (see [commit]). Also returns the
+  /// weighted-squared-error distortion this candidate would introduce
+  /// (see `_chooseHfMultRd`'s doc comment for why weighted, not plain,
+  /// MSE), computed in the same loop as quantization to avoid a second
+  /// pass over the coefficients.
+  ({List<double> dc, List<Int32List> ac, double distortion}) quantizeCandidate(
+      List<List<Float32List>> coeffBuf,
+      int mult,
+      List<double> sd,
+      List<List<Float32List>> rawWeight,
+      List<double> scaleFactor) {
+    final n = tt.pixelHeight;
+    final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+    final numBlocks = llfH * llfW;
+
+    // DC/LLF: invert the decoder's forward-DCT-of-DC-values relationship
+    // (trivial identity when numBlocks == 1). Unaffected by `mult` — DC
+    // uses its own dedicated scale (`sd`), never `hfMult`.
+    final List<double> dc;
+    if (numBlocks == 1) {
+      dc = [for (var c = 0; c < 3; c++) coeffBuf[c][0][0] / sd[c]];
+    } else {
+      // numBlocks == 4 (16x16): coeffBuf[c][0][0..1] and [1][0..1] are the
+      // true LLF corner (row-major); llfScale is also row-major. Flat
+      // layout: index c * 4 + {0: top-left, 1: top-right, 2: bottom-left,
+      // 3: bottom-right} of the 2x2 DC-plane patch, matching [commit].
+      dc = List<double>.filled(12, 0);
+      for (var c = 0; c < 3; c++) {
+        final pre00 = coeffBuf[c][0][0] / tt.llfScale[0];
+        final pre01 = coeffBuf[c][0][1] / tt.llfScale[1];
+        final pre10 = coeffBuf[c][1][0] / tt.llfScale[2];
+        final pre11 = coeffBuf[c][1][1] / tt.llfScale[3];
+        dc[c * 4] = (pre00 + pre01 + pre10 + pre11) / sd[c];
+        dc[c * 4 + 1] = (pre00 - pre01 + pre10 - pre11) / sd[c];
+        dc[c * 4 + 2] = (pre00 + pre01 - pre10 - pre11) / sd[c];
+        dc[c * 4 + 3] = (pre00 - pre01 - pre10 + pre11) / sd[c];
+      }
+    }
+
+    final ac = [for (var c = 0; c < 3; c++) Int32List(n * n)];
+    var distortion = 0.0;
+    for (var c = 0; c < 3; c++) {
+      final acc = ac[c];
+      final rw = rawWeight[c];
+      final sfc = scaleFactor[c] / mult;
+      for (var y = 0; y < n; y++) {
+        for (var x = 0; x < n; x++) {
+          if (y < llfH && x < llfW) continue;
+          final w = rw[y][x];
+          final step = sfc / w;
+          final trueVal = coeffBuf[c][y][x];
+          final qval = (trueVal / step).round();
+          acc[y * n + x] = qval;
+          final err = trueVal - qval * step;
+          distortion += (w * err) * (w * err);
+        }
+      }
+    }
+    return (dc: dc, ac: ac, distortion: distortion);
+  }
+
+  /// Commits a [quantizeCandidate] result as this block's real,
+  /// bitstream-bound quantization: writes DC into [dcInt] and sets
+  /// [hfMult]/[acInt].
+  void commit(
+      ({List<double> dc, List<Int32List> ac, double distortion}) candidate,
+      int mult,
+      List<Int32List> dcInt,
+      int bw) {
+    hfMult = mult;
+    acInt = candidate.ac;
+    final numBlocks = tt.dctSelectHeight * tt.dctSelectWidth;
+    if (numBlocks == 1) {
+      for (var c = 0; c < 3; c++) {
+        dcInt[c][by * bw + bx] = candidate.dc[c].round();
+      }
+    } else {
+      for (var c = 0; c < 3; c++) {
+        dcInt[c][by * bw + bx] = candidate.dc[c * 4].round();
+        dcInt[c][by * bw + bx + 1] = candidate.dc[c * 4 + 1].round();
+        dcInt[c][(by + 1) * bw + bx] = candidate.dc[c * 4 + 2].round();
+        dcInt[c][(by + 1) * bw + bx + 1] = candidate.dc[c * 4 + 3].round();
+      }
+    }
+  }
+
+  /// Default (non-RD-search) path: compute coefficients, choose `hfMult`
+  /// via the L2 adaptive-energy heuristic (smooth/low-energy blocks get a
+  /// boost — hfMultiplier can only refine *finer* than the baseline, dequant
+  /// being inversely proportional to it, see doc/spec_notes.md), quantize,
+  /// commit.
+  void computeAndQuantize(
+      List<List<Float32List>> planes,
+      _ChromaFromLumaFit cfl,
+      double refStep,
+      List<double> sd,
+      List<List<Float32List>> rawWeight,
+      List<double> scaleFactor,
+      List<Int32List> dcInt,
+      int bw,
+      List<Float32List> scratch8a,
+      List<Float32List> scratch8b,
+      List<Float32List> scratch16a,
+      List<Float32List> scratch16b) {
+    final coeffBuf = computeCoeffBuf(
+        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+    final n = tt.pixelHeight;
+    final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+
     var acEnergy = 0.0;
     final y1 = coeffBuf[1];
     for (var y = 0; y < n; y++) {
@@ -612,50 +769,15 @@ class _PlacedBlock {
       }
     }
     final relEnergy = math.sqrt(acEnergy) / refStep;
-    hfMult = relEnergy < 1.0
+    final mult = relEnergy < 1.0
         ? 4
         : relEnergy < 4.0
             ? 2
             : 1;
 
-    // DC/LLF: invert the decoder's forward-DCT-of-DC-values relationship
-    // (trivial identity when numBlocks == 1).
-    if (numBlocks == 1) {
-      for (var c = 0; c < 3; c++) {
-        dcInt[c][by * bw + bx] = (coeffBuf[c][0][0] / sd[c]).round();
-      }
-    } else {
-      // numBlocks == 4 (16x16): coeffBuf[c][0][0..1] and [1][0..1] are the
-      // true LLF corner (row-major); llfScale is also row-major.
-      for (var c = 0; c < 3; c++) {
-        final pre00 = coeffBuf[c][0][0] / tt.llfScale[0];
-        final pre01 = coeffBuf[c][0][1] / tt.llfScale[1];
-        final pre10 = coeffBuf[c][1][0] / tt.llfScale[2];
-        final pre11 = coeffBuf[c][1][1] / tt.llfScale[3];
-        final p00 = pre00 + pre01 + pre10 + pre11;
-        final p01 = pre00 - pre01 + pre10 - pre11;
-        final p10 = pre00 + pre01 - pre10 - pre11;
-        final p11 = pre00 - pre01 - pre10 + pre11;
-        dcInt[c][by * bw + bx] = (p00 / sd[c]).round();
-        dcInt[c][by * bw + bx + 1] = (p01 / sd[c]).round();
-        dcInt[c][(by + 1) * bw + bx] = (p10 / sd[c]).round();
-        dcInt[c][(by + 1) * bw + bx + 1] = (p11 / sd[c]).round();
-      }
-    }
-
-    acInt = [for (var c = 0; c < 3; c++) Int32List(n * n)];
-    for (var c = 0; c < 3; c++) {
-      final ac = acInt[c];
-      final rw = rawWeight[c];
-      final sfc = scaleFactor[c] / hfMult;
-      for (var y = 0; y < n; y++) {
-        for (var x = 0; x < n; x++) {
-          if (y < llfH && x < llfW) continue;
-          final step = sfc / rw[y][x];
-          ac[y * n + x] = (coeffBuf[c][y][x] / step).round();
-        }
-      }
-    }
+    final candidate =
+        quantizeCandidate(coeffBuf, mult, sd, rawWeight, scaleFactor);
+    commit(candidate, mult, dcInt, bw);
   }
 }
 
@@ -1071,6 +1193,66 @@ class _GroupTokens {
   final List<int> values = [];
 }
 
+/// Computes one (block, channel)'s AC coefficient tokens (the non-zero-
+/// count token, then per-position coefficient tokens up to the last
+/// non-zero position), appending to [contextsOut]/[valuesOut]. [predicted]
+/// (the non-zero-count context prediction from neighboring blocks) is
+/// supplied by the caller rather than computed here: `_computeGroupTokens`
+/// derives it live from a running per-group grid, while the RD-search
+/// rate estimate (`_blockRate`) scores multiple quantization candidates
+/// against a *frozen* snapshot of that grid (see `_chooseHfMultRd`'s doc
+/// comment for why). Returns this channel's real non-zero count, which
+/// the caller needs to update its own prediction grid/bookkeeping.
+int _blockChannelTokens(
+    _TransformCtx ctx,
+    HfBlockContext hfctx,
+    int c,
+    Int32List acData,
+    int predicted,
+    List<int> contextsOut,
+    List<int> valuesOut) {
+  final numBlocks = ctx.numBlocks;
+  final orderSize = ctx.orderSize;
+  final ucoeffLen = orderSize - numBlocks;
+  final n = ctx.tt.pixelWidth;
+  var countNonZero = 0;
+  var lastNonZeroK = -1;
+  final vals = List<int>.filled(ucoeffLen, 0);
+  for (var k = 0; k < ucoeffLen; k++) {
+    final o = ctx.order[k + numBlocks];
+    final oy = o >> 16, ox = o & 0xFFFF;
+    // flip == true for every square DCT this encoder emits: the scan's
+    // (y, x) is transposed relative to the coefficient grid.
+    final v = acData[ox * n + oy];
+    vals[k] = v;
+    if (v != 0) {
+      countNonZero++;
+      lastNonZeroK = k;
+    }
+  }
+
+  final nonZeroCtx =
+      HfCoefficients.getNonZeroContext(hfctx, predicted, ctx.blockCtx[c]);
+  contextsOut.add(nonZeroCtx);
+  valuesOut.add(countNonZero);
+
+  var remaining = countNonZero;
+  var prevNonzero = false;
+  for (var k = 0; k <= lastNonZeroK; k++) {
+    final prev =
+        k == 0 ? (remaining > orderSize ~/ 16 ? 0 : 1) : (prevNonzero ? 1 : 0);
+    final coefCtx = ctx.histCtx[c] +
+        HfCoefficients.getCoefficientContext(
+            k + numBlocks, remaining, numBlocks, prev);
+    final u = _packSigned(vals[k]);
+    contextsOut.add(coefCtx);
+    valuesOut.add(u);
+    prevNonzero = u != 0;
+    if (prevNonzero) remaining--;
+  }
+  return countNonZero;
+}
+
 /// Computes one group's AC coefficient tokens, iterating [blocksInGroup] in
 /// their global raster-scan-with-skip (placement) order — the decoder's
 /// `HfCoefficients` iterates every block in that same global order,
@@ -1078,13 +1260,17 @@ class _GroupTokens {
 /// is preserved by construction. The non-zero prediction grid is local to
 /// the group (in 8x8-cell units relative to the group's own origin,
 /// [groupOriginY]/[groupOriginX]), mirroring a fresh `HfCoefficients` per
-/// (pass, group) in the decoder.
+/// (pass, group) in the decoder. When [predictedOut] is given, records
+/// each (block, channel)'s `predicted` value there — used by the RD-hfMult
+/// search (`_chooseHfMultRd`) to freeze a bootstrap pass's prediction
+/// context for scoring later candidates, without re-deriving it live.
 _GroupTokens _computeGroupTokens(
     int groupOriginY,
     int groupOriginX,
     List<_PlacedBlock> blocksInGroup,
     HfBlockContext hfctx,
-    Map<int, _TransformCtx> ctxByType) {
+    Map<int, _TransformCtx> ctxByType,
+    {Map<_PlacedBlock, Int32List>? predictedOut}) {
   final nonZeroesGrid = Int32List(3 * 32 * 32);
   final tokens = _GroupTokens();
   for (final block in blocksInGroup) {
@@ -1092,56 +1278,21 @@ _GroupTokens _computeGroupTokens(
     final localY = block.by - groupOriginY;
     final localX = block.bx - groupOriginX;
     final numBlocks = ctx.numBlocks;
-    final orderSize = ctx.orderSize;
-    final ucoeffLen = orderSize - numBlocks;
-    final n = block.tt.pixelWidth;
+    final predictedForBlock = predictedOut == null ? null : Int32List(3);
     for (final c in _channelOrder) {
-      final acData = block.acInt[c];
-      var countNonZero = 0;
-      var lastNonZeroK = -1;
-      final vals = List<int>.filled(ucoeffLen, 0);
-      for (var k = 0; k < ucoeffLen; k++) {
-        final o = ctx.order[k + numBlocks];
-        final oy = o >> 16, ox = o & 0xFFFF;
-        // flip == true for every square DCT this encoder emits: the scan's
-        // (y, x) is transposed relative to the coefficient grid.
-        final v = acData[ox * n + oy];
-        vals[k] = v;
-        if (v != 0) {
-          countNonZero++;
-          lastNonZeroK = k;
-        }
-      }
-
       final predicted = HfCoefficients.getPredictedNonZeroes(
           nonZeroesGrid, c, localY, localX);
-      final nonZeroCtx =
-          HfCoefficients.getNonZeroContext(hfctx, predicted, ctx.blockCtx[c]);
-      tokens.contexts.add(nonZeroCtx);
-      tokens.values.add(countNonZero);
+      predictedForBlock?[c] = predicted;
+      final countNonZero = _blockChannelTokens(ctx, hfctx, c, block.acInt[c],
+          predicted, tokens.contexts, tokens.values);
       final fill = (countNonZero + numBlocks - 1) ~/ numBlocks;
       for (var iy = 0; iy < block.tt.dctSelectHeight; iy++) {
         for (var ix = 0; ix < block.tt.dctSelectWidth; ix++) {
           nonZeroesGrid[c * 1024 + (localY + iy) * 32 + (localX + ix)] = fill;
         }
       }
-
-      var remaining = countNonZero;
-      var prevNonzero = false;
-      for (var k = 0; k <= lastNonZeroK; k++) {
-        final prev = k == 0
-            ? (remaining > orderSize ~/ 16 ? 0 : 1)
-            : (prevNonzero ? 1 : 0);
-        final coefCtx = ctx.histCtx[c] +
-            HfCoefficients.getCoefficientContext(
-                k + numBlocks, remaining, numBlocks, prev);
-        final u = _packSigned(vals[k]);
-        tokens.contexts.add(coefCtx);
-        tokens.values.add(u);
-        prevNonzero = u != 0;
-        if (prevNonzero) remaining--;
-      }
     }
+    if (predictedForBlock != null) predictedOut![block] = predictedForBlock;
   }
   return tokens;
 }
@@ -1240,6 +1391,194 @@ _AcClustering _chooseAcClustering(List<_GroupTokens> groups) {
         '${byFrequency.length} bestBytes=$totalBytes');
   }
   return best!;
+}
+
+/// Rate estimate (bits) for a candidate quantization of one block: sums,
+/// over both channels' token sequences, `codeLength + exactExtraBits` per
+/// token. `codeLength` comes from [lengths] (a bootstrap pass's real,
+/// already-built Huffman code lengths, indexed `[cluster][token]` — see
+/// `_chooseHfMultRd`'s doc comment for why a frozen table, not a live
+/// rebuild, is correct here) via [clusterMap] (dense, context -> cluster,
+/// from that same bootstrap — `_chooseAcClustering`'s `fullClusterMap`,
+/// which defaults unseen contexts to cluster 0; only an estimation-
+/// accuracy question, not a correctness one, since the real bitstream is
+/// built fresh afterward with the *final* chosen candidates' own real
+/// clustering). `exactExtraBits` comes from `tokenizeHybrid` — a
+/// closed-form, histogram-independent value, no table needed. A token
+/// value larger than any seen in that cluster during the bootstrap (only
+/// possible for a finer candidate than the bootstrap explored there)
+/// falls back to 15 bits, the length-limited Huffman construction's own
+/// cap (`huffmanLengths(hist, 15)`) — a real bound, not an arbitrary one.
+double _blockRate(
+    _TransformCtx ctx,
+    HfBlockContext hfctx,
+    List<Int32List> acIntCandidate,
+    Int32List predictedPerChannel,
+    List<int> clusterMap,
+    List<List<int>> lengths) {
+  var rate = 0.0;
+  final contexts = <int>[];
+  final values = <int>[];
+  for (final c in _channelOrder) {
+    contexts.clear();
+    values.clear();
+    _blockChannelTokens(ctx, hfctx, c, acIntCandidate[c],
+        predictedPerChannel[c], contexts, values);
+    for (var j = 0; j < contexts.length; j++) {
+      final cluster = clusterMap[contexts[j]];
+      final (token, extraBits, _) = tokenizeHybrid(_hfConfig, values[j]);
+      final lens = lengths[cluster];
+      final codeLen = token < lens.length ? lens[token] : 15;
+      rate += codeLen + extraBits;
+    }
+  }
+  return rate;
+}
+
+/// Candidate multipliers tried by the RD search — the same set the
+/// default heuristic chooses from (see `_PlacedBlock.computeAndQuantize`),
+/// so this isolates "does real RD scoring beat the ad hoc threshold at
+/// the same discrete choice" as the only new variable (a wider candidate
+/// set is deferred — see doc/spec_notes.md).
+const _rdHfMultCandidates = [1, 2, 4];
+
+/// Lagrange multiplier trading rate for distortion (`cost = distortion +
+/// lambda * rate`), scaled by `refStep^2` (standard scalar-quantizer RD
+/// theory: the rate/distortion trade-off's slope near a given step size
+/// scales with step^2) so it stays consistent as `distance`/`acScale`
+/// move the baseline step. The dimensionless constant has no formula to
+/// mirror — pure encoder policy, calibrated empirically exactly like
+/// `VardctL0Config.fromDistance` already is. `refStep` itself is tiny in
+/// this encoder's units (~0.0018 at `distance = 1.0`, so `refStep^2` is
+/// ~3e-6) while `distortion` (weighted-squared-error) and `rate` (bits)
+/// are both O(1)-to-O(100) — so `kLambda` needs to be large (O(1e3)-
+/// O(1e4)) to bring `lambda * rate` into the same range as `distortion`;
+/// a naive small `kLambda` (e.g. this formula's superficial resemblance
+/// to a [0.02, 5] range might suggest) has *zero* observable effect
+/// since `lambda * rate` stays negligible regardless — confirmed by
+/// direct measurement (sweeping `kLambda` from 0.02 to 10 produced
+/// byte-identical output every time; sweeping 100 to 100000 produced the
+/// expected monotonic size/RMSE trade-off).
+///
+/// **Calibration status: no value found clears both bars** (see
+/// `tool/calibrate_rd_lambda.dart` and doc/spec_notes.md for the full
+/// sweep and analysis) — this is why [VardctL0Config.enableRdHfMult]
+/// stays off by default despite this machinery being implemented and
+/// djxl-verified correct. Values around 10000-12000 genuinely beat the
+/// L2 heuristic on real photo content (smaller *and* better RMSE), but
+/// push the smooth-gradient banding-prevention test's RMSE to an
+/// uncomfortable ~0.94-0.97 (a real regression from the heuristic's
+/// comfortable margin there); values that keep gradient content safe
+/// (~500) make photo content larger than the heuristic, not smaller.
+/// Root cause (confirmed via `jxl.encdebug`'s hfMult histogram, not just
+/// inferred): at the photo-favorable lambda, most gradient blocks shift
+/// from the heuristic's aggressive `hfMult = 4` (which specifically
+/// protects near-zero-AC-energy blocks from banding) down to `1`/`2` —
+/// weighted-squared-error judges the *absolute* distortion saved by that
+/// protection as not worth its bit cost, even though banding is far more
+/// perceptually objectionable than its raw MSE contribution suggests.
+/// This is a real modeling gap (a genuine perceptual/banding-aware term,
+/// not just this constant, would be needed to close it), not a
+/// calibration shortfall — see doc/spec_notes.md before spending more
+/// time re-sweeping this constant.
+const _kRdLambda = 3000.0;
+
+/// Real per-block rate-distortion search replacing the crude 3-bucket
+/// `hfMult` heuristic (`_PlacedBlock.computeAndQuantize`'s default path,
+/// already run once by the time this is called — see step 5 of
+/// `encodeLossyVardctL0`): scores every candidate in
+/// [_rdHfMultCandidates] against a real distortion measure (weighted
+/// squared error — `quantizeCandidate`'s `distortion`, weighted by the
+/// same per-frequency `rawWeight` table quantization itself uses, since
+/// that's exactly what the encoder already treats as perceptually
+/// important) and a real rate estimate ([_blockRate]), picking the
+/// minimizer of `distortion + lambda * rate`.
+///
+/// The rate estimate needs a real, already-built Huffman code-length
+/// table, but that table depends on the very quantization decisions this
+/// search is trying to make — resolved with a **bootstrap pass**: build a
+/// real `_AcClustering` from the heuristic's own already-committed
+/// choices, and *freeze* both its code-length table and its non-zero-
+/// count prediction grid ([_computeGroupTokens]'s `predictedOut`) for
+/// scoring every candidate. This is sound (not just convenient) because
+/// `HfCoefficients.getBlockContext` only lets `hfMult` shift which
+/// cluster a token routes to via `HfBlockContext.qfThresholds`, which
+/// this encoder's always-used `HfBlockContext.defaults()` leaves empty —
+/// so no candidate's *context* depends on which candidate wins, only the
+/// *values* landing in that context do. The prediction grid is a real,
+/// accepted approximation, though (a candidate other than the
+/// heuristic's original choice could in principle shift a later block's
+/// non-zero-count prediction) — see doc/spec_notes.md for the calibration
+/// status and measured impact of that approximation.
+void _chooseHfMultRd(
+    List<_PlacedBlock> placedBlocks,
+    List<List<Float32List>> planes,
+    _ChromaFromLumaFit cfl,
+    double refStep,
+    List<double> sd,
+    List<List<Float32List>> rawWeight8,
+    List<List<Float32List>> rawWeight16,
+    List<double> scaleFactor,
+    List<Int32List> dcInt,
+    int bw,
+    List<Float32List> scratch8a,
+    List<Float32List> scratch8b,
+    List<Float32List> scratch16a,
+    List<Float32List> scratch16b,
+    HfBlockContext hfctx,
+    Map<int, _TransformCtx> ctxByType,
+    int groupsX,
+    int groupsY,
+    List<List<_PlacedBlock>> blocksByGroup,
+    double? lambdaOverride) {
+  final predictedOut = <_PlacedBlock, Int32List>{};
+  final bootstrapTokens = <_GroupTokens>[
+    for (var gy = 0; gy < groupsY; gy++)
+      for (var gx = 0; gx < groupsX; gx++)
+        _computeGroupTokens(gy * 32, gx * 32, blocksByGroup[gy * groupsX + gx],
+            hfctx, ctxByType,
+            predictedOut: predictedOut),
+  ];
+  final bootstrap = _chooseAcClustering(bootstrapTokens);
+  final lengths = bootstrap.codes.tokenBitLengths();
+  final clusterMap = bootstrap.clusterMap;
+  final kLambda = lambdaOverride ?? _kRdLambda;
+  final lambda = kLambda * refStep * refStep;
+
+  final chosenHistogram = const bool.fromEnvironment('jxl.encdebug')
+      ? <int, int>{for (final m in _rdHfMultCandidates) m: 0}
+      : null;
+  for (final block in placedBlocks) {
+    final coeffBuf = block.computeCoeffBuf(
+        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+    final rawWeight = block.tt == _tt16 ? rawWeight16 : rawWeight8;
+    final ctx = ctxByType[block.tt.type]!;
+    final predicted = predictedOut[block]!;
+
+    var bestCost = double.infinity;
+    var bestMult = _rdHfMultCandidates[0];
+    ({List<double> dc, List<Int32List> ac, double distortion})? bestCandidate;
+    for (final mult in _rdHfMultCandidates) {
+      final candidate =
+          block.quantizeCandidate(coeffBuf, mult, sd, rawWeight, scaleFactor);
+      final rate =
+          _blockRate(ctx, hfctx, candidate.ac, predicted, clusterMap, lengths);
+      final cost = candidate.distortion + lambda * rate;
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestMult = mult;
+        bestCandidate = candidate;
+      }
+    }
+    block.commit(bestCandidate!, bestMult, dcInt, bw);
+    if (chosenHistogram != null) {
+      chosenHistogram[bestMult] = chosenHistogram[bestMult]! + 1;
+    }
+  }
+  if (chosenHistogram != null) {
+    // ignore: avoid_print
+    print('vardct RD hfMult: lambda=$lambda chosen=$chosenHistogram');
+  }
 }
 
 /// Writes the AC coefficient payload for one group using an already-built

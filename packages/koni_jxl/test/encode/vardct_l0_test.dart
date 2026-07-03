@@ -316,6 +316,46 @@ void main() {
     }
   });
 
+  test('RD hfMult search (opt-in) decodes correctly', () {
+    if (!_haveDjxl) return;
+    // Phase 1 gate (doc/spec_notes.md): correctness only, not yet a
+    // quality/size claim (kLambda is uncalibrated — see
+    // tool/calibrate_rd_lambda.dart). Exercises the bootstrap pass, the
+    // per-block candidate scoring, and the commit path across single-
+    // group, multi-group and multi-LF-group sizes, plus combination with
+    // 16x16 blocks (enableVariableTransforms) to check the two opt-in
+    // features don't interact badly even though RD search doesn't yet
+    // choose between transform sizes itself.
+    for (final (w, h, variableTransforms) in [
+      (256, 256, false),
+      (264, 104, false), // multi-group
+      (2056, 8, false), // multi-LF-group
+      (264, 264, true), // + 16x16 blocks
+    ]) {
+      final pixels = _synthetic(w, h, 7);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: w,
+          height: h,
+          config: VardctL0Config(
+              enableRdHfMult: true,
+              enableVariableTransforms: variableTransforms));
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, w);
+      expect(image.height, h);
+      final dir = Directory.systemTemp.createTempSync('koni_rd');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed for ${w}x$h: ${r.stderr}');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }
+  });
+
   test('variable transforms default off: regresses manga-like content', () {
     if (!_haveDjxl) return;
     // Regression guard for the enableVariableTransforms default. The

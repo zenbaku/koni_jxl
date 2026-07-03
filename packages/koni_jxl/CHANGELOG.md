@@ -66,6 +66,17 @@
   the clamped-gradient predictor, keeping whichever compresses smaller —
   a further ~5% reduction on real photo content where WP wins, no change
   where gradient already wins.
+- **Lossy (VarDCT) — RD-hfMult search (`VardctL0Config.enableRdHfMult`,
+  off by default).** A genuine per-block rate-distortion search replacing
+  the crude 3-bucket adaptive-quantization heuristic: real weighted-
+  squared-error distortion, a real Huffman-code-length-based rate
+  estimate (`EntropyCodes.tokenBitLengths()`, new), correctness-verified
+  against djxl in every configuration tried. Calibration
+  (`tool/calibrate_rd_lambda.dart`) found no single trade-off constant
+  both beats the heuristic on real photo content and preserves its
+  smooth-gradient banding protection — a genuine modeling limit (plain
+  weighted MSE can't see banding sensitivity the way a real perceptual
+  metric would), not a bug, documented in doc/spec_notes.md.
 - **ANS (rANS)** is now a per-image lossless entropy candidate alongside
   prefix codes, and can carry LZ77 matches (`plain`/`LZ77` x
   `prefix`/`ANS`, smallest actual output wins).

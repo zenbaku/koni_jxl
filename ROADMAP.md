@@ -167,6 +167,31 @@ output for where the gap actually is.
   byte-identical where gradient already wins (`palette16`, no regression).
   A DC context tree and AC-side rate-distortion search remain the larger
   levers — see doc/spec_notes.md.
+- ✅ **Compression efficiency, round 3: a genuine RD search for hfMult
+  (implemented; off by default — calibration found a real modeling
+  limit, not a bug).** Scoped via two independent research agents before
+  writing code (see doc/spec_notes.md for the full design and the
+  grounding fact that made it tractable: `hfMult` can't change which
+  entropy cluster a token routes to, only what value lands there, given
+  this encoder's always-empty `HfBlockContext.qfThresholds`). Implemented
+  a real per-block cost/benefit decision — weighted-squared-error
+  distortion, a real Huffman-code-length-based rate estimate (`Entropy
+  Codes.tokenBitLengths()`, new and unit-tested), a bootstrap-then-score
+  architecture — behind `VardctL0Config.enableRdHfMult` (default
+  `false`). Correctness is fully verified (djxl round-trips clean in
+  every configuration tried). **Calibration (`tool/calibrate_rd_lambda.
+  dart`) found no single trade-off constant beats the heuristic on real
+  photo content while preserving its smooth-gradient banding protection**
+  — the photo-favorable setting measurably removes most of the
+  heuristic's banding protection (confirmed via the actual per-block
+  multiplier histogram, not inferred), because plain weighted MSE can't
+  see banding sensitivity the way a real perceptual metric would. This is
+  a genuine modeling gap, not a constant to keep searching for — see
+  doc/spec_notes.md before re-attempting without changing the distortion
+  metric itself. The infrastructure (rate estimator, RD search, and
+  calibration tool) ships anyway: it's correctness-verified and directly
+  reusable for a future banding-aware distortion term or for the
+  transform-size RD search still deferred from L3.
 
 ---
 

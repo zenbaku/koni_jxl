@@ -487,14 +487,8 @@ final class EntropyCodes {
   double estimatedBits() {
     var bits = _extraBits;
     for (final hist in _histograms) {
-      var used = 0;
-      var total = 0;
-      for (final count in hist) {
-        if (count > 0) used++;
-        total += count;
-      }
-      if (total == 0 || used <= 1) continue; // zero-bit symbols
-      final lens = huffmanLengths(hist, 15);
+      final lens = _safeLengths(hist);
+      if (lens == null) continue; // zero-bit symbols
       for (var s = 0; s < hist.length; s++) {
         bits += hist[s] * lens[s];
       }
@@ -502,6 +496,34 @@ final class EntropyCodes {
       bits += 8.0 * hist.length.clamp(4, 64) + 40;
     }
     return bits;
+  }
+
+  /// Per-cluster Huffman code length for every token (0 for unused/
+  /// zero-bit-symbol clusters) — an auxiliary table for cheap rate
+  /// estimation elsewhere (e.g. a per-block rate-distortion decision
+  /// scoring several quantization candidates against an already-built,
+  /// frozen histogram), not part of the real bitstream. Uses the exact
+  /// same length-limited Huffman construction [estimatedBits] and the
+  /// real prefix-code writer already use, so it inherits their
+  /// 1-bit-per-symbol floor correctness (Shannon entropy is not safe
+  /// here — see [estimatedBits]'s doc comment).
+  List<List<int>> tokenBitLengths() => [
+        for (final hist in _histograms)
+          _safeLengths(hist) ?? List<int>.filled(hist.length, 0),
+      ];
+
+  /// Length-limited Huffman lengths for [hist], or null when the cluster
+  /// has 0 or 1 used symbols (no real code needed — [estimatedBits] and
+  /// [tokenBitLengths] both treat that as a zero-bit-per-symbol cluster).
+  List<int>? _safeLengths(List<int> hist) {
+    var used = 0;
+    var total = 0;
+    for (final count in hist) {
+      if (count > 0) used++;
+      total += count;
+    }
+    if (total == 0 || used <= 1) return null;
+    return huffmanLengths(hist, 15);
   }
 
   // --- ANS (rANS) mode ---

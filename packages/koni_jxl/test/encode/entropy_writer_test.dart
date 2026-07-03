@@ -49,6 +49,50 @@ void main() {
     ]);
   });
 
+  test('tokenBitLengths matches estimatedBits\' internal payload computation',
+      () {
+    // Verifies EntropyCodes.tokenBitLengths() (an auxiliary table for
+    // cheap per-block rate estimation elsewhere) reproduces exactly the
+    // same per-token bit lengths estimatedBits() computes internally —
+    // both must come from the same real, length-limited Huffman
+    // construction (huffmanLengths), not an approximation, per this
+    // project's "never Shannon entropy" rule (see entropy_writer.dart's
+    // estimatedBits doc comment).
+    const config = HybridIntegerConfig(4, 1, 0);
+    final rng = math.Random(42);
+    final contexts = <int>[];
+    final values = <int>[];
+    // Context 0: heavily skewed (real Huffman code needed).
+    for (var i = 0; i < 200; i++) {
+      contexts.add(0);
+      values.add(rng.nextInt(3) == 0 ? 5 : 0);
+    }
+    // Context 1: spread out (also a real, less-skewed code).
+    for (var i = 0; i < 200; i++) {
+      contexts.add(1);
+      values.add(rng.nextInt(20));
+    }
+    // Context 2: never referenced -> a degenerate, all-zero cluster.
+    final codes = EntropyCodes.build(3, contexts, values, config);
+    final lens = codes.tokenBitLengths();
+    expect(lens.length, 3);
+    expect(lens[2], [0]); // unused context: degenerate 1-symbol alphabet
+
+    var recomputedPayload = 0.0;
+    for (var i = 0; i < contexts.length; i++) {
+      final (token, extraBits, _) = tokenizeHybrid(config, values[i]);
+      recomputedPayload += lens[contexts[i]][token] + extraBits;
+    }
+    var headerBits = 0.0;
+    for (final hist in lens) {
+      if (hist.any((l) => l > 0)) {
+        headerBits += 8.0 * hist.length.clamp(4, 64) + 40;
+      }
+    }
+    expect(
+        recomputedPayload + headerBits, closeTo(codes.estimatedBits(), 1e-6));
+  });
+
   test('fuzz: random tokens, contexts and configs round-trip', () {
     final rng = math.Random(1234);
     for (var iter = 0; iter < 200; iter++) {
