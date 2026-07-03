@@ -251,6 +251,23 @@ output for where the gap actually is.
   (the gradient banding-protection test's own RDOQ-off baseline already
   exceeds its gate above `distance=4` — a pre-existing gap in that
   heuristic's own validation coverage, left for a future session).
+- 🔲 **Check whether `_chooseHfMultRd`'s own lambda has the same
+  distance-scaling bug RDOQ had.** `_kRdLambda` was also only ever
+  calibrated at `distance=1.0`, and shares RDOQ's old (buggy)
+  `refStep^2` scaling convention — never caught because hfMult's RD
+  search was already shelved for a different reason (the banding blind
+  spot, round 3) before anyone tested it across distances. Worth a
+  multi-distance check (same method as round 5's fix) before ever
+  revisiting hfMult's RD search, independent of the banding question.
+- 🔲 **Fix the gradient banding-protection test's own gate gap above
+  `distance=4`.** Found as a side effect of round 5's fix, confirmed
+  unrelated to RDOQ (byte-identical output regardless of `enableRdoq`):
+  the `VardctL0Config.fromDistance`-driven L2 adaptive-quant heuristic's
+  own RMSE, with every RD feature off, already exceeds the smooth-
+  gradient regression test's 1.0 gate at `distance=4` (1.043) and
+  `distance=8` (1.513) — that test has only ever run at the implicit
+  default `distance=1.0`. Pre-existing, not a regression from this
+  session's work.
 
 ---
 

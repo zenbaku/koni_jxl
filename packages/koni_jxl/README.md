@@ -62,17 +62,21 @@ playback, background-isolate encode), use
 - RGB 8-bit input, any width/height (padded internally to the 8-pixel
   block grid VarDCT requires)
 - Real HF coefficient context model, adaptive per-block quantization,
-  per-region chroma-from-luma, gradient-predicted DC coefficients,
-  multi-group and multi-LF-group support
+  per-region chroma-from-luma, a learned DC context tree, gradient/
+  weighted-predictor DC prediction, a per-AC-coefficient rate-distortion
+  search (RDOQ, on by default), multi-group and multi-LF-group support
 - Gaborish/EPF filters and adaptive 8x8/16x16 transform size are
   implemented but **off by default** — both help photographic content
   but measurably hurt manga's screentone/line-art content (see
   [doc/spec_notes.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/spec_notes.md)
   in the repository)
-- Correctness is djxl-verified; **compression efficiency is improving
-  but not yet competitive** — currently 1.2-2.5x larger than `cjxl -e1`
-  at matched `distance` (no rate-distortion search yet, only 2 of 27
-  transform types), see `tool/bench_lossy_vs_cjxl.dart`
+- Correctness is djxl-verified; **compression efficiency is a work in
+  progress, with real wins already banked** — on manga-typical
+  screentone content at low-to-mid `distance`, files are already
+  *smaller* than `cjxl -e1` (0.84-0.94x); on real photo content the gap
+  is 1.3-2.3x depending on `distance`, mostly structural (only 2 of 27
+  transform types implemented, no transform-type RD search yet), see
+  `tool/bench_lossy_vs_cjxl.dart`
 
 **Robustness** — all decode surfaces throw only `JxlException` on
 malformed input (mutation-fuzz verified); `JxlLimits` caps

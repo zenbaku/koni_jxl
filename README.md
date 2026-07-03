@@ -120,20 +120,22 @@ B/W page at ~99% of cjxl -e3 and a color page at ~81% of cjxl -e3, at
 
 **Lossy** (`encodeLossy`, RGB 8-bit, any width/height): real HF
 coefficient context model, adaptive per-block quantization, per-region
-chroma-from-luma, gradient-predicted DC coefficients, multi-group/
-multi-LF-group support for arbitrarily large images. Gaborish/EPF
-filters and adaptive 8x8/16x16 transform size are available but off by
-default — both measurably help smooth photographic content but hurt
-manga's screentone/line-art content, so they're opt-in (see
-`doc/spec_notes.md` for the numbers). Correctness is solid
-(djxl-verified against the shared corpus and hand-written test
-patterns); **compression efficiency is improving but not yet
-competitive**: at matched `distance`, files currently run 1.2-2.5x
-larger than `cjxl -e1` (see
-`packages/koni_jxl/tool/bench_lossy_vs_cjxl.dart`), since there's no
-rate-distortion search yet and only 2 of the format's 27 transform types
-are implemented — real quality/compactness work, tracked in
-ROADMAP.md, rather than a missing capability.
+chroma-from-luma, a learned DC context tree, gradient/weighted-predictor
+DC prediction, a per-AC-coefficient rate-distortion search (RDOQ,
+on by default), and multi-group/multi-LF-group support for arbitrarily
+large images. Gaborish/EPF filters and adaptive 8x8/16x16 transform size
+are available but off by default — both measurably help smooth
+photographic content but hurt manga's screentone/line-art content, so
+they're opt-in (see `doc/spec_notes.md` for the numbers). Correctness is
+solid (djxl-verified against the shared corpus and hand-written test
+patterns); **compression efficiency is a work in progress, with real
+wins already banked**: on manga-typical screentone content at low-to-mid
+`distance`, files are already *smaller* than `cjxl -e1` (0.84-0.94x);
+on real photo content the gap is 1.3-2.3x depending on `distance` (see
+`packages/koni_jxl/tool/bench_lossy_vs_cjxl.dart`). The remaining gap is
+mostly structural — only 2 of the format's 27 transform types are
+implemented, and there's no RD search over transform-type choice yet —
+tracked in ROADMAP.md.
 
 Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` (lossless) and
 `encodeJxlLossyFromRgba` / `encodeJxlLossyFromUiImage` (lossy, alpha
