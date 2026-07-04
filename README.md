@@ -85,13 +85,16 @@ Not yet (decoding throws `JxlUnsupportedException` with the feature name):
 - ⏳ Float (HDR) sample formats; ICC-driven output color transforms
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless
-manga page decodes in ~60 ms (effort 1 encodes) to ~400 ms (effort 7–9).
-Lossy (VarDCT) pages decode in ~0.3 s (JPEG-transcoded manga chapters) to
-~0.5 s (worst-case dense screentone at effort 7), using Float32x4 SIMD
-throughout the float pipeline: fused 8×8 inverse DCT, batched-vector
-large DCTs, dequantization, XYB inverse, gaborish and EPF filters.
-Flutter Web (dart2js) emulates SIMD and decodes lossy images noticeably
-slower.
+manga-style (screentone/line-art) page decodes in ~60 ms (effort 1
+encodes) to ~400 ms (effort 7–9); smooth/photographic content is slower
+to decode losslessly (harder for the predictor and context model) —
+see [doc/BENCHMARKS.md](doc/BENCHMARKS.md) for the content-type
+breakdown. Lossy (VarDCT) pages decode in ~0.3 s (JPEG-transcoded manga
+chapters) to ~0.5 s (worst-case dense screentone at effort 7), using
+Float32x4 SIMD throughout the float pipeline: fused 8×8 inverse DCT,
+batched-vector large DCTs, dequantization, XYB inverse, gaborish and EPF
+filters. Flutter Web (dart2js) emulates SIMD and decodes lossy images
+noticeably slower.
 
 ## Encoding
 
@@ -114,9 +117,17 @@ threshold) through **both** this package's decoder and djxl.
 YCoCg RCT by exact coded-size estimates. It learns a per-image context
 tree (the biggest lever for lossless size), a modular transform (palette
 / YCoCg RCT), and the smallest of four entropy modes ({plain, LZ77} x
-{prefix, ANS}). Real manga pages land near or below `cjxl -e3` — e.g. a
-B/W page at ~99% of cjxl -e3 and a color page at ~81% of cjxl -e3, at
-~0.3-1 s/page single-threaded. 8/16-bit gray/RGB with optional alpha.
+{prefix, ANS}). Real manga pages reportedly land near or below `cjxl -e3`,
+at ~0.3-1 s/page single-threaded — pre-existing figures, not
+independently reverified for this pass (`manga_samples/` only has
+JPEG-transcoded pages, a harder and slower case than a clean scan; see
+[doc/BENCHMARKS.md](doc/BENCHMARKS.md)'s "Real-world manga chapters"
+section for what was actually checked). On the synthetic corpus's
+manga-style (screentone) test image, this encoder beats **every** `cjxl`
+effort level including `-e9` — see doc/BENCHMARKS.md for the full,
+reproducible comparison (and why `-e3` specifically isn't a reliable
+bar: `cjxl`'s own effort levels aren't monotonic in size on halftone
+content). 8/16-bit gray/RGB with optional alpha.
 
 **Lossy** (`encodeLossy`, RGB 8-bit, any width/height): real HF
 coefficient context model, adaptive per-block quantization, per-region
@@ -130,12 +141,15 @@ they're opt-in (see `doc/spec_notes.md` for the numbers). Correctness is
 solid (djxl-verified against the shared corpus and hand-written test
 patterns); **compression efficiency is a work in progress, with real
 wins already banked**: on manga-typical screentone content at low-to-mid
-`distance`, files are already *smaller* than `cjxl -e1` (0.84-0.94x);
-on real photo content the gap is 1.3-2.3x depending on `distance` (see
-`packages/koni_jxl/tool/bench_lossy_vs_cjxl.dart`). The remaining gap is
-mostly structural — only 2 of the format's 27 transform types are
-implemented, and there's no RD search over transform-type choice yet —
-tracked in ROADMAP.md.
+`distance` (0.5–2.0), files are already *smaller* than `cjxl -e1`
+(0.81-0.94x, measured — the gap flips past `distance` 2.0, where the
+RDOQ heuristics weren't tuned); on smooth/photographic content the gap
+is larger (1.5x+ vs. `cjxl -e1` at `distance=1.0`). See
+[doc/BENCHMARKS.md](doc/BENCHMARKS.md) for the full table, including
+`cjxl -e7`'s real RD search (0.37-0.54x on manga content — the headroom
+tracked below). The remaining gap is mostly structural — only 2 of the
+format's 27 transform types are implemented, and there's no RD search
+over transform-type choice yet — tracked in ROADMAP.md.
 
 Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` (lossless) and
 `encodeJxlLossyFromRgba` / `encodeJxlLossyFromUiImage` (lossy, alpha
@@ -148,6 +162,26 @@ throw a `JxlException` — never a `RangeError`, hang, or out-of-memory.
 This contract is fuzz-tested and enforced by a regression suite;
 `JxlLimits` caps what a crafted header can allocate (override if you
 legitimately decode very large images).
+
+## Benchmarks
+
+Full methodology, tables, and exact repro commands live in
+[doc/BENCHMARKS.md](doc/BENCHMARKS.md) — regenerated for every revision of
+that file, not hand-copied prose. Headline numbers (Apple M1,
+single-threaded, AOT-compiled, libjxl v0.11.2, synthetic 1536×2200 corpus
+pages):
+
+| | manga-style (screentone) | smooth/photographic |
+|---|---|---|
+| lossless decode | 350 ms (9.7 MP/s) | 748 ms (2.1 MP/s) |
+| lossy decode (effort 7) | 300-430 ms | 210-410 ms |
+| lossless size vs. `cjxl` | 48% of `-e7`, 88% of `-e9` | competitive only with `-e1`/`-e3` |
+| lossy size vs. `cjxl -e1` (`distance` 0.5-2.0) | 0.81-0.94x | 1.5x+ |
+
+Reproduce the decode-speed table with
+`python3 tool/gen_corpus.py && (cd packages/koni_jxl && dart compile exe tool/bench_decode.dart -o /tmp/bd && /tmp/bd)`;
+the compression tables with `tool/bench_lossless_vs_cjxl.dart` and
+`tool/bench_lossy_vs_cjxl.dart` in the same package.
 
 ## Roadmap
 

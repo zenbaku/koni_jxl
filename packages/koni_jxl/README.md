@@ -72,11 +72,13 @@ playback, background-isolate encode), use
   in the repository)
 - Correctness is djxl-verified; **compression efficiency is a work in
   progress, with real wins already banked** — on manga-typical
-  screentone content at low-to-mid `distance`, files are already
-  *smaller* than `cjxl -e1` (0.84-0.94x); on real photo content the gap
-  is 1.3-2.3x depending on `distance`, mostly structural (only 2 of 27
-  transform types implemented, no transform-type RD search yet), see
-  `tool/bench_lossy_vs_cjxl.dart`
+  screentone content at low-to-mid `distance` (0.5-2.0), files are
+  already *smaller* than `cjxl -e1` (0.81-0.94x, measured); on smooth
+  photographic content the gap is larger (1.5x+), mostly structural
+  (only 2 of 27 transform types implemented, no transform-type RD search
+  yet). See
+  [doc/BENCHMARKS.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/BENCHMARKS.md)
+  in the repository for the full, reproducible comparison
 
 **Robustness** — all decode surfaces throw only `JxlException` on
 malformed input (mutation-fuzz verified); `JxlLimits` caps
@@ -88,9 +90,16 @@ and float (HDR) sample formats.
 
 ## Performance
 
-Apple Silicon, AOT, single-threaded: a 1536×2200 lossless page decodes
-in ~60–410 ms; typical lossy pages in ~0.3–0.5 s, using Float32x4 SIMD
-across the lossy pipeline (native on AOT targets; emulated on the web).
+Apple M1, AOT, single-threaded: a 1536×2200 manga-style (screentone)
+page decodes losslessly in ~60–410 ms depending on effort; smooth/
+photographic content is slower to decode losslessly (harder for the
+predictor and context model — up to ~750 ms measured). Typical lossy
+pages decode in ~0.3–0.5 s, using Float32x4 SIMD across the lossy
+pipeline (native on AOT targets; emulated on the web).
+
+Full methodology, reproducible tables (decode speed and compression vs.
+`cjxl`, by content type), and exact commands:
+[doc/BENCHMARKS.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/BENCHMARKS.md).
 
 ## Command-line tools
 

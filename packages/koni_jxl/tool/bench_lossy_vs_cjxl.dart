@@ -20,6 +20,14 @@ import 'package:koni_jxl/koni_jxl.dart';
 /// to RGB (this encoder's `encodeLossy` is RGB-only), matching
 /// `encoder_lossy_corpus_test.dart`'s own pattern for exercising grayscale
 /// corpus content.
+///
+/// `encode-ms` is a single cold call, not a warmed-up loop — for
+/// apples-to-apples numbers across tools, AOT-compile first
+/// (`dart compile exe tool/bench_lossy_vs_cjxl.dart -o /tmp/bl && /tmp/bl`).
+/// Note this can come out *slower* than `dart run` here: the encoder's
+/// hot inner loops run long enough within one call for the JIT to tier
+/// them up mid-flight, while default `dart compile exe` has no
+/// profile-guided optimization to draw on. See `doc/BENCHMARKS.md`.
 void main(List<String> args) {
   final inputs = args.isNotEmpty
       ? args

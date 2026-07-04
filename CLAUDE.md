@@ -29,7 +29,12 @@ animation and splines).
 - `packages/koni_jxl/tool/` — dev tools: `profile_decode.dart` (phase
   timings; compile with `-Djxl.timings=true`), `bench_dct.dart`,
   `bench_simd.dart`, `anim_dump.dart` (frames → PAM;
-  `-Djxl.framedebug=true` prints frame headers).
+  `-Djxl.framedebug=true` prints frame headers), `bench_decode.dart`
+  (decode speed vs djxl across the corpus — AOT-compile it, `dart run`
+  numbers don't match), `bench_lossless_vs_cjxl.dart` /
+  `bench_lossy_vs_cjxl.dart` (compression vs cjxl by content type). See
+  `doc/BENCHMARKS.md` for the reproducible numbers these tools produce —
+  update it (not just prose in the READMEs) when a change moves them.
 - `third_party/` (all gitignored): `jxlatte/` (MIT Java reference clone),
   `conformance/` (official testcases), `corpus/` (generated).
 - `manga_samples/` — user's copyrighted CBZs. **Never commit. Never add
