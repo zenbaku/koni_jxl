@@ -18,10 +18,11 @@ import '../wp_predictor.dart';
 import 'xyb_forward.dart';
 
 /// Lossy (VarDCT) encoder (doc/lossy_encoder_plan.md's L0/L1/L2/L3): 8x8
-/// DCT (plus optional adaptive 16x16 selection), real HF coefficient
-/// context model, multi-group, adaptive per-block quantization, a custom
-/// per-frequency quant weight table and optional filters; still
-/// single-LfGroup (see ROADMAP.md for what's left).
+/// DCT (plus adaptive 16x16 selection, on by default — see
+/// `VardctL0Config.enableVariableTransforms`), real HF coefficient context
+/// model, multi-group, multi-LF-group, adaptive per-block quantization, a
+/// custom per-frequency quant weight table and optional filters (see
+/// ROADMAP.md for what's left).
 ///
 /// The overall quantization step is `scaleFactor[c] / rawWeight[c][y][x]`
 /// for AC and `lfDequantDefault[c] / (globalScale * quantLF)` for DC; both
@@ -39,7 +40,8 @@ class VardctL0Config {
     this.bqmScale = 2,
     this.acScale = 1.0,
     this.enableFilters = false,
-    this.enableVariableTransforms = false,
+    this.enableVariableTransforms = true,
+    this.transformRdLambdaOverride,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
     this.enableRdoq = true,
@@ -94,17 +96,33 @@ class VardctL0Config {
   final bool enableFilters;
 
   /// Whether to adaptively choose between 8x8 and 16x16 DCT per 16x16
-  /// pixel region (a rough bit-cost proxy decides). Defaults to **off**:
-  /// the proxy is a crude per-coefficient magnitude/count estimate, not
-  /// the real context-adaptive entropy cost, and it mispredicts badly on
-  /// regular high-frequency content — it picked 16x16 100% of the time on
-  /// a screentone test pattern, yet the real (entropy-coded, djxl-
-  /// verified) output was both larger *and* worse RMSE than plain 8x8
-  /// there (+20% size) and on line art (+31% size). It's a small, genuine
-  /// win on smooth photographic content (~4% smaller at matched quality
-  /// in testing). See doc/spec_notes.md before flipping this on for a
-  /// non-manga use case.
+  /// pixel region. Defaults to **on**: the per-region decision
+  /// (`_decideTransformLayout`) is a real, bootstrap-frozen bit-rate
+  /// estimate — quantize the whole image as all-8x8 first, build a real AC
+  /// entropy-code-length table from that, then compare each region's
+  /// actual `distortion + lambda * rate` cost against a freshly quantized
+  /// 16x16 candidate's — replacing an earlier version that used a crude
+  /// pre-quantization coefficient-magnitude proxy with no visibility into
+  /// the real context-adaptive entropy cost (measured to over-select
+  /// 16x16 on regular high-frequency content: +20% size on screentone,
+  /// +31% on line art, despite picking 16x16 there 50-100% of the time).
+  /// On top of that per-region estimate, `encodeLossyVardctL0` also
+  /// assembles a real, fully-encoded body for *both* the all-8x8 layout
+  /// and the decided mixed layout and keeps whichever is genuinely
+  /// smaller — the same real-assembly safety net RDOQ already uses, one
+  /// level up — so enabling this can never produce a larger file than
+  /// leaving it off, only the same size (the estimate found no
+  /// improvement) or smaller. See `_decideTransformLayout`'s doc comment
+  /// for the full method and doc/spec_notes.md for the calibration and
+  /// measured numbers behind the current default.
   final bool enableVariableTransforms;
+
+  /// Overrides the rate/distortion trade-off constant `_kTransformRdLambda`
+  /// used by [enableVariableTransforms]'s layout decision (a runtime knob
+  /// rather than a recompile, purely so
+  /// `tool/calibrate_transform_lambda.dart` can sweep it in one process).
+  /// Null (the default) uses the shipped, calibrated constant.
+  final double? transformRdLambdaOverride;
 
   /// Whether to replace the default 3-bucket adaptive-quantization
   /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
@@ -284,48 +302,11 @@ Uint8List encodeLossyVardctL0(
   // an absolute threshold tuned for one quantization strength.
   final refStep = scaleFactor[1] / rawWeight8[1][0][1];
 
-  // 4. Decide the block layout: adaptively 8x8 or 16x16 per aligned 16x16
-  // pixel region (a rough bit-cost proxy, `_should16x16`), in the exact
-  // raster-scan-with-skip order `HfMetadata`'s decoder-side `_placeBlock`
-  // reconstructs from a flat block list — placement order IS the wire
-  // format here, not just a convenience.
-  final placedBlocks = <_PlacedBlock>[];
-  if (config.enableVariableTransforms) {
-    final covered = List<bool>.filled(bh * bw, false);
-    for (var by = 0; by < bh; by++) {
-      for (var bx = 0; bx < bw; bx++) {
-        if (covered[by * bw + bx]) continue;
-        final canPair = by.isEven &&
-            bx.isEven &&
-            by + 1 < bh &&
-            bx + 1 < bw &&
-            !covered[(by + 1) * bw + bx] &&
-            !covered[by * bw + bx + 1] &&
-            !covered[(by + 1) * bw + bx + 1];
-        if (canPair &&
-            _should16x16(planes[1], by, bx, refStep, scratch8a, scratch8b,
-                scratch16a, scratch16b)) {
-          covered[(by + 1) * bw + bx] = true;
-          covered[by * bw + bx + 1] = true;
-          covered[(by + 1) * bw + bx + 1] = true;
-          placedBlocks.add(_PlacedBlock(by, bx, _tt16));
-        } else {
-          placedBlocks.add(_PlacedBlock(by, bx, _tt8));
-        }
-      }
-    }
-  } else {
-    for (var by = 0; by < bh; by++) {
-      for (var bx = 0; bx < bw; bx++) {
-        placedBlocks.add(_PlacedBlock(by, bx, _tt8));
-      }
-    }
-  }
-
-  // 4.5. Context/grouping setup: hoisted ahead of quantization since it
-  // only depends on which transform types are placed and where — not on
-  // any block's chosen hfMult — and the RD-hfMult search (step 5.5) needs
-  // it for its bootstrap pass before step 6's real one.
+  // 4.5. Context/grouping setup: hoisted ahead of layout/quantization since
+  // it only depends on image size, not on which transform types end up
+  // placed where — the layout decision itself (step 4, below) now needs
+  // it too (a real bootstrap-frozen bit-rate estimate, not just the
+  // RD-hfMult search in step 5.5).
   final hfctx = HfBlockContext.defaults();
   final ctxByType = {
     for (final tt in [_tt8, _tt16]) tt.type: _TransformCtx(tt, hfctx),
@@ -338,32 +319,200 @@ Uint8List encodeLossyVardctL0(
   final groupsX = ceilDiv(paddedWidth, 256);
   final groupsY = ceilDiv(paddedHeight, 256);
   final numGroups = groupsX * groupsY;
-  final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
-  for (final block in placedBlocks) {
-    final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);
-    blocksByGroup[g].add(block);
-  }
 
-  // 5. Per-block forward DCT, chroma-from-luma pre-subtraction, adaptive
-  // quantization multiplier and quantization. dcInt is semantic-indexed
-  // (0=X, 1=Y, 2=B), always at native 8x8-block granularity (DC/LF is
-  // always coded per 8x8 cell regardless of the HF transform covering it —
-  // see _PlacedBlock's doc comment on the LLF relationship for 16x16).
-  final dcInt = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
-  for (final block in placedBlocks) {
-    block.computeAndQuantize(
+  // Custom per-frequency quant weight tables (if any), used by
+  // `_finishEncode`'s HfGlobal writer — doesn't depend on layout, so
+  // computed once regardless of which candidate(s) get assembled below.
+  final usesCustomWeights = config.acScale != 1.0;
+  final customParamsByIndex = usesCustomWeights
+      ? {
+          _tt8.parameterIndex: customDctParams8,
+          _tt16.parameterIndex: customDctParams16
+        }
+      : null;
+
+  // 4. Decide the block layout: adaptively 8x8 or 16x16 per aligned 16x16
+  // pixel region, in the exact raster-scan-with-skip order `HfMetadata`'s
+  // decoder-side `_placeBlock` reconstructs from a flat block list —
+  // placement order IS the wire format here, not just a convenience. Also
+  // performs this encoder's forward DCT + quantization (step 5, folded in
+  // below) — dcInt is semantic-indexed (0=X, 1=Y, 2=B), always at native
+  // 8x8-block granularity regardless of the HF transform covering it (see
+  // _PlacedBlock's doc comment on the LLF relationship for 16x16).
+  if (config.enableVariableTransforms) {
+    // _decideTransformLayout returns *two* fully independent candidates
+    // (its doc comment explains why) — assemble a real body for each and
+    // keep whichever is genuinely smaller, so this feature can never
+    // regress vs `enableVariableTransforms: false` alone, matching the
+    // real-assembly safety net this file's other RD features already use.
+    final dcIntBootstrap = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
+    final (bootstrapBlocks, mixedBlocks, dcIntFinal) = _decideTransformLayout(
         planes,
         cfl,
         refStep,
         sd,
-        block.tt == _tt16 ? rawWeight16 : rawWeight8,
+        rawWeight8,
+        rawWeight16,
         scaleFactor,
-        dcInt,
+        dcIntBootstrap,
+        bh,
         bw,
         scratch8a,
         scratch8b,
         scratch16a,
-        scratch16b);
+        scratch16b,
+        hfctx,
+        ctxByType,
+        groupsX,
+        groupsY,
+        config.transformRdLambdaOverride);
+    final bodyOff = _finishEncode(
+        bootstrapBlocks,
+        dcIntBootstrap,
+        bh,
+        bw,
+        groupsX,
+        groupsY,
+        numGroups,
+        hfctx,
+        ctxByType,
+        planes,
+        cfl,
+        refStep,
+        sd,
+        rawWeight8,
+        rawWeight16,
+        scaleFactor,
+        scratch8a,
+        scratch8b,
+        scratch16a,
+        scratch16b,
+        config,
+        customParamsByIndex,
+        width,
+        height);
+    // No region swapped to 16x16: mixedBlocks/dcIntFinal are content-
+    // identical to bootstrapBlocks/dcIntBootstrap (every kept cell is an
+    // exact `.copy()`, and dcIntFinal is an untouched clone), so assembling
+    // an "on" body would just reproduce bodyOff at ~2x the RDOQ/clustering/
+    // assembly cost for zero size difference — exactly the case for
+    // manga's dominant content types, where this feature is default-on but
+    // rarely (if ever) picks 16x16. `mixedBlocks.length == bh * bw` iff
+    // zero swaps happened (each swap removes 3 entries from the flat list).
+    if (mixedBlocks.length == bh * bw) {
+      if (const bool.fromEnvironment('jxl.encdebug')) {
+        // ignore: avoid_print
+        print('vardct variable-transform candidates: zero 16x16 swaps, '
+            'skipped "on" assembly (off=${bodyOff.length}B)');
+      }
+      return bodyOff;
+    }
+    final bodyOn = _finishEncode(
+        mixedBlocks,
+        dcIntFinal,
+        bh,
+        bw,
+        groupsX,
+        groupsY,
+        numGroups,
+        hfctx,
+        ctxByType,
+        planes,
+        cfl,
+        refStep,
+        sd,
+        rawWeight8,
+        rawWeight16,
+        scaleFactor,
+        scratch8a,
+        scratch8b,
+        scratch16a,
+        scratch16b,
+        config,
+        customParamsByIndex,
+        width,
+        height);
+    final chosen = bodyOff.length <= bodyOn.length ? bodyOff : bodyOn;
+    if (const bool.fromEnvironment('jxl.encdebug')) {
+      // ignore: avoid_print
+      print('vardct variable-transform candidates: off=${bodyOff.length}B '
+          'on=${bodyOn.length}B chosen=${identical(chosen, bodyOff) ? 'off' : 'on'}');
+    }
+    return chosen;
+  }
+
+  final dcInt = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
+  final placedBlocks = [
+    for (var by = 0; by < bh; by++)
+      for (var bx = 0; bx < bw; bx++) _PlacedBlock(by, bx, _tt8),
+  ];
+  for (final block in placedBlocks) {
+    block.computeAndQuantize(planes, cfl, refStep, sd, rawWeight8, scaleFactor,
+        dcInt, bw, scratch8a, scratch8b, scratch16a, scratch16b);
+  }
+  return _finishEncode(
+      placedBlocks,
+      dcInt,
+      bh,
+      bw,
+      groupsX,
+      groupsY,
+      numGroups,
+      hfctx,
+      ctxByType,
+      planes,
+      cfl,
+      refStep,
+      sd,
+      rawWeight8,
+      rawWeight16,
+      scaleFactor,
+      scratch8a,
+      scratch8b,
+      scratch16a,
+      scratch16b,
+      config,
+      customParamsByIndex,
+      width,
+      height);
+}
+
+/// Finishes encoding one already-decided, already-quantized block layout
+/// into a complete VarDCT bitstream: the optional RD-hfMult/RDOQ passes,
+/// real AC clustering, LF-group partitioning, and section assembly (steps
+/// 5.5-7 of `encodeLossyVardctL0`, factored out so
+/// `enableVariableTransforms` can run this same pipeline independently on
+/// two candidate layouts — see `_decideTransformLayout`'s doc comment —
+/// and keep whichever assembles smaller).
+Uint8List _finishEncode(
+    List<_PlacedBlock> placedBlocks,
+    List<Int32List> dcInt,
+    int bh,
+    int bw,
+    int groupsX,
+    int groupsY,
+    int numGroups,
+    HfBlockContext hfctx,
+    Map<int, _TransformCtx> ctxByType,
+    List<List<Float32List>> planes,
+    _ChromaFromLumaFit cfl,
+    double refStep,
+    List<double> sd,
+    List<List<Float32List>> rawWeight8,
+    List<List<Float32List>> rawWeight16,
+    List<double> scaleFactor,
+    List<Float32List> scratch8a,
+    List<Float32List> scratch8b,
+    List<Float32List> scratch16a,
+    List<Float32List> scratch16b,
+    VardctL0Config config,
+    Map<int, List<List<double>>>? customParamsByIndex,
+    int width,
+    int height) {
+  final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
+  for (final block in placedBlocks) {
+    final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);
+    blocksByGroup[g].add(block);
   }
 
   // 5.5. Optional: replace the L2 heuristic's per-block hfMult choice
@@ -476,14 +625,6 @@ Uint8List encodeLossyVardctL0(
   // PassGroup) — matching `frame.dart`'s exact TOC section ordering:
   // LfGlobal, one section per LF group, HfGlobal+passes, then one
   // PassGroup section per group.
-  final usesCustomWeights = config.acScale != 1.0;
-  final customParamsByIndex = usesCustomWeights
-      ? {
-          _tt8.parameterIndex: customDctParams8,
-          _tt16.parameterIndex: customDctParams16
-        }
-      : null;
-
   final out = BitWriter();
   writeImageHeader(
       out,
@@ -593,51 +734,210 @@ Uint8List _assembleLfGroupSection(
   return w.toBytes();
 }
 
-/// Rough bit-cost proxy (count of above-threshold coefficients, log-weighted
-/// by magnitude) comparing one 16x16 DCT against four independent 8x8 DCTs
-/// over the same 16x16 pixel region, on the Y channel only (the dominant
-/// perceptual signal). Measured to favor 16x16 on every content type tried
-/// (smooth gradients, screentone, line art, noise) in ad hoc testing before
-/// this was wired in — see doc/spec_notes.md.
-bool _should16x16(
-    List<Float32List> yPlane,
-    int by,
-    int bx,
-    double refStep,
-    List<Float32List> scratch8a,
-    List<Float32List> scratch8b,
-    List<Float32List> scratch16a,
-    List<Float32List> scratch16b) {
-  final c8 = List.generate(8, (_) => Float32List(8));
-  var cost8 = 0.0;
-  for (final oy in [by * 8, by * 8 + 8]) {
-    for (final ox in [bx * 8, bx * 8 + 8]) {
-      forwardDCT2D(yPlane, c8, oy, ox, 0, 0, 8, 8, scratch8a, scratch8b);
-      cost8 += _bitProxy(c8, 8, 8, 1, refStep);
-    }
-  }
-  final c16 = List.generate(16, (_) => Float32List(16));
-  forwardDCT2D(
-      yPlane, c16, by * 8, bx * 8, 0, 0, 16, 16, scratch16a, scratch16b);
-  final cost16 = _bitProxy(c16, 16, 16, 4, refStep);
-  return cost16 < cost8;
-}
+/// Rate/distortion trade-off constant for the 8x8-vs-16x16 layout decision
+/// (`_decideTransformLayout`), scaled the same way as `_kRdLambda`
+/// (`lambda = kLambda * refStep^2` — both trade off the *same* distortion
+/// metric, `quantizeCandidate`'s weighted-squared-error, against a bit-rate
+/// estimate, so the same scalar-quantizer-theory scaling law applies; see
+/// `_kRdLambda`'s doc comment for the derivation). Calibrated independently
+/// from `_kRdLambda` (via `tool/calibrate_transform_lambda.dart`, a
+/// multi-distance sweep across photo/gradient/screentone/line-art content —
+/// see doc/spec_notes.md for the calibration methodology this project
+/// learned the hard way with RDOQ's lambda, and for the measured numbers
+/// behind this specific value).
+const _kTransformRdLambda = 3000.0;
 
-double _bitProxy(
-    List<Float32List> coeffs, int h, int w, int numLlf, double thresh) {
-  var cost = 0.0;
-  var llfSeen = 0;
-  for (var y = 0; y < h; y++) {
-    for (var x = 0; x < w; x++) {
-      if (y < 2 && x < 2 && llfSeen < numLlf) {
-        llfSeen++;
-        continue; // LLF/DC positions are quantized separately.
+/// Decides the 8x8-vs-16x16 layout per 16x16-pixel region using a real,
+/// bootstrap-frozen bit-rate estimate instead of the old pre-quantization
+/// coefficient-magnitude proxy this replaced (`_should16x16`/`_bitProxy`,
+/// removed) — that proxy was measured to over-select 16x16 on regular
+/// high-frequency content (screentone, line art: real, djxl-verified output
+/// was both larger *and* worse RMSE than plain 8x8 despite the proxy
+/// favoring 16x16 there), because it had no visibility into the real
+/// context-adaptive entropy cost (see doc/spec_notes.md's L3 write-up).
+///
+/// Returns **two** fully independent, already-quantized-and-committed
+/// candidates — `(bootstrapBlocks, dcIntBootstrap already populated
+/// in-place, mixedBlocks, dcIntFinal)` — not just the mixed layout this
+/// decision favors: the caller (`encodeLossyVardctL0`) assembles a real
+/// body for *both* and keeps whichever is actually smaller, the same
+/// real-assembly safety net `_chooseAcClustering`/RDOQ already use
+/// elsewhere in this file, applied one level up (per-image instead of
+/// per-block-channel) — this decision's own cost estimate is only ever a
+/// bootstrap-frozen approximation (see point 3 below), so unlike RDOQ it
+/// cannot promise never-worse on its own; the outer safety net is what
+/// makes the combination never-worse. The two candidates share no mutable
+/// `_PlacedBlock` state (see [_PlacedBlock.copy]'s doc comment) — callers
+/// must not run [_PlacedBlock.computeAndQuantize] on any returned block
+/// (both are already committed).
+///
+/// **Method** (mirrors `_chooseHfMultRd`'s already-shipped
+/// bootstrap-then-freeze pattern, generalized from "which hfMult" to
+/// "which transform type"):
+/// 1. Quantize the *whole* image as all-8x8 blocks first (the
+///    "bootstrap"), committing into [dcIntBootstrap] and recording each
+///    block's own distortion ([_PlacedBlock.distortion]). This bootstrap
+///    layout, as-is, *is* the "off" candidate — identical to what
+///    `enableVariableTransforms: false` alone would have produced.
+/// 2. Build the bootstrap's own AC token/clustering pass
+///    ([_computeGroupTokens]/[_chooseAcClustering]) to get a real, frozen
+///    Huffman code-length table ([EntropyCodes.tokenBitLengths]) and
+///    cluster map — the same bootstrap-then-freeze soundness argument
+///    `_chooseHfMultRd`'s doc comment already establishes applies
+///    unchanged here: `HfCoefficients.getBlockContext` only lets `hfMult`
+///    (not transform type) shift which cluster a token routes to via
+///    `HfBlockContext.qfThresholds`, which stays empty regardless of any
+///    per-region transform-type decision, and each region's own `orderID`-
+///    derived context ([_TransformCtx.blockCtx]) is a pure function of
+///    *that* region's chosen type — so no candidate's context depends on
+///    which candidate wins, only the values landing in it do.
+/// 3. For every 2x2-aligned candidate region, compare the real bootstrap
+///    cost of its 4 already-committed 8x8 blocks (`sum(distortion + lambda
+///    * _blockRate(...))`, using each block's own frozen bootstrap
+///    `predicted` non-zero-count value) against a freshly quantized 16x16
+///    candidate's own cost (same formula) — keeping whichever is smaller.
+///    The 16x16 candidate reuses the region's top-left 8x8 block's own
+///    frozen `predicted` value: `HfCoefficients.getPredictedNonZeroes`
+///    depends only on the (already-decided) grid state to the region's
+///    west/north, not on this region's own footprint size, so this is
+///    *exact* whenever no earlier (west/north) region has itself been
+///    swapped to 16x16 yet, and an accepted approximation otherwise —
+///    identical in kind (not degree) to the approximation
+///    `_chooseHfMultRd`'s doc comment already documents and ships with.
+/// 4. A region that swaps to 16x16 gets a fresh `commit()` (overwriting
+///    the bootstrap's 8x8 DC values at those 4 cells with the
+///    LLF-inverted 16x16-consistent ones); a region that stays 8x8 needs
+///    no further work — its bootstrap commit already stands.
+(List<_PlacedBlock>, List<_PlacedBlock>, List<Int32List>)
+    _decideTransformLayout(
+        List<List<Float32List>> planes,
+        _ChromaFromLumaFit cfl,
+        double refStep,
+        List<double> sd,
+        List<List<Float32List>> rawWeight8,
+        List<List<Float32List>> rawWeight16,
+        List<double> scaleFactor,
+        List<Int32List> dcIntBootstrap,
+        int bh,
+        int bw,
+        List<Float32List> scratch8a,
+        List<Float32List> scratch8b,
+        List<Float32List> scratch16a,
+        List<Float32List> scratch16b,
+        HfBlockContext hfctx,
+        Map<int, _TransformCtx> ctxByType,
+        int groupsX,
+        int groupsY,
+        double? lambdaOverride) {
+  // 1. Bootstrap: quantize the whole image as all-8x8, committing into
+  // dcIntBootstrap — this becomes (unmodified) the "off" candidate's DC
+  // plane, so nothing below may overwrite it; the "on" (mixed-layout)
+  // candidate gets its own clone (dcIntFinal, below) instead.
+  final blockAt = List<_PlacedBlock?>.filled(bh * bw, null);
+  final bootstrapBlocks = <_PlacedBlock>[
+    for (var by = 0; by < bh; by++)
+      for (var bx = 0; bx < bw; bx++) _PlacedBlock(by, bx, _tt8),
+  ];
+  for (final block in bootstrapBlocks) {
+    block.computeAndQuantize(planes, cfl, refStep, sd, rawWeight8, scaleFactor,
+        dcIntBootstrap, bw, scratch8a, scratch8b, scratch16a, scratch16b);
+    blockAt[block.by * bw + block.bx] = block;
+  }
+  final bootstrapByGroup =
+      List<List<_PlacedBlock>>.generate(groupsX * groupsY, (_) => []);
+  for (final block in bootstrapBlocks) {
+    final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);
+    bootstrapByGroup[g].add(block);
+  }
+
+  // 2. Bootstrap AC tokens/clustering -> frozen rate table.
+  final predictedOut = <_PlacedBlock, Int32List>{};
+  final bootstrapTokens = <_GroupTokens>[
+    for (var gy = 0; gy < groupsY; gy++)
+      for (var gx = 0; gx < groupsX; gx++)
+        _computeGroupTokens(gy * 32, gx * 32,
+            bootstrapByGroup[gy * groupsX + gx], hfctx, ctxByType,
+            predictedOut: predictedOut),
+  ];
+  final bootstrap = _chooseAcClustering(bootstrapTokens);
+  final lengths = bootstrap.codes.tokenBitLengths();
+  final clusterMap = bootstrap.clusterMap;
+  final lambda = (lambdaOverride ?? _kTransformRdLambda) * refStep * refStep;
+  final ctx8 = ctxByType[_tt8.type]!;
+  final ctx16 = ctxByType[_tt16.type]!;
+
+  // Each bootstrap block's own real rate against the frozen table,
+  // precomputed once (every 8x8 cell belongs to exactly one 2x2 region).
+  final rate8 = Float64List(bh * bw);
+  for (final block in bootstrapBlocks) {
+    rate8[block.by * bw + block.bx] = _blockRate(
+        ctx8, hfctx, block.acInt, predictedOut[block]!, clusterMap, lengths);
+  }
+
+  // dcIntFinal starts as a clone of the bootstrap's DC plane; only cells
+  // covered by a region that swaps to 16x16 (below) ever get overwritten.
+  final dcIntFinal = [
+    for (final ch in dcIntBootstrap) Int32List.fromList(ch),
+  ];
+
+  // 3/4. Per-region decision, in the same raster-scan-with-skip order the
+  // decoder's placement reconstructs from the flat block list. Every
+  // non-merged cell gets an independent `.copy()` (not the bootstrap
+  // instance) so the "off" candidate (bootstrapBlocks) and "on" candidate
+  // (result, below) never alias the same mutable `_PlacedBlock` — the
+  // caller runs RD-hfMult/RDOQ separately on each candidate, and those
+  // passes mutate hfMult/acInt in place (see `_PlacedBlock.copy`'s doc
+  // comment).
+  final result = <_PlacedBlock>[];
+  final covered = List<bool>.filled(bh * bw, false);
+  for (var by = 0; by < bh; by++) {
+    for (var bx = 0; bx < bw; bx++) {
+      if (covered[by * bw + bx]) continue;
+      final canPair = by.isEven &&
+          bx.isEven &&
+          by + 1 < bh &&
+          bx + 1 < bw &&
+          !covered[(by + 1) * bw + bx] &&
+          !covered[by * bw + bx + 1] &&
+          !covered[(by + 1) * bw + bx + 1];
+      _PlacedBlock? merged;
+      if (canPair) {
+        final i00 = by * bw + bx, i01 = by * bw + bx + 1;
+        final i10 = (by + 1) * bw + bx, i11 = (by + 1) * bw + bx + 1;
+        final cost8 = blockAt[i00]!.distortion +
+            lambda * rate8[i00] +
+            blockAt[i01]!.distortion +
+            lambda * rate8[i01] +
+            blockAt[i10]!.distortion +
+            lambda * rate8[i10] +
+            blockAt[i11]!.distortion +
+            lambda * rate8[i11];
+
+        final candidate16 = _PlacedBlock(by, bx, _tt16);
+        final coeffBuf16 = candidate16.computeCoeffBuf(
+            planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+        final (mult16, quant16) = candidate16.chooseCandidate(
+            coeffBuf16, refStep, sd, rawWeight16, scaleFactor);
+        final rate16 = _blockRate(ctx16, hfctx, quant16.ac,
+            predictedOut[blockAt[i00]!]!, clusterMap, lengths);
+        final cost16 = quant16.distortion + lambda * rate16;
+
+        if (cost16 < cost8) {
+          candidate16.commit(quant16, mult16, dcIntFinal, bw);
+          merged = candidate16;
+        }
       }
-      final v = coeffs[y][x].abs();
-      if (v > thresh) cost += 1 + math.log(v / thresh) / math.ln2;
+      if (merged != null) {
+        covered[(by + 1) * bw + bx] = true;
+        covered[by * bw + bx + 1] = true;
+        covered[(by + 1) * bw + bx + 1] = true;
+        result.add(merged);
+      } else {
+        result.add(blockAt[by * bw + bx]!.copy());
+      }
     }
   }
-  return cost;
+  return (bootstrapBlocks, result, dcIntFinal);
 }
 
 /// One placed HF block: either an 8x8 or 16x16 DCT at block-grid origin
@@ -658,6 +958,13 @@ class _PlacedBlock {
   final int by, bx;
   final TransformType tt;
   int hfMult = 1;
+
+  /// Weighted-squared-error distortion of the committed candidate (see
+  /// [quantizeCandidate]'s doc comment) — set by [commit], read back by
+  /// [_decideTransformLayout]'s real-bit-cost region comparison, which
+  /// needs each already-quantized bootstrap block's own distortion without
+  /// recomputing it.
+  double distortion = 0;
 
   /// Per semantic channel (X, Y, B): flat, row-major
   /// (`tt.pixelHeight` x `tt.pixelWidth`) quantized AC coefficients. The
@@ -792,6 +1099,7 @@ class _PlacedBlock {
       int bw) {
     hfMult = mult;
     acInt = candidate.ac;
+    distortion = candidate.distortion;
     final numBlocks = tt.dctSelectHeight * tt.dctSelectWidth;
     if (numBlocks == 1) {
       for (var c = 0; c < 3; c++) {
@@ -818,26 +1126,36 @@ class _PlacedBlock {
     }
   }
 
-  /// Default (non-RD-search) path: compute coefficients, choose `hfMult`
-  /// via the L2 adaptive-energy heuristic (smooth/low-energy blocks get a
+  /// An independent, already-[commit]-ted copy of this block (deep-copying
+  /// [acInt], not just the reference) — used by [_decideTransformLayout]
+  /// to hand the two candidate bodies (the bootstrap all-8x8 layout and
+  /// the decided mixed layout) fully disjoint mutable objects for a
+  /// region kept as 8x8 in both. Without this, `_finishEncode`'s RD-hfMult/
+  /// RDOQ passes on one candidate would mutate the very `_PlacedBlock`
+  /// object the other candidate also references for that same cell.
+  _PlacedBlock copy() {
+    final b = _PlacedBlock(by, bx, tt)
+      ..hfMult = hfMult
+      ..distortion = distortion
+      ..acInt = [for (final ch in acInt) Int32List.fromList(ch)];
+    return b;
+  }
+
+  /// The L2 adaptive-energy heuristic (smooth/low-energy blocks get a
   /// boost — hfMultiplier can only refine *finer* than the baseline, dequant
-  /// being inversely proportional to it, see doc/spec_notes.md), quantize,
-  /// commit.
-  void computeAndQuantize(
-      List<List<Float32List>> planes,
-      _ChromaFromLumaFit cfl,
-      double refStep,
-      List<double> sd,
-      List<List<Float32List>> rawWeight,
-      List<double> scaleFactor,
-      List<Int32List> dcInt,
-      int bw,
-      List<Float32List> scratch8a,
-      List<Float32List> scratch8b,
-      List<Float32List> scratch16a,
-      List<Float32List> scratch16b) {
-    final coeffBuf = computeCoeffBuf(
-        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+  /// being inversely proportional to it, see doc/spec_notes.md) plus the
+  /// quantization it implies, *without* committing — used both by
+  /// [computeAndQuantize] (the default path) and by
+  /// [_decideTransformLayout] (which needs a 16x16 region's candidate cost
+  /// before deciding whether to keep it, without disturbing [dcInt] for a
+  /// region it might reject).
+  (int, ({List<double> dc, List<Int32List> ac, double distortion}))
+      chooseCandidate(
+          List<List<Float32List>> coeffBuf,
+          double refStep,
+          List<double> sd,
+          List<List<Float32List>> rawWeight,
+          List<double> scaleFactor) {
     final n = tt.pixelHeight;
     final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
 
@@ -856,9 +1174,31 @@ class _PlacedBlock {
         : relEnergy < 4.0
             ? 2
             : 1;
+    return (
+      mult,
+      quantizeCandidate(coeffBuf, mult, sd, rawWeight, scaleFactor)
+    );
+  }
 
-    final candidate =
-        quantizeCandidate(coeffBuf, mult, sd, rawWeight, scaleFactor);
+  /// Default (non-RD-search) path: compute coefficients, choose `hfMult` via
+  /// [chooseCandidate], quantize, commit.
+  void computeAndQuantize(
+      List<List<Float32List>> planes,
+      _ChromaFromLumaFit cfl,
+      double refStep,
+      List<double> sd,
+      List<List<Float32List>> rawWeight,
+      List<double> scaleFactor,
+      List<Int32List> dcInt,
+      int bw,
+      List<Float32List> scratch8a,
+      List<Float32List> scratch8b,
+      List<Float32List> scratch16a,
+      List<Float32List> scratch16b) {
+    final coeffBuf = computeCoeffBuf(
+        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+    final (mult, candidate) =
+        chooseCandidate(coeffBuf, refStep, sd, rawWeight, scaleFactor);
     commit(candidate, mult, dcInt, bw);
   }
 }

@@ -437,15 +437,28 @@ void main() {
     }
   });
 
-  test('variable transforms default off: regresses manga-like content', () {
+  test(
+      'variable transforms (default on) no longer regresses manga-like '
+      'content', () {
     if (!_haveDjxl) return;
-    // Regression guard for the enableVariableTransforms default. The
-    // 8x8-vs-16x16 decision heuristic is a crude bit-cost proxy, not the
-    // real context-adaptive entropy cost: it picks 16x16 100% of the time
-    // on a screentone test pattern, yet real end-to-end output was both
-    // larger *and* worse RMSE than plain 8x8 there — see
-    // VardctL0Config.enableVariableTransforms's doc comment. This checks
-    // the *default* (off) beats explicitly turning it on for this content.
+    // Regression guard for the enableVariableTransforms default, updated
+    // when the default flipped from false to true. The *old* 8x8-vs-16x16
+    // decision was a crude pre-quantization bit-cost proxy with no
+    // visibility into the real context-adaptive entropy cost: it picked
+    // 16x16 100% of the time on a screentone test pattern, yet real
+    // end-to-end output was both larger *and* worse RMSE than plain 8x8
+    // there (and +31% size on line art) — that's what justified defaulting
+    // it off. `_decideTransformLayout` replaced that proxy with a real
+    // bootstrap-frozen bit-rate estimate (see its doc comment and
+    // doc/spec_notes.md), calibrated via `tool/calibrate_transform_lambda.
+    // dart` across the full distance range and confirmed to no longer
+    // regress on exactly these two content types — this test guards that.
+    // A whole-image real-assembly safety net (`encodeLossyVardctL0`
+    // assembles a real body for both the all-8x8 and decided-mixed
+    // layouts and keeps whichever is smaller) makes this an *exact*
+    // guarantee, not just "close": the "off" candidate is byte-identical
+    // to `enableVariableTransforms: false`, so `withVt <= withoutVt`
+    // always holds, with no tolerance needed.
     const w = 256, h = 256;
     Uint8List screentone() {
       final out = Uint8List(w * h * 3);
@@ -464,18 +477,81 @@ void main() {
       return out;
     }
 
-    final pixels = screentone();
+    Uint8List lineArt() {
+      final out = Uint8List(w * h * 3);
+      var i = 0;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          final onLine = (x % 40 < 3) || (y % 40 < 3) || ((x + y) % 60 < 3);
+          final v = onLine ? 20 : 250;
+          out[i++] = v;
+          out[i++] = v;
+          out[i++] = v;
+        }
+      }
+      return out;
+    }
+
+    for (final MapEntry(key: name, value: pixels) in {
+      'screentone': screentone(),
+      'line art': lineArt(),
+    }.entries) {
+      final withVt = encodeLossyVardctL0(pixels,
+          width: w,
+          height: h,
+          config: const VardctL0Config(enableVariableTransforms: true));
+      final withoutVt = encodeLossyVardctL0(pixels,
+          width: w,
+          height: h,
+          config: const VardctL0Config(enableVariableTransforms: false));
+      expect(withVt.length, lessThanOrEqualTo(withoutVt.length),
+          reason: 'variable transforms (${withVt.length}B) should never '
+              'be larger than off (${withoutVt.length}B) on $name — the '
+              'whole-image safety net makes this an exact guarantee');
+    }
+  });
+
+  test('variable transforms (default on) genuinely wins on smooth content', () {
+    if (!_haveDjxl) return;
+    // The never-worse guard above only checks "not larger" — it would
+    // stay green even if a future change made 16x16 never win and the
+    // safety net silently fell back to "off" on every input. This locks
+    // in the other half: on content 16x16 genuinely helps (a smooth
+    // gradient, mirroring the "adaptive quantization" test above and
+    // tool/calibrate_transform_lambda.dart's own measured win there —
+    // at `distance=2.0` specifically, where the sweep found a comfortable
+    // -18.2% win; the plain default config's implicit distance~1.0
+    // happens to land on a rarer tie for this exact pattern), variable
+    // transforms must produce a strictly smaller file, not just a tied one.
+    const w = 256, h = 256;
+    final pixels = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final v = (x * 255 / w).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(2.0);
     final withVt = encodeLossyVardctL0(pixels,
         width: w,
         height: h,
-        config: const VardctL0Config(enableVariableTransforms: true));
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true));
     final withoutVt = encodeLossyVardctL0(pixels,
         width: w,
         height: h,
-        config: const VardctL0Config(enableVariableTransforms: false));
-    expect(withoutVt.length, lessThan(withVt.length),
-        reason: 'default (${withoutVt.length}B) should beat '
-            'variable transforms (${withVt.length}B) on screentone');
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: false));
+    expect(withVt.length, lessThan(withoutVt.length),
+        reason: 'variable transforms (${withVt.length}B) should beat '
+            'off (${withoutVt.length}B) on a smooth gradient');
   });
 
   test('finer quantization improves RMSE', () {

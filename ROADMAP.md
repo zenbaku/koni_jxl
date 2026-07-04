@@ -103,14 +103,15 @@ quality lives.
     smooth photographic content; up to ~31% *larger* on line art and
     screentone, because the selection heuristic (a cheap bit-cost proxy)
     doesn't capture the real context-adaptive entropy cost and
-    over-selects 16x16 on regular high-frequency patterns. A
-    higher-fidelity heuristic (or an actual-assembled-bytes comparison,
-    per this project's established "measure, don't estimate" pattern —
-    see `_chooseAcClustering`) could recover this as a real per-region
-    win rather than an all-or-nothing global toggle; not attempted here.
+    over-selects 16x16 on regular high-frequency patterns.
+    **Superseded — see "Compression efficiency, round 6" below**: a
+    later session replaced the proxy with a real bootstrap-based
+    estimate plus a whole-image real-assembly safety net, closing exactly
+    this gap, and `enableVariableTransforms` now defaults to **on**.
   Full 27-transform-type support (this encoder only added 8x8/16x16) and
-  a real rate-distortion search remain open if a non-manga use case ever
-  needs them.
+  a real rate-distortion search over transform size itself (round 6
+  chooses between two fixed candidates per region, not a search) remain
+  open if a non-manga use case ever needs them.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -119,10 +120,13 @@ quality lives.
   hand-written synthetic patterns in `vardct_l0_test.dart`); a
   `cjxl`-comparison benchmark (`tool/bench_lossy_vs_cjxl.dart`, matched
   distances, both decoded via `djxl` for size/RMSE/time). The benchmark's
-  honest finding: koni_jxl is 1.5-5x larger than even `cjxl -e1` at the
-  same `distance`, though often at comparable-or-better RMSE — expected,
-  since this encoder has no rate-distortion search and only 2 of 27
-  transform types, but now concretely measured rather than assumed.
+  honest finding *at the time*: koni_jxl is 1.5-5x larger than even
+  `cjxl -e1` at the same `distance`, though often at comparable-or-better
+  RMSE — expected, since this encoder has no rate-distortion search and
+  only 2 of 27 transform types, but now concretely measured rather than
+  assumed. (Narrowed to 1.18x-1.82x on the same corpus image by
+  "Compression efficiency, round 6" below — still worth re-running after
+  any future transform-selection or RD-search work.)
   Also removed an incidental limitation found while building the
   Flutter helper: `encodeLossyVardctL0` now accepts *any* positive
   width/height (previously required multiples of 8), padding internally
@@ -251,6 +255,37 @@ output for where the gap actually is.
   (the gradient banding-protection test's own RDOQ-off baseline already
   exceeds its gate above `distance=4` — a pre-existing gap in that
   heuristic's own validation coverage, left for a future session).
+- ✅ **Compression efficiency, round 6: variable-transform selection
+  fixed, flipped on by default.** Replaced L3's `_should16x16` (a
+  pre-quantization coefficient-magnitude proxy, measured to over-select
+  16x16 on manga content: +20% screentone, +31% line art) with
+  `_decideTransformLayout` — a real, bootstrap-frozen bit-rate estimate
+  mirroring `_chooseHfMultRd`'s already-shipped pattern, generalized from
+  "which `hfMult`" to "which transform type" — plus a whole-image
+  real-assembly safety net (assemble a real body for both the all-8x8
+  and decided-mixed layouts, keep whichever is genuinely smaller) added
+  after an advisor review flagged that the per-region estimate alone
+  couldn't promise RDOQ's never-worse guarantee, and two synthetic
+  content patterns were thin ground to override manga's "off until
+  proven" precedent on a project whose real fixtures can never be repo
+  test cases. The safety net's marginal cost is small (~1.28x encode
+  time, not 2x — the bootstrap's expensive DCT/quantization/clustering
+  work is reused, only the final assembly runs twice) and it verified
+  clean on a mixed-content case (half gradient, half screentone in one
+  image) that no single-content-type test could have caught: byte-
+  identical to `false` at most distances, a small real win at
+  `distance=0.5`. Multi-distance calibration
+  (`tool/calibrate_transform_lambda.dart`, same methodology as round 5's
+  fix) found `_kTransformRdLambda = 3000.0` clears a stricter manga gate
+  (within 2% of `false`) at every distance 0.5-8.0 while winning
+  substantially elsewhere: `color_cover` -4.3% to -26.7% smaller with
+  *better* RMSE throughout, screentone/line-art landing at 0% to -3.1%
+  (real wins, not just flat). `VardctL0Config.enableVariableTransforms`
+  now defaults to **true**; `tool/bench_lossy_vs_cjxl.dart`'s gap vs
+  `cjxl -e1` narrowed from 1.52x-2.79x to 1.18x-1.82x on `color_cover` —
+  the largest single improvement to that number yet, from fixing an
+  existing transform type's selection rather than adding a new one. See
+  doc/spec_notes.md for the full write-up.
 - 🔲 **Check whether `_chooseHfMultRd`'s own lambda has the same
   distance-scaling bug RDOQ had.** `_kRdLambda` was also only ever
   calibrated at `distance=1.0`, and shares RDOQ's old (buggy)

@@ -1157,6 +1157,124 @@ roughly 20-40% slower at the sizes benchmarked (e.g. `color_cover`
 `distance=1.0`: 811ms → 1115ms) — no regression test exists for this yet,
 same caveat as round 4's DC context tree.
 
+### Lossy (VarDCT) encoder — variable-transform selection: bootstrap decision + safety net, on by default
+
+Follow-up session to L3's write-up above, which shipped 16x16 support but
+left it **off** by default because `_should16x16` (a pre-quantization,
+log-scaled coefficient-magnitude proxy) over-selected 16x16 on manga's two
+dominant content types: +20% size on screentone, +31% on line art, despite
+picking 16x16 there 50-100% of the time. This session replaces that proxy
+and, after the numbers held up, flips the default on.
+
+**The fix, `_decideTransformLayout`**: mirrors `_chooseHfMultRd`'s
+already-shipped bootstrap-then-freeze pattern (round 3, above), generalized
+from "which `hfMult`" to "which transform type". Quantize the whole image
+as all-8x8 first (the bootstrap), build a real AC token/clustering pass
+from that to get a frozen Huffman code-length table
+(`EntropyCodes.tokenBitLengths()`) and cluster map, then for every
+2x2-aligned region compare the real bootstrap cost of its 4 already-
+committed 8x8 blocks (`sum(distortion + lambda * _blockRate(...))`) against
+a freshly quantized 16x16 candidate's own cost — keeping whichever is
+smaller. This soundness argument is identical to `_chooseHfMultRd`'s:
+`HfBlockContext.qfThresholds` is empty, so neither `hfMult` nor which
+transform type a *different* region picks can shift which cluster a token
+routes to, only the values landing in it — so scoring against a frozen
+table is a real, not just convenient, comparison. The 16x16 candidate
+reuses its region's top-left 8x8 block's own frozen `predicted` non-zero-
+count value (`HfCoefficients.getPredictedNonZeroes` depends only on
+already-decided west/north grid state, which is identical whether this
+region's own footprint ends up 8x8 or 16x16) — exact when no earlier
+region has itself swapped to 16x16 yet, an accepted approximation
+otherwise, same as `_chooseHfMultRd`'s own documented gap.
+
+**Why this alone wasn't enough, and the whole-image safety net that
+followed.** An advisor review (before shipping) pointed out a real gap:
+this decision is a real-*estimate* comparison, not RDOQ's real-*assembly*
+one — RDOQ earns its on-by-default status specifically by re-encoding for
+real before committing any drop, and this fix, as first written, had no
+equivalent. Two synthetic patterns clearing a tolerance gate is thin
+ground to override manga's "off by default until proven" precedent
+(L3, above) on a project whose stated primary use case is manga, where a
+real fixture can never be a repo test case. The fix: `_decideTransformLayout`
+now returns **two** fully independent candidates — the bootstrap all-8x8
+layout (byte-identical to what `enableVariableTransforms: false` alone
+would produce) and the decided mixed layout — and `encodeLossyVardctL0`
+assembles a real, fully-encoded body for *both* (`_finishEncode`, the
+factored-out steps 5.5-7 of the encoder, run once per candidate) and keeps
+whichever is genuinely smaller. This is the same "estimates can't resolve
+near-ties, verify by real assembly" rule `_chooseAcClustering` and RDOQ
+already use elsewhere in this file, applied one level up (per-image
+instead of per-block-channel) — and it makes the *combination*
+provably never-worse than `enableVariableTransforms: false`, even though
+the per-region estimate alone cannot promise that.
+
+**Marginal cost of the safety net is small, not a second full encode.**
+The expensive part — DCT + quantization + AC clustering for the all-8x8
+layout — is already computed once inside the bootstrap; assembling its
+real body costs only one more clustering-header-and-payload write pass
+(cheap relative to DCT/quantization). Measured: `color_cover` at
+`distance=1.0`, 1088ms (`enableVariableTransforms: false`) vs 1389ms
+(`true`, both candidates assembled) — about 1.28x, not 2x.
+
+**A subtle correctness hazard, caught before shipping**: the two
+candidates' non-swapped 8x8 cells initially referenced the *same*
+`_PlacedBlock` objects (built once by the bootstrap). Since RD-hfMult/RDOQ
+mutate `hfMult`/`acInt` in place, running them independently on both
+candidate bodies would have let one candidate's mutations leak into the
+other's shared cells. Fixed with `_PlacedBlock.copy()` — the mixed-layout
+candidate gets independent copies (deep-copying `acInt`, not just the
+reference) for every cell it keeps as 8x8, so the two candidates share zero
+mutable state.
+
+**Calibration** (`tool/calibrate_transform_lambda.dart`, mirroring
+`calibrate_rdoq_lambda.dart`'s multi-distance-sweep methodology from the
+previous section — this project's standing lesson about single-point
+calibration): swept `kLambda` across `distance ∈ {0.5, 1.0, 2.0, 4.0, 8.0}`
+against `color_cover` (photo), a synthetic gradient, and manga-typical
+screentone/line-art patterns. `_kTransformRdLambda = 3000.0` (the same
+scaling law as `_kRdLambda`, `lambda = kLambda * refStep²` — both trade off
+the same weighted-squared-error distortion metric against a bit-rate
+estimate) cleared the manga gate (screentone/line-art within 2% of the
+`enableVariableTransforms: false` baseline) at **every** distance tested,
+while giving real wins elsewhere: `color_cover` -4.3% to -26.7% smaller
+(with *better*, not just comparable, RMSE at every point — e.g. -21.4% RMSE
+at `distance=8.0`), the synthetic gradient similarly smaller and better-
+RMSE, screentone/line-art landing at 0% to -3.1% (i.e. small real wins, not
+just "safely flat"). Lower `kLambda` values (100-300) failed the gate at
+higher distances (screentone +13.6% at `distance=4.0`, `kLambda=100`) —
+too eager to spend bits on 16x16 relative to its rate cost; `3000` sits
+near a local optimum, not just a safe floor (higher values, e.g. `30000`,
+gave measurably smaller wins on `color_cover` at low distance).
+
+**A mixed-content check** (half smooth gradient, half screentone in one
+256x256 image — deliberately not covered by any single-content-type test,
+since that's the exact case a per-region decision exists to handle and the
+frozen-bootstrap-prediction approximation is most likely to misfire at a
+content boundary): the whole-image safety net produced byte-identical
+output to `enableVariableTransforms: false` at `distance ∈ {1.0, 2.0, 4.0,
+8.0}` (the mixed-layout candidate's estimate turned out not to actually
+win once really assembled, so the safety net fell back cleanly) and a
+small real win at `distance=0.5` (13605 vs 13611 bytes, RMSE 0.688 vs
+0.738) — confirming the never-worse property holds exactly where the
+approximation was most likely to be tested, not just on the two
+single-content-type patterns the lambda sweep used.
+
+**Shipped**: `VardctL0Config.enableVariableTransforms` defaults to
+**true** (flipped from `false`), `_kTransformRdLambda = 3000.0`. Full test
+suite green (298 tests, including a rewritten regression test — the old
+"default off beats explicitly-on on screentone" assertion inverted to "the
+gap is within 2%, both directions" once the fix made explicitly-on
+*smaller* than default-off pre-flip). `tool/bench_lossy_vs_cjxl.dart`'s
+gap vs `cjxl -e1` on `color_cover` narrowed from 1.52x-2.79x (L4's
+measurement) to 1.18x-1.82x across the same distance range — the largest
+single improvement to that benchmark's numbers so far, from fixing an
+existing, already-implemented transform type's selection rather than
+adding a new one. `palette16` improved similarly (1.10x-1.44x, down from
+1.16x-1.52x). The remaining gap is unchanged in kind: still only 2 of the
+format's 27 transform types and no rate-distortion search over transform
+size itself (this fix chooses between two fixed candidates per region, not
+a search) — see ROADMAP.md.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
