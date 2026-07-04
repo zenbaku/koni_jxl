@@ -1316,7 +1316,88 @@ transform type actually used. On a 3.4MP page the EPF pass runs in
 
 Note for Flutter Web: dart2js emulates Float32x4 in software, so lossy
 decoding is substantially slower there; AOT targets (Android/iOS/desktop)
-get native SIMD.
+get native SIMD. See "Web compile targets" below for a correctness caveat
+that applies specifically to dart2js, not dart2wasm.
+
+## Web compile targets: dart2wasm is correct, dart2js is not (and isn't a
+   target)
+
+dart2wasm compiles Dart `int` to a real 64-bit Wasm `i64` - identical
+semantics to the VM/AOT. Verified end-to-end: `dart compile wasm` on the
+full corpus subset used below, run under Node, matches native byte-for-byte
+on every lossless file and within RMSE ~0.005 (max per-channel diff of 1)
+on the two lossy files tested - ordinary float rounding variance between
+platforms' math libraries, not a bug, and far inside the project's own
+lossy gate (`rmse < 2.0`).
+
+dart2js is a different story: Dart `int` there is a JS `double`, and
+critically **every bitwise operator (`<<`, `>>`, `>>>`, `&`, `|`, `^`)
+coerces both operands and the result through a 32-bit int**, mirroring raw
+JavaScript's `ToInt32`/`ToUint32` - not just for shift amounts >= 32 (which
+at least fails loudly at the literal-compile stage for `0x9e3779b9...`-style
+constants), but silently for:
+- any *result* that would exceed 2^32, even with a shift amount < 32
+  (`240 << 25` truncates to `240 << 25 mod 2^32`);
+- any *operand* that is negative - dart2js reinterprets it as its
+  unsigned-32-bit two's complement equivalent and never converts back
+  (`-5 >> 1` gives 4294967293 there, not -3).
+
+That second point breaks the classic "XOR two ints, negative iff signs
+differ" idiom (`(a ^ b) <= 0`) used by the weighted predictor's clamp
+condition, and the `lower ^ a ^ b` min/max-via-XOR trick, wherever the
+operands are signed channel/error values (which they routinely are - RCT
+chroma channels, WP error terms). Combined with the first point corrupting
+fixed-point `(a * b) >> k` products once they exceed 2^32 (routine in the
+WP prediction's `(1<<24)/k` reciprocal table), this desyncs the entropy
+stream deep into decode with no diagnostic at the actual fault site - it
+surfaces many symbols later as an unrelated-looking "illegal final modular
+state" or a truncated-read exception.
+
+This was found by building a differential oracle
+(`tool/web_decode_oracle.dart`; a throwaway base64-embedded variant was used
+during the investigation to run under `dart compile js` + Node against real
+corpus bytes) and bisecting divergences with per-symbol/per-pixel debug
+logging comparing native vs. dart2js output - grep cannot find this class
+of bug, since "this operand might be negative" isn't a syntactic pattern
+and the unsafe cases are indistinguishable from safe ones (`x & mask`,
+`x & 1`, and small fixed shifts on already-bounded values are all fine) by
+inspection alone. The following were fixed - correct on every platform,
+not just dart2js/dart2wasm - once found:
+- `vlc_table.dart`, `entropy_writer.dart`: `1 << 32` used as a sentinel,
+  replaced with the literal `0x100000000`.
+- `bit_reader.dart`: `readBits`/`peekBits`'s mask for `bits == 32`; the
+  core byte-accumulation loop (was `_cache |= byte << cacheBits`, silently
+  truncated once `_cache` exceeds 2^32 - rewritten as `_cache += byte *
+  (1 << cacheBits)`, arithmetic instead of bitwise, since the byte's bit
+  range never overlaps what's already cached); `readU64`/`readIccVarint`'s
+  varint shifts; added `wideShl`/`wideShr`/`wideShrSigned` to
+  `math_helper.dart` (multiply/divide-based, not `<<`/`>>`) for shift
+  amounts or operand magnitudes that can exceed 32 bits.
+- `entropy_stream.dart`'s `_readHybridInteger`: token expansion shift can
+  reach exactly 32.
+- `modular_channel.dart` / `encode/wp_predictor.dart` (the encoder's exact
+  mirror): the WP clamp condition's XOR sign-trick and `_clamp3`/
+  `_clamp4`'s XOR-based min/max, both rewritten via plain sign/equality
+  comparisons; the WP prediction's `(s * reciprocal) >> 24` now goes
+  through `wideShrSigned`.
+- `image_header.dart`'s `1 << 40` (level > 5 max-pixel-count check).
+- `render/noise.dart`'s `XorShiro` (xorshift128+ for the noise feature):
+  the *only* dart2js failure that was a hard compile error, not a silent
+  runtime one - three 64-bit hex literals aren't exactly representable as
+  JS doubles. Rewritten as (hi, lo) `Uint32` pairs throughout; verified
+  against the original `Int64List`-backed implementation across 20,000
+  random seed pairs x 64 words plus explicit edge seeds (all-bits-set,
+  the 2^32 carry boundary), zero mismatches.
+
+None of the above are reachable on dart2wasm (real 64-bit `int`), so they
+were latent correctness bugs, not live ones, given dart2wasm is the actual
+web target for this project. What was **not** pursued once that was
+confirmed: an exhaustive whole-codebase sweep for every remaining
+negative-operand bitwise site on dart2js specifically (this class turned
+out pervasive, not a short list - each fix found via the corpus oracle
+exposed a new failure elsewhere rather than converging). If dart2js support
+is ever needed, budget for a dedicated pass with the same oracle, not a
+code-reading audit.
 
 Profiling a real manga page's phase timings (`tool/profile_decode.dart -D
 jxl.timings=true`) found the AC coefficient entropy-decode phase

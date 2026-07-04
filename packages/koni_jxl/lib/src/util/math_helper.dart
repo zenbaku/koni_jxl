@@ -28,6 +28,45 @@ int floorLog1p(int x) {
   return (x + 1) & x != 0 ? c - 1 : c;
 }
 
+/// 2^[n] for any non-negative [n], computed without ever needing a `<<`
+/// by more than 31: dart2js's shift/bitwise operators (`<<`, `>>`, `>>>`,
+/// `&`, `|`, `^`) all coerce through a 32-bit integer first (mirroring raw
+/// JavaScript's `ToInt32`/`ToUint32`), so results - not just shift amounts
+/// - above 2^32 silently get truncated there, unlike the VM's real 64-bit
+/// `int`. Multiplication and division do not have this limitation (plain
+/// double arithmetic, exact as long as the true result fits in 2^53), so
+/// [wideShl]/[wideShr] are built on those instead of `<<`/`>>` wherever a
+/// shift amount OR an intermediate value could reach 32 bits.
+@pragma('vm:prefer-inline')
+int _pow2(int n) => n < 32 ? (1 << n) : (1 << (n - 32)) * 0x100000000;
+
+/// Left-shifts non-negative [value] by [n] bits (n may be >= 32, and
+/// [value] itself may already need more than 32 bits) - safe on dart2js
+/// where a bare `<<` is not. See [_pow2]. Results are only exact while the
+/// true product stays within 2^53 - true 64-bit-scale values are already
+/// beyond what a JS-double-backed `int` can represent exactly on any
+/// platform.
+@pragma('vm:prefer-inline')
+int wideShl(int value, int n) => value * _pow2(n);
+
+/// Right-shifts non-negative [value] by [n] bits, the division-based
+/// counterpart to [wideShl] for the same reason (also safe when [value]
+/// itself needs more than 32 bits, unlike a bare `>>`).
+@pragma('vm:prefer-inline')
+int wideShr(int value, int n) => value ~/ _pow2(n);
+
+/// Arithmetic right-shift of [value] (which may be negative, unlike
+/// [wideShr]) by [n] bits, matching `>>`'s floor-toward-negative-infinity
+/// semantics - needed wherever the *value*, not just the shift amount,
+/// can exceed 32 bits (e.g. fixed-point `(a * b) >> k` products), since
+/// Dart's `~/` truncates toward zero rather than flooring.
+@pragma('vm:prefer-inline')
+int wideShrSigned(int value, int n) {
+  final divisor = _pow2(n);
+  final q = value ~/ divisor;
+  return value < 0 && q * divisor != value ? q - 1 : q;
+}
+
 /// Reflects an out-of-range coordinate back into [0, size).
 @pragma('vm:prefer-inline')
 int mirrorCoordinate(int coordinate, int size) {

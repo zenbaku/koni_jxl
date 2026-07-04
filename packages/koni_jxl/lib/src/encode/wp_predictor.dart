@@ -32,7 +32,13 @@ final Int32List _oneL24OverKP1 = () {
 
 int _clamp4(int v, int a, int b, int c) {
   var lower = a < b ? a : b;
-  var upper = lower ^ a ^ b;
+  // max(a, b) via a plain comparison, not `lower ^ a ^ b`: a, b are
+  // channel sample values, which can be negative (e.g. RCT chroma
+  // channels) - dart2js's `^` reinterprets a negative operand as its
+  // unsigned-32-bit equivalent and never converts the result back, so a
+  // max that should come out negative comes out as a huge positive
+  // number there instead.
+  var upper = a < b ? b : a;
   lower = lower < c ? lower : c;
   upper = upper > c ? upper : c;
   return v < lower
@@ -41,6 +47,13 @@ int _clamp4(int v, int a, int b, int c) {
           ? upper
           : v;
 }
+
+/// Whether the WP prediction should be clamped to the (w, n, ne) range -
+/// see the decoder's `_wpShouldClamp` (modular_channel.dart) for why this
+/// is written via sign/equality comparisons rather than the classic
+/// `((tN ^ tW) | (tN ^ tNW)) <= 0` XOR trick.
+bool _wpShouldClamp(int tN, int tW, int tNW) =>
+    (tN < 0) != (tW < 0) || (tN < 0) != (tNW < 0) || (tN == tW && tN == tNW);
 
 /// Fills [residuals] (length tw*th) with `value - weightedPrediction` for the
 /// tile, in raster order. When [maxErrors] is given, also records each
@@ -129,8 +142,12 @@ void wpTileResiduals(Int32List tile, int tw, int th, Int32List residuals,
       s += subpred[1] * sw1;
       s += subpred[2] * sw2;
       s += subpred[3] * sw3;
-      var pred = (s * _oneL24OverKP1[wSum - 1]) >> 24;
-      if (((tN ^ tW) | (tN ^ tNW)) <= 0) {
+      // wideShrSigned (not `>>`): the fixed-point product s * (2^24/k)
+      // routinely exceeds 2^32 for ordinary pixel values, and s can be
+      // negative - a bare `>>` truncates through a 32-bit int on
+      // dart2js, silently corrupting the prediction.
+      var pred = wideShrSigned(s * _oneL24OverKP1[wSum - 1], 24);
+      if (_wpShouldClamp(tN, tW, tNW)) {
         pred = _clamp4(pred, w3, n3, ne3);
       }
       if (maxErrors != null) {

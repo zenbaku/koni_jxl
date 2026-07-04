@@ -19,7 +19,13 @@ final Int32List _oneL24OverKP1 = () {
 @pragma('vm:prefer-inline')
 int _clamp3(int v, int a, int b) {
   final lower = a < b ? a : b;
-  final upper = lower ^ a ^ b;
+  // max(a, b) via a plain comparison, not `lower ^ a ^ b`: a, b are
+  // channel sample values, which can be negative (e.g. RCT chroma
+  // channels) - dart2js's `^` reinterprets a negative operand as its
+  // unsigned-32-bit equivalent and never converts the result back, so a
+  // max that should come out negative comes out as a huge positive
+  // number there instead.
+  final upper = a < b ? b : a;
   return v < lower
       ? lower
       : v > upper
@@ -27,10 +33,26 @@ int _clamp3(int v, int a, int b) {
           : v;
 }
 
+/// Whether the WP prediction should be clamped to the (w, n, ne) range:
+/// true when `tN` and `tW` don't have strictly opposite nonzero signs, and
+/// likewise for `tN`/`tNW` - i.e. the gradients agree closely enough that
+/// clamping to the neighborhood is safe. Originally `((tN ^ tW) | (tN ^
+/// tNW)) <= 0`, a classic "XOR two ints, negative iff their signs differ"
+/// trick - but `tN`/`tW`/`tNW` are WP error terms that can be negative,
+/// and dart2js's `^`/`|` reinterpret a negative operand as its
+/// unsigned-32-bit equivalent (and never convert the result back), so a
+/// result that should come out negative comes out as a huge positive
+/// number there instead, silently flipping this condition. Expressed via
+/// plain sign/equality comparisons instead, which dart2js evaluates
+/// correctly regardless of sign.
+@pragma('vm:prefer-inline')
+bool _wpShouldClamp(int tN, int tW, int tNW) =>
+    (tN < 0) != (tW < 0) || (tN < 0) != (tNW < 0) || (tN == tW && tN == tNW);
+
 @pragma('vm:prefer-inline')
 int _clamp4(int v, int a, int b, int c) {
   var lower = a < b ? a : b;
-  var upper = lower ^ a ^ b;
+  var upper = a < b ? b : a;
   lower = lower < c ? lower : c;
   upper = upper > c ? upper : c;
   return v < lower
@@ -296,8 +318,13 @@ final class ModularChannel {
     s += _subpred[1] * sw1;
     s += _subpred[2] * sw2;
     s += _subpred[3] * sw3;
-    var pred = (s * _oneL24OverKP1[wSum - 1]) >> 24;
-    if (((tN ^ tW) | (tN ^ tNW)) <= 0) {
+    // wideShrSigned (not `>>`): the fixed-point product s * (2^24/k)
+    // routinely exceeds 2^32 for ordinary pixel values, and s can be
+    // negative - a bare `>>` truncates through a 32-bit int on dart2js,
+    // silently corrupting the prediction (and everything downstream
+    // that depends on it via the MA tree's error-based properties).
+    var pred = wideShrSigned(s * _oneL24OverKP1[wSum - 1], 24);
+    if (_wpShouldClamp(tN, tW, tNW)) {
       pred = _clamp4(pred, w3, n3, ne3);
     }
     _pred![o] = pred;
@@ -349,8 +376,13 @@ final class ModularChannel {
     s += _subpred[1] * sw1;
     s += _subpred[2] * sw2;
     s += _subpred[3] * sw3;
-    var pred = (s * _oneL24OverKP1[wSum - 1]) >> 24;
-    if (((tN ^ tW) | (tN ^ tNW)) <= 0) {
+    // wideShrSigned (not `>>`): the fixed-point product s * (2^24/k)
+    // routinely exceeds 2^32 for ordinary pixel values, and s can be
+    // negative - a bare `>>` truncates through a 32-bit int on dart2js,
+    // silently corrupting the prediction (and everything downstream
+    // that depends on it via the MA tree's error-based properties).
+    var pred = wideShrSigned(s * _oneL24OverKP1[wSum - 1], 24);
+    if (_wpShouldClamp(tN, tW, tNW)) {
       pred = _clamp4(pred, w3, n3, ne3);
     }
     _pred![o] = pred;

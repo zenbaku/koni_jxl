@@ -5,24 +5,62 @@ import '../util/image_buffer.dart';
 import '../util/math_helper.dart';
 
 /// xorshift128+ with 8 lanes, matching the JXL noise RNG.
+///
+/// Every 64-bit lane is stored as an (hi, lo) pair of 32-bit-unsigned `int`s
+/// rather than a single 64-bit value: dart2js's `int` cannot exactly
+/// represent values, literals, or intermediate shift/multiply results above
+/// 2^53, so a direct port (as this class used to be, backed by [Int64List])
+/// fails to even compile for web ("integer literal ... can't be represented
+/// exactly in JavaScript") and would be silently wrong at runtime even if it
+/// did. Every operation below is deliberately mask-before-shift and
+/// add-with-carry so no intermediate value ever exceeds 2^32, which keeps
+/// every platform (VM, AOT, dart2js, dart2wasm) bit-identical.
 final class XorShiro {
-  XorShiro(int seed0, int seed1) {
-    _state0[0] = _splitMix64(seed0 + 0x9e3779b97f4a7c15);
-    _state1[0] = _splitMix64(seed1 + 0x9e3779b97f4a7c15);
+  XorShiro(int seed0Hi, int seed0Lo, int seed1Hi, int seed1Lo) {
+    var (h, l) = _add64(seed0Hi, seed0Lo, 0x9e3779b9, 0x7f4a7c15);
+    (h, l) = _splitMix64(h, l);
+    _state0Hi[0] = h;
+    _state0Lo[0] = l;
+    (h, l) = _add64(seed1Hi, seed1Lo, 0x9e3779b9, 0x7f4a7c15);
+    (h, l) = _splitMix64(h, l);
+    _state1Hi[0] = h;
+    _state1Lo[0] = l;
     for (var i = 1; i < 8; i++) {
-      _state0[i] = _splitMix64(_state0[i - 1]);
-      _state1[i] = _splitMix64(_state1[i - 1]);
+      (h, l) = _splitMix64(_state0Hi[i - 1], _state0Lo[i - 1]);
+      _state0Hi[i] = h;
+      _state0Lo[i] = l;
+      (h, l) = _splitMix64(_state1Hi[i - 1], _state1Lo[i - 1]);
+      _state1Hi[i] = h;
+      _state1Lo[i] = l;
     }
   }
 
-  static int _splitMix64(int z) {
-    z = (z ^ (z >>> 30)) * 0xbf58476d1ce4e5b9;
-    z = (z ^ (z >>> 27)) * 0x94d049bb133111eb;
-    return z ^ (z >>> 31);
+  static final BigInt _mask64 = (BigInt.one << 64) - BigInt.one;
+  static final BigInt _mul1 = BigInt.parse('bf58476d1ce4e5b9', radix: 16);
+  static final BigInt _mul2 = BigInt.parse('94d049bb133111eb', radix: 16);
+
+  /// The seeding-only mixing step: only ~16 calls per [XorShiro] (one per
+  /// image group), so exactness via [BigInt] costs nothing that matters,
+  /// and removes the error-prone part (a full 64x64 multiply) from the
+  /// hand-rolled 32-bit-limb surface entirely.
+  static (int, int) _splitMix64(int hi, int lo) {
+    var z = (BigInt.from(hi) << 32) | BigInt.from(lo);
+    z = ((z ^ (z >> 30)) * _mul1) & _mask64;
+    z = ((z ^ (z >> 27)) * _mul2) & _mask64;
+    z ^= z >> 31;
+    return ((z >> 32).toInt(), (z & BigInt.from(0xFFFFFFFF)).toInt());
   }
 
-  final Int64List _state0 = Int64List(8);
-  final Int64List _state1 = Int64List(8);
+  /// 64-bit add mod 2^64 on (hi, lo) uint32 pairs.
+  static (int, int) _add64(int aHi, int aLo, int bHi, int bLo) {
+    final loSum = aLo + bLo;
+    return ((aHi + bHi + (loSum >> 32)) & 0xFFFFFFFF, loSum & 0xFFFFFFFF);
+  }
+
+  final Uint32List _state0Hi = Uint32List(8);
+  final Uint32List _state0Lo = Uint32List(8);
+  final Uint32List _state1Hi = Uint32List(8);
+  final Uint32List _state1Lo = Uint32List(8);
   final Uint32List _batch = Uint32List(16);
   int _batchPos = 16;
 
@@ -35,14 +73,30 @@ final class XorShiro {
 
   void _fillBatch() {
     for (var i = 0; i < 8; i++) {
-      final a = _state1[i];
-      var b = _state0[i];
-      final c = a + b;
-      _state0[i] = a;
-      b ^= b << 23;
-      _state1[i] = b ^ a ^ (b >>> 18) ^ (a >>> 5);
-      _batch[2 * i] = c & 0xFFFFFFFF;
-      _batch[2 * i + 1] = c >>> 32;
+      final aHi = _state1Hi[i];
+      final aLo = _state1Lo[i];
+      final bHi = _state0Hi[i];
+      final bLo = _state0Lo[i];
+      // c = a + b (64-bit, mod 2^64).
+      final cLoSum = aLo + bLo;
+      final cLo = cLoSum & 0xFFFFFFFF;
+      final cHi = (aHi + bHi + (cLoSum >> 32)) & 0xFFFFFFFF;
+      _state0Hi[i] = aHi;
+      _state0Lo[i] = aLo;
+      // b ^= b << 23 (64-bit shift). Every intermediate below is masked
+      // BEFORE shifting (not after) so it never exceeds 2^32 - shifting
+      // first and masking after would transiently need up to 2^55, which
+      // dart2js's double-backed `int` can't represent exactly.
+      final nbHi = bHi ^ (((bHi & 0x1FF) << 23) | (bLo >>> 9));
+      final nbLo = bLo ^ ((bLo & 0x1FF) << 23);
+      // state1 = b ^ a ^ (b >>> 18) ^ (a >>> 5), same 64-bit-shift rule.
+      _state1Hi[i] = nbHi ^ aHi ^ (nbHi >>> 18) ^ (aHi >>> 5);
+      _state1Lo[i] = nbLo ^
+          aLo ^
+          (((nbHi & 0x3FFFF) << 14) | (nbLo >>> 18)) ^
+          (((aHi & 0x1F) << 27) | (aLo >>> 5));
+      _batch[2 * i] = cLo;
+      _batch[2 * i + 1] = cHi;
     }
     _batchPos = 0;
   }
@@ -58,7 +112,12 @@ const _laplacian = [
 
 /// Generates the per-group noise field (uniform [1,2) floats convolved with
 /// a Laplacian kernel). Must run after upsampling, before synthesis.
-List<List<Float32List>>? initializeNoise(Frame frame, int seed0) {
+///
+/// [seed0Hi]/[seed0Lo] are the high/low 32 bits of the frame-wide 64-bit
+/// seed (kept as a pair rather than one packed 64-bit int for the same
+/// web-safety reason as [XorShiro]).
+List<List<Float32List>>? initializeNoise(
+    Frame frame, int seed0Hi, int seed0Lo) {
   if (frame.lfGlobal.noiseParameters == null) return null;
   final colors = frame.colorChannelCount;
   final height = frame.boundsHeight;
@@ -72,13 +131,12 @@ List<List<Float32List>>? initializeNoise(Frame frame, int seed0) {
     final loc = frame.getGroupLocation(group);
     final y0 = loc.y << frame.header.logGroupDim;
     final x0 = loc.x << frame.header.logGroupDim;
-    final seed1 = ((x0 & 0xFFFFFFFF) << 32) | (y0 & 0xFFFFFFFF);
     final ySize = frame.header.groupDim < height - y0
         ? frame.header.groupDim
         : height - y0;
     final xSize =
         frame.header.groupDim < width - x0 ? frame.header.groupDim : width - x0;
-    final rng = XorShiro(seed0, seed1);
+    final rng = XorShiro(seed0Hi, seed0Lo, x0 & 0xFFFFFFFF, y0 & 0xFFFFFFFF);
     for (var c = 0; c < colors; c++) {
       for (var y = 0; y < ySize; y++) {
         for (var x = 0; x < xSize; x += 16) {

@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import '../exceptions.dart';
 import '../io/bit_reader.dart';
+import '../util/math_helper.dart';
 import 'ans.dart';
 import 'entropy_tables.dart';
 import 'hybrid_uint.dart';
@@ -192,6 +193,7 @@ final class EntropyStream {
     return hybridInt;
   }
 
+  @pragma('vm:prefer-inline')
   int _readHybridInteger(
       BitReader reader, HybridIntegerConfig config, int token) {
     final split = 1 << config.splitExponent;
@@ -207,6 +209,10 @@ final class EntropyStream {
     token >>= config.lsbInToken;
     token &= (1 << config.msbInToken) - 1;
     token |= 1 << config.msbInToken;
-    return (((token << n) | reader.readBits(n)) << config.lsbInToken) | low;
+    // n can be up to 32 (checked above): a plain `token << n` would break
+    // on dart2js there, since a *computed* shift by exactly 32 silently
+    // returns 0 (see wideShl's doc).
+    return ((wideShl(token, n) | reader.readBits(n)) << config.lsbInToken) |
+        low;
   }
 }

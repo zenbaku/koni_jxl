@@ -49,11 +49,15 @@ final class VlcTable {
         continue;
       }
       code += 1 << (32 - len);
-      if (code > 1 << 32) {
+      // Written as the literal (not `1 << 32`): dart2js's `<<` returns 0
+      // for any shift amount >= 32, so a *computed* `1 << 32` silently
+      // gives 0 there, even though the value itself is exactly
+      // representable as a double.
+      if (code > 0x100000000) {
         throw const JxlInvalidBitstreamException('too many VLC codes');
       }
     }
-    if (code != 1 << 32) {
+    if (code != 0x100000000) {
       throw const JxlInvalidBitstreamException('not enough VLC codes');
     }
     for (var i = 0; i < count; i++) {

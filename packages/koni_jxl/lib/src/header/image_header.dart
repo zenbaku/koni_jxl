@@ -51,7 +51,9 @@ final class ImageHeader {
           : reader.readU32(1, 9, 1, 13, 1, 18, 1, 30);
     }
     final maxDim = level <= 5 ? 1 << 18 : 1 << 28;
-    final maxTimes = level <= 5 ? 1 << 30 : 1 << 40;
+    // 1 << 40 (not computed): a *computed* shift by >= 32 silently gives 0
+    // on dart2js, even though the value is exactly representable.
+    final maxTimes = level <= 5 ? 1 << 30 : 1099511627776;
     if (width > maxDim || height > maxDim) {
       throw JxlInvalidBitstreamException(
           'width or height too large for level $level: ${width}x$height');

@@ -29,7 +29,9 @@ List<int> canonicalCodes(List<int> lengths) {
     codes[s] = _reverse32(code) & ((1 << lengths[s]) - 1);
     code += 1 << (32 - lengths[s]);
   }
-  assert(order.length <= 1 || code == 1 << 32,
+  // 0x100000000 (not `1 << 32`): a *computed* shift by exactly 32 silently
+  // gives 0 on dart2js even though the value is exactly representable.
+  assert(order.length <= 1 || code == 0x100000000,
       'canonical code lengths must satisfy Kraft exactly');
   return codes;
 }
@@ -324,7 +326,10 @@ void _writeComplexPrefixCode(BitWriter w, List<int> lengths) {
   final high = value >> lsb;
   final n = high.bitLength - 1 - msb;
   final msbBits = (high >> n) & ((1 << msb) - 1);
-  final extra = high & ((1 << n) - 1);
+  // n mirrors _readHybridInteger's decoder-side n, which can reach 32 for
+  // large values: `(1 << n) - 1` would break on dart2js there (see
+  // wideShl's doc), so build the mask via wideShl instead of a bare `<<`.
+  final extra = high & (wideShl(1, n) - 1);
   final token = split +
       (((n - (config.splitExponent - msb - lsb)) << (msb + lsb)) |
           (msbBits << lsb) |

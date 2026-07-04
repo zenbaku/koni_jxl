@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../exceptions.dart';
+import '../util/math_helper.dart';
 
 /// Reads a JPEG XL codestream bit by bit.
 ///
@@ -54,11 +55,24 @@ final class BitReader {
         throw JxlTruncatedException(
             'unable to read $bits bits at bit position $bitsRead');
       }
-      _cache |= _data[_pos++] << _cacheBits;
+      // += (not |=): _cacheBits is always < 32 here (the loop can add at
+      // most 4 bytes before bits <= 32 stops it), so `1 << _cacheBits` is
+      // itself safe, but the ACCUMULATED _cache can exceed 2^32 - and
+      // dart2js's `|=` (like all its bitwise ops) truncates through a
+      // 32-bit integer regardless of shift amount, silently dropping any
+      // high bits already in _cache. Addition doesn't have that limit,
+      // and is equivalent here since the new byte's bit range never
+      // overlaps what's already in _cache.
+      _cache += _data[_pos++] * (1 << _cacheBits);
       _cacheBits += 8;
     }
-    final ret = _cache & ((1 << bits) - 1);
-    _cache >>= bits;
+    // bits == 32 is a real call (ANS state init reads a raw 32-bit word):
+    // computing the mask as `(1 << bits) - 1` breaks on dart2js there,
+    // since a *computed* `1 << 32` silently gives 0 (not 4294967296), even
+    // though the mask value itself is exactly representable.
+    final mask = bits == 32 ? 0xFFFFFFFF : (1 << bits) - 1;
+    final ret = _cache & mask;
+    _cache = wideShr(_cache, bits);
     _cacheBits -= bits;
     return ret;
   }
@@ -71,10 +85,18 @@ final class BitReader {
   int peekBits(int bits) {
     assert(bits >= 0 && bits <= 32);
     while (_cacheBits < bits && _pos < _data.length) {
-      _cache |= _data[_pos++] << _cacheBits;
+      // += (not |=): _cacheBits is always < 32 here (the loop can add at
+      // most 4 bytes before bits <= 32 stops it), so `1 << _cacheBits` is
+      // itself safe, but the ACCUMULATED _cache can exceed 2^32 - and
+      // dart2js's `|=` (like all its bitwise ops) truncates through a
+      // 32-bit integer regardless of shift amount, silently dropping any
+      // high bits already in _cache. Addition doesn't have that limit,
+      // and is equivalent here since the new byte's bit range never
+      // overlaps what's already in _cache.
+      _cache += _data[_pos++] * (1 << _cacheBits);
       _cacheBits += 8;
     }
-    return _cache & ((1 << bits) - 1);
+    return _cache & (bits == 32 ? 0xFFFFFFFF : (1 << bits) - 1);
   }
 
   bool readBool() => readBits(1) != 0;
@@ -104,10 +126,10 @@ final class BitReader {
     var shift = 12;
     while (readBool()) {
       if (shift == 60) {
-        value |= readBits(4) << shift;
+        value |= wideShl(readBits(4), shift);
         break;
       }
-      value |= readBits(8) << shift;
+      value |= wideShl(readBits(8), shift);
       shift += 8;
     }
     return value;
@@ -151,7 +173,7 @@ final class BitReader {
     var value = 0;
     for (var shift = 0; shift < 63; shift += 7) {
       final b = readBits(8);
-      value |= (b & 127) << shift;
+      value |= wideShl(b & 127, shift);
       if (b <= 127) break;
     }
     if (value > 0x7FFFFFFF) {
@@ -175,7 +197,7 @@ final class BitReader {
   void skipBits(int bits) {
     assert(bits >= 0);
     if (bits <= _cacheBits) {
-      _cache >>= bits;
+      _cache = wideShr(_cache, bits);
       _cacheBits -= bits;
       return;
     }

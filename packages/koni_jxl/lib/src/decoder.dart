@@ -108,7 +108,7 @@ final class _DecoderState {
       }
       upsampleFrame(frame);
       final noiseBuffer =
-          initializeNoise(frame, (_visibleFrames << 32) | _invisibleFrames);
+          initializeNoise(frame, _visibleFrames, _invisibleFrames);
       if (save && header.saveBeforeCT) {
         _reference[header.saveAsReference] = [
           for (final b in frame.buffer) ImageBuffer.copy(b),
