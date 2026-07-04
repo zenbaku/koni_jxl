@@ -132,4 +132,12 @@ final class Toc {
     return _readers.putIfAbsent(
         i, () => BitReader.view(_data, _starts[i], _starts[i] + lengths[i]));
   }
+
+  /// The pristine byte range of logical section [index], independent of any
+  /// prior [sectionReader] consumption. Public so profiling tools can replay
+  /// a single section's decode from scratch (e.g. `tool/bench_entropy.dart`).
+  Uint8List sectionBytes(int index) {
+    final i = lengths.length <= 1 ? 0 : (permutation?[index] ?? index);
+    return Uint8List.sublistView(_data, _starts[i], _starts[i] + lengths[i]);
+  }
 }

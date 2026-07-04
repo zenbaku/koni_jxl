@@ -122,8 +122,7 @@ void invertVarDCTGroup(
   final meta = hf.lfg.hfMetadata!;
 
   if (prev != null) {
-    for (var i = 0; i < hf.blockIncluded.length; i++) {
-      if (!hf.blockIncluded[i]) continue;
+    for (final i in hf.includedIndices) {
       final posY = meta.blockY[i];
       final posX = meta.blockX[i];
       final tt = meta.dctSelectAt(posY, posX)!;
@@ -156,8 +155,7 @@ void invertVarDCTGroup(
   final groupLocY = groupLoc.y << 8;
   final groupLocX = groupLoc.x << 8;
 
-  for (var i = 0; i < hf.blockIncluded.length; i++) {
-    if (!hf.blockIncluded[i]) continue;
+  for (final i in hf.includedIndices) {
     final posY = meta.blockY[i];
     final posX = meta.blockX[i];
     final tt = meta.dctSelectAt(posY, posX)!;

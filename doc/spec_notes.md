@@ -1296,7 +1296,8 @@ every `readSymbol` caller.
 
 Lossless decoding runs at ~3.5x single-threaded djxl. Lossy decoding of a
 3.4-megapixel page takes ~0.4-0.65 s single-threaded (djxl: ~0.1 s); a
-real-world JPEG-transcoded manga page decodes in ~0.3 s. The float
+real-world JPEG-transcoded manga page decodes in ~0.25 s (was ~0.3 s before
+the per-group block-index fix below). The float
 pipeline uses dart:typed_data Float32x4 SIMD (native NEON/SSE under AOT):
 the fused 8x8 inverse DCT (in-register transposes), coefficient
 dequantization (float-arithmetic lane masks; Int32x4 select boxes in
@@ -1316,6 +1317,69 @@ transform type actually used. On a 3.4MP page the EPF pass runs in
 Note for Flutter Web: dart2js emulates Float32x4 in software, so lossy
 decoding is substantially slower there; AOT targets (Android/iOS/desktop)
 get native SIMD.
+
+Profiling a real manga page's phase timings (`tool/profile_decode.dart -D
+jxl.timings=true`) found the AC coefficient entropy-decode phase
+(`HfCoefficients`'s constructor: per-block/per-channel ANS context
+computation and symbol reads) at 40-47% of total decode time - bigger than
+the already-SIMD-optimized dequant+IDCT+CfL stage, and filters (gaborish/
+EPF) don't even factor in, since real JPEG-transcoded manga pages ship with
+both off. Two fixes, isolated and A/B-measured via `tool/bench_entropy.dart`
+(replays one pass-group's decode from pristine section bytes, so identical
+bits decode repeatedly without re-parsing the file):
+1. `HfCoefficients.getCoefficientContext`'s two `~/` divisions are
+   identities whenever `numBlocks == 1` (a single 8x8-or-smaller
+   transform) - confirmed via `tool/diag_entropy.dart` that this is true
+   for 100% of blocks in real JPEG-transcoded manga content (JPEG's own
+   8x8 DCT structure survives transcoding), so the fast path fires on
+   essentially every coefficient for the actual workload. Combined with
+   `@pragma('vm:prefer-inline')` on `AnsSymbolDistribution.readSymbol` and
+   `EntropyStream._readHybridInteger`: ~7.5-14% faster entropy-decode
+   phase, ~4-5% faster end-to-end decode.
+2. A bigger one: every `HfCoefficients` instance (one per pass-group)
+   scanned its LF group's *entire* block list (`meta.nbBlocks`, e.g.
+   26800 blocks for a typical page) to find the ~1/35th belonging to it -
+   and the same full-list scan-and-skip repeated independently in
+   `_dequantizeHFCoefficients`, `_chromaFromLuma`, `_finalizeLLF`, and
+   `invertVarDCTGroup`'s two loops (6 sites total). Fixed by
+   `HfMetadata.blockIndicesByGroup()`: partitions all blocks into a fixed
+   64-bucket layout (`(blockY>>5)*8 + (blockX>>5)`, keyed the same way
+   `Frame.groupPosInLFGroup`'s `pos.y/pos.x` already range over [0,8) -
+   an LF group is always exactly 8x8 groups) in one O(nbBlocks) pass,
+   computed once per LF group and cached, then shared by every pass and
+   pass-group. All 6 sites now iterate the precomputed index list instead
+   of scanning-and-skipping. Order is preserved by construction (indices
+   are appended in ascending original-scan order per bucket), so this is
+   a pure enumeration-strategy change, not a behavior change - verified
+   bit-exact/RMSE-clean across the full corpus gate (multi-LF-group and
+   odd-sized-boundary cases included). Measured a bigger win than the
+   fix's own isolated scan-loop microbenchmark predicted (~4% of the
+   entropy-decode phase) - the *combined* fix (all 6 sites, not just the
+   constructor's) cut real-manga-page decode time 18-24% end-to-end,
+   because the standalone reproduction of "just the scan arithmetic"
+   didn't capture how much the redundant scan cost *in the context of*
+   the surrounding giant function/multiple call sites. Reinforces the
+   project's standing lesson: model-based estimates of Dart AOT hot-loop
+   cost are unreliable - only an A/B measurement of the real code (before
+   vs after, same tool, same inputs) is trustworthy.
+
+Lossless decode was profiled the same way: `MaTree.compactify()` (resolves
+channel-index/stream-index/y-dependent tree splits, called once per row of
+every channel) unconditionally reallocated a full copy of every non-leaf
+node it visited, even nodes whose subtree never tests properties 0-2 at all
+- and real learned trees (both this project's own encoder and, empirically,
+cjxl's) split almost exclusively on spatial/gradient properties (3+), so in
+practice most of a tree gets needlessly recopied on every single row. Fixed
+by caching a `needsResolution` bit per node (does this subtree test
+properties 0-2 anywhere) and short-circuiting to `return this` when false -
+a pure object-identity change, since the caller (`ModularChannel.decode`)
+only ever reads fields off the returned tree, never mutates it. Measured
+~2-4% faster end-to-end lossless decode across cjxl-encoded corpus files
+and a real manga page re-encoded through this project's own encoder
+(smaller than the analogous VarDCT redundant-scan fix - lossless decode's
+hot loop, particularly the weighted predictor's interior fast path, had
+already been heavily optimized in earlier milestones, unlike the VarDCT AC
+path which had never been profiled at this granularity before).
 
 Multi-core decode via isolates was evaluated and deferred: Dart isolates
 share no mutable memory, so parallel pass-group decoding would need

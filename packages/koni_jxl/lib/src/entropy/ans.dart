@@ -132,6 +132,7 @@ final class AnsSymbolDistribution extends SymbolDistribution {
   }
 
   @override
+  @pragma('vm:prefer-inline')
   int readSymbol(BitReader reader, AnsState stateObj) {
     var state = stateObj.hasState ? stateObj.state : reader.readBits(32);
     final index = state & 0xFFF;

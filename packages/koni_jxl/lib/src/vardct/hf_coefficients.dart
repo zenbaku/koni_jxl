@@ -74,16 +74,15 @@ final class HfCoefficients {
     groupPosX = pos.x << 5;
 
     final meta = lfg.hfMetadata!;
-    blockIncluded = List<bool>.filled(meta.nbBlocks, false);
-    for (var i = 0; i < meta.nbBlocks; i++) {
+    // Every block in this bucket is, by construction, within this group's
+    // 32x32 block grid (see blockIndicesByGroup) — no per-block range check
+    // needed, unlike a full scan-and-skip over every block in the LF group.
+    includedIndices = meta.blockIndicesByGroup()[pos.y * 8 + pos.x];
+    for (final i in includedIndices) {
       final posY = meta.blockY[i];
       final posX = meta.blockX[i];
       final groupY = posY - groupPosY;
       final groupX = posX - groupPosX;
-      if (groupY < 0 || groupX < 0 || groupY >= 32 || groupX >= 32) {
-        continue; // not in this group
-      }
-      blockIncluded[i] = true;
       final tt = meta.dctSelectAt(posY, posX)!;
       final flip = tt.flip;
       final hfMult = meta.hfMultiplierAt(posY, posX);
@@ -115,7 +114,8 @@ final class HfCoefficients {
               'nonzero coefficient count out of range');
         }
         final base = c * 1024;
-        final fill = (nonZero + numBlocks - 1) ~/ numBlocks;
+        final fill =
+            numBlocks == 1 ? nonZero : (nonZero + numBlocks - 1) ~/ numBlocks;
         for (var iy = 0; iy < tt.dctSelectHeight; iy++) {
           for (var ix = 0; ix < tt.dctSelectWidth; ix++) {
             nonZeroes[base + (sGroupY + iy) * 32 + sGroupX + ix] = fill;
@@ -191,8 +191,9 @@ final class HfCoefficients {
   late final int groupPosY;
   late final int groupPosX;
 
-  /// Whether lfg block i belongs to this group.
-  late final List<bool> blockIncluded;
+  /// lfg block indices belonging to this group (see
+  /// `HfMetadata.blockIndicesByGroup`).
+  late final Int32List includedIndices;
 
   void bakeDequantizedCoeffs() {
     _dequantizeHFCoefficients();
@@ -226,8 +227,12 @@ final class HfCoefficients {
   /// / `_coeffFreqCtx` exactly, without hand-duplicating those tables).
   static int getCoefficientContext(
       int k, int nonZeroes, int numBlocks, int prev) {
-    nonZeroes = (nonZeroes + numBlocks - 1) ~/ numBlocks;
-    k ~/= numBlocks;
+    // numBlocks == 1 (a single 8x8-or-smaller transform, the overwhelming
+    // common case) makes both divisions identities; skip them.
+    if (numBlocks != 1) {
+      nonZeroes = (nonZeroes + numBlocks - 1) ~/ numBlocks;
+      k ~/= numBlocks;
+    }
     return (_coeffNumNonzeroCtx[nonZeroes] + _coeffFreqCtx[k]) * 2 + prev;
   }
 
@@ -269,8 +274,7 @@ final class HfCoefficients {
       [-matrix.quantBias[2], 0.0, matrix.quantBias[2]],
     ];
     final meta = lfg.hfMetadata!;
-    for (var i = 0; i < blockIncluded.length; i++) {
-      if (!blockIncluded[i]) continue;
+    for (final i in includedIndices) {
       final posY = meta.blockY[i];
       final posX = meta.blockX[i];
       final tt = meta.dctSelectAt(posY, posX)!;
@@ -360,8 +364,7 @@ final class HfCoefficients {
     final d0 = dequantHFCoeff0;
     final d1 = dequantHFCoeff1;
     final d2 = dequantHFCoeff2;
-    for (var i = 0; i < blockIncluded.length; i++) {
-      if (!blockIncluded[i]) continue;
+    for (final i in includedIndices) {
       final posY = meta.blockY[i];
       final posX = meta.blockX[i];
       final tt = meta.dctSelectAt(posY, posX)!;
@@ -402,8 +405,7 @@ final class HfCoefficients {
     final scratch1 = floatMatrix(32, 32);
     final header = frame.header;
     final meta = lfg.hfMetadata!;
-    for (var i = 0; i < blockIncluded.length; i++) {
-      if (!blockIncluded[i]) continue;
+    for (final i in includedIndices) {
       final posY = meta.blockY[i];
       final posX = meta.blockX[i];
       final tt = meta.dctSelectAt(posY, posX)!;

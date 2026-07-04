@@ -91,10 +91,28 @@ final class MaTree {
         right!.usesWeightedPredictor;
   }
 
+  bool? _needsResolution;
+
+  /// Whether this subtree tests channel index, stream index or y (properties
+  /// 0-2) anywhere — i.e. whether [compactify] can do anything but return
+  /// `this` unchanged. Real learned trees (this project's own encoder and,
+  /// empirically, cjxl's) split almost exclusively on spatial/gradient
+  /// properties (3+), so this is `false` for entire trees in practice.
+  bool get needsResolution {
+    final cached = _needsResolution;
+    if (cached != null) return cached;
+    final result = !isLeaf &&
+        (property <= 2 || left!.needsResolution || right!.needsResolution);
+    return _needsResolution = result;
+  }
+
   /// Resolves properties that are constant across a channel row
-  /// (channel index, stream index, y), returning a smaller tree.
+  /// (channel index, stream index, y), returning a smaller tree. Called once
+  /// per row of every channel decode, so subtrees that don't test properties
+  /// 0-2 anywhere must short-circuit rather than reallocate a full copy of
+  /// themselves on every call (see [needsResolution]).
   MaTree compactify(int channelIndex, int streamIndex, int y) {
-    if (isLeaf) return this;
+    if (isLeaf || !needsResolution) return this;
     final prop = switch (property) {
       0 => channelIndex,
       1 => streamIndex,

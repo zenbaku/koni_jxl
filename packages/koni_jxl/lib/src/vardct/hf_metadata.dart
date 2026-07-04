@@ -72,6 +72,32 @@ final class HfMetadata {
   int sharpnessAt(int y, int x) =>
       hfStreamChannels[3].buffer![y * blockWidth + x];
 
+  /// [nbBlocks] block indices partitioned by the (group-dim-sized) pass-group
+  /// they fall into, keyed by `(blockY[i] >> 5) * 8 + (blockX[i] >> 5)` — an
+  /// LF group always spans exactly 8x8 groups (`Frame.groupPosInLFGroup`'s
+  /// `pos.y`/`pos.x` range), so this fixed 64-bucket layout mirrors the same
+  /// group-grid assumption `HfCoefficients` already hardcodes via `<< 5`/
+  /// `32`. Computed once per LF group and shared by every pass and every
+  /// pass-group that reads it, instead of each one separately re-scanning
+  /// all [nbBlocks] entries to find its own subset.
+  List<Int32List> blockIndicesByGroup() {
+    final cached = _groupBlockIndices;
+    if (cached != null) return cached;
+    final counts = Int32List(64);
+    for (var i = 0; i < nbBlocks; i++) {
+      counts[(blockY[i] >> 5) * 8 + (blockX[i] >> 5)]++;
+    }
+    final buckets = List<Int32List>.generate(64, (k) => Int32List(counts[k]));
+    final fillPos = Int32List(64);
+    for (var i = 0; i < nbBlocks; i++) {
+      final key = (blockY[i] >> 5) * 8 + (blockX[i] >> 5);
+      buckets[key][fillPos[key]++] = i;
+    }
+    return _groupBlockIndices = buckets;
+  }
+
+  List<Int32List>? _groupBlockIndices;
+
   /// Places [block] at the first free position at/after (lastY, lastX) in
   /// raster order; returns (y << 20) | x.
   int _placeBlock(
