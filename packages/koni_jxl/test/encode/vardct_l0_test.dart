@@ -147,38 +147,61 @@ void main() {
     _check(1000, 600, seed: 13); // larger multi-group image
   });
 
-  test('adaptive quantization reduces banding on smooth gradients', () {
-    if (!_haveDjxl) return;
-    // A smooth gradient is exactly where a fixed quant step causes visible
-    // banding; the adaptive per-block multiplier (L2) should cut RMSE
-    // substantially here without this encoder needing to know it's a
-    // gradient specifically (see doc/spec_notes.md).
-    const w = 256, h = 256;
-    final pixels = Uint8List(w * h * 3);
-    var i = 0;
-    for (var y = 0; y < h; y++) {
-      for (var x = 0; x < w; x++) {
-        final v = (x * 255 / w).round().clamp(0, 255);
-        pixels[i++] = v;
-        pixels[i++] = (v * 0.8).round();
-        pixels[i++] = 255 - v;
+  // Per-distance RMSE ceilings for the banding test below (an absolute
+  // bound, not a reduction-vs-baseline check — this test doesn't compare
+  // against a fixed-multiplier baseline, only asserts adaptive quant keeps
+  // RMSE bounded). RMSE is *supposed* to grow with distance (that's the
+  // quality knob doing its job), so a single flat threshold checked only
+  // at the implicit default (distance=1.0) missed a real gap at
+  // distance=8.0, where this heuristic's RMSE is legitimately higher —
+  // see ROADMAP.md's "gradient banding-protection test's own gate gap"
+  // and doc/spec_notes.md. Each threshold leaves >=15% margin over the
+  // value measured with production defaults (RDOQ + variable transforms
+  // both on, this encoder's actual shipped configuration): 0.5->0.38,
+  // 1.0->0.87, 2.0->0.83, 4.0->0.77, 8.0->1.31.
+  final gradientBandingThresholds = {
+    0.5: 0.6,
+    1.0: 1.0,
+    2.0: 1.0,
+    4.0: 1.0,
+    8.0: 1.6,
+  };
+  for (final MapEntry(key: distance, value: threshold)
+      in gradientBandingThresholds.entries) {
+    test(
+        'adaptive quantization keeps smooth-gradient banding bounded '
+        'at distance $distance', () {
+      if (!_haveDjxl) return;
+      // A smooth gradient is exactly where a fixed quant step causes
+      // visible banding; the adaptive per-block multiplier (L2) should cut
+      // RMSE substantially here without this encoder needing to know it's
+      // a gradient specifically (see doc/spec_notes.md).
+      const w = 256, h = 256;
+      final pixels = Uint8List(w * h * 3);
+      var i = 0;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          final v = (x * 255 / w).round().clamp(0, 255);
+          pixels[i++] = v;
+          pixels[i++] = (v * 0.8).round();
+          pixels[i++] = 255 - v;
+        }
       }
-    }
-    final encoded = JxlEncoder.encodeLossy(pixels, width: w, height: h);
-    final image = JxlDecoder.decode(encoded);
-    var sumSq = 0.0;
-    for (var c = 0; c < 3; c++) {
-      final ours = channelAsInts(image.channels[c], 255);
-      for (var j = 0; j < w * h; j++) {
-        final d = ours[j] - pixels[j * 3 + c];
-        sumSq += d * d;
+      final encoded = JxlEncoder.encodeLossy(pixels,
+          width: w, height: h, distance: distance);
+      final image = JxlDecoder.decode(encoded);
+      var sumSq = 0.0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        for (var j = 0; j < w * h; j++) {
+          final d = ours[j] - pixels[j * 3 + c];
+          sumSq += d * d;
+        }
       }
-    }
-    final rmse = math.sqrt(sumSq / (w * h * 3));
-    // A fixed-multiplier baseline measured ~2.0 here; adaptive quant
-    // brings it under 1.0.
-    expect(rmse, lessThan(1.0), reason: 'gradient rmse $rmse');
-  });
+      final rmse = math.sqrt(sumSq / (w * h * 3));
+      expect(rmse, lessThan(threshold), reason: 'gradient rmse $rmse');
+    });
+  }
 
   test('DC gradient prediction shrinks smooth-content file size', () {
     if (!_haveDjxl) return;

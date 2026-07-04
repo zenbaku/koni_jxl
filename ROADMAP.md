@@ -286,23 +286,43 @@ output for where the gap actually is.
   the largest single improvement to that number yet, from fixing an
   existing transform type's selection rather than adding a new one. See
   doc/spec_notes.md for the full write-up.
-- 🔲 **Check whether `_chooseHfMultRd`'s own lambda has the same
-  distance-scaling bug RDOQ had.** `_kRdLambda` was also only ever
-  calibrated at `distance=1.0`, and shares RDOQ's old (buggy)
-  `refStep^2` scaling convention — never caught because hfMult's RD
-  search was already shelved for a different reason (the banding blind
-  spot, round 3) before anyone tested it across distances. Worth a
-  multi-distance check (same method as round 5's fix) before ever
-  revisiting hfMult's RD search, independent of the banding question.
-- 🔲 **Fix the gradient banding-protection test's own gate gap above
+- ✅ **Checked whether `_chooseHfMultRd`'s own lambda has the same
+  distance-scaling bug RDOQ had — yes, partly, and `acScale^2` measurably
+  helps (caught a self-inflicted confound along the way).**
+  `tool/calibrate_rd_lambda.dart` now sweeps `distance` 0.5-8.0, isolated
+  from `enableVariableTransforms` (a first, non-isolated pass produced a
+  flat, kLambda-insensitive result that looked like saturation but was
+  actually a degenerate near-zero-AC transform-layout choice at high
+  distance — see doc/spec_notes.md for how that was caught). Isolated, at
+  the shipped constant (`kLambda=3000`): gradient RMSE tracks the
+  heuristic at `distance=1.0` (0.935 vs. 0.938) but becomes a real
+  regression by `distance=2.0` (1.119 vs. heuristic 0.992) and
+  `distance=8.0` (2.246 vs. 1.513) under the current `refStep^2` scaling —
+  a genuine RDOQ-like distance-dependent issue. A one-off `acScale^2`
+  patch (not shipped) at the equivalent `kLambda` (confirmed equivalent:
+  identical 0.935 at `distance=1.0`) landed within noise of the heuristic
+  at `distance>=4.0` instead of +48-60% over it — a real fix for the
+  high-distance blowup, though it doesn't resolve the `distance<=2.0`
+  photo-vs-banding trade-off, which is about the distortion metric, not
+  lambda's scaling. `enableRdHfMult` stays off
+  either way; **anyone revisiting this should start from `acScale^2`
+  scaling, not `refStep^2`**. See doc/spec_notes.md's hfMult follow-up for
+  the full numbers and the corrected conclusion (an earlier draft of this
+  entry wrongly concluded no rescaling would help, before the isolated
+  measurement was run).
+- ✅ **Fixed the gradient banding-protection test's own gate gap above
   `distance=4`.** Found as a side effect of round 5's fix, confirmed
   unrelated to RDOQ (byte-identical output regardless of `enableRdoq`):
   the `VardctL0Config.fromDistance`-driven L2 adaptive-quant heuristic's
-  own RMSE, with every RD feature off, already exceeds the smooth-
+  own RMSE, with every RD feature off, already exceeded the smooth-
   gradient regression test's 1.0 gate at `distance=4` (1.043) and
-  `distance=8` (1.513) — that test has only ever run at the implicit
-  default `distance=1.0`. Pre-existing, not a regression from this
-  session's work.
+  `distance=8` (1.513) — that test had only ever run at the implicit
+  default `distance=1.0`. `vardct_l0_test.dart`'s banding test now runs
+  at 0.5/1.0/2.0/4.0/8.0 with per-distance thresholds (RMSE is *supposed*
+  to grow with distance — a single flat bound was the wrong shape of
+  gate), each with >=15% margin over the value measured with this
+  encoder's actual shipped defaults (RDOQ + variable transforms on):
+  0.5→0.6, 1.0→1.0, 2.0→1.0, 4.0→1.0, 8.0→1.6.
 
 ---
 

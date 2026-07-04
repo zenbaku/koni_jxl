@@ -805,6 +805,76 @@ verified for the opt-in path across single-group, multi-group, multi-LF-
 group and 16x16-block-mixed configurations
 (`vardct_l0_test.dart`'s "RD hfMult search (opt-in) decodes correctly").
 
+**Follow-up: a multi-distance sweep (ROADMAP.md's open question — does
+`_kRdLambda` share RDOQ's old, buggy `refStep^2`-scaling bug?), including
+a confound found and corrected mid-investigation.** All of the above was
+only ever measured at `distance=1.0`; `tool/calibrate_rd_lambda.dart` now
+sweeps 0.5-8.0.
+
+*First pass (confounded, not trustworthy — kept here as a process
+lesson).* Run with the encoder's actual defaults
+(`enableVariableTransforms: true`), every `kLambda` from 500 to 20000
+landed at an *identical* gradient RMSE of 2.075 by `distance=8.0` — a
+~56% regression over the heuristic's own baseline there (1.333), with
+zero sensitivity to `kLambda`. That zero-sensitivity was itself the tell:
+`jxl.encdebug`'s histogram showed the *committed* 16x16 layout at that
+distance has essentially no AC left (`bestBytes=2`), so every hfMult
+candidate scores near-identically and the tiebreak trivially picks the
+same one — an artifact of variable-transform layout selection on coarse
+gradients, not a property of the hfMult search itself. An advisor review
+caught this before it shipped as a conclusion (the tool's own first
+doc-comment draft claimed "no scaling bug, `acScale^2` wouldn't help" —
+without ever testing `acScale^2`, and using confounded data to boot).
+
+*Isolated re-run (`enableVariableTransforms: false`), the trustworthy
+data.* Real, non-degenerate signal: `distance=1.0`'s gradient-safe
+`kLambda=500` (RMSE 0.615 vs. the heuristic's 0.938) degrades
+monotonically as distance grows — 1.009 at `distance=2.0` (heuristic:
+0.992, already past it), 1.385 at `distance=4.0` (heuristic: 1.043),
+1.882 at `distance=8.0` (heuristic: 1.513). A real, RDOQ-like
+distance-dependent regression, confirmed independent of the transform
+confound.
+
+*Does `acScale^2` fix it, like it fixed RDOQ's version of this problem?
+Partially — measured, not assumed.* A one-off patch to `_chooseHfMultRd`
+swapping `kLambda * refStep * refStep` for `kLambda * acScale * acScale`
+(not shipped — a temporary, reverted diagnostic edit; see
+`tool/calibrate_rd_lambda.dart`'s module doc for what to change to
+reproduce). The two formulas coincide exactly at `distance=1.0` by
+construction (`acScale=1` there), so the fair comparison is the actual
+shipped constant, `refStep^2` at `kLambda=3000` (`_kRdLambda`'s value),
+against its `distance=1.0`-equivalent `acScale^2` counterpart,
+`kLambda≈0.01` — both give identical output at `distance=1.0`, confirming
+they're really the same operating point before distance moves:
+
+| distance | heuristic RMSE | `refStep^2` (kLambda=3000) | `acScale^2` (kLambda≈0.01) |
+|---|---|---|---|
+| 1.0 | 0.938 | 0.935 | 0.935 |
+| 2.0 | 0.992 | 1.119 | 1.007 |
+| 4.0 | 1.043 | 1.666 | 1.045 |
+| 8.0 | 1.513 | 2.246 | 1.513 |
+
+At `distance>=4.0`, `acScale^2` lands within noise of the heuristic
+baseline instead of 48-60% over it (+60% at `distance=4.0`, +48% at
+`distance=8.0` for `refStep^2`) — a genuinely better-matched scaling
+for this search's distortion metric, not a dead end. This directly
+contradicts this file's (and the tool's) own first-draft conclusion that
+"no rescaling would help" — that conclusion was reasoned from the
+distortion metric's structure, sounded plausible, and was wrong; only the
+isolated measurement caught it.
+
+**What `acScale^2` does *not* fix**: `distance=2.0` is still right at the
+gate (1.007), and the core photo-vs-banding trade-off documented above —
+no single constant both beats the heuristic on photo content and stays
+clearly safe on gradients — is about the distortion metric itself, not
+lambda's units, so it survives the rescaling untouched. `enableRdHfMult`
+stays off by default either way. **Net guidance for any future attempt**:
+start from `acScale^2` scaling (not `refStep^2`), still implement the
+banding-aware distortion term this section already calls for, and verify
+across the *full* distance range from the start — including checking for
+degenerate transform-layout interactions before trusting a flat result
+across `kLambda`, the specific mistake this investigation made once.
+
 ### Lossy (VarDCT) encoder — compression efficiency: a learned context tree for DC
 
 Follow-up to the two DC prediction fixes above, picked as the smaller,

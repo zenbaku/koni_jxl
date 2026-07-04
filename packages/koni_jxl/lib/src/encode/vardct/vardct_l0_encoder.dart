@@ -127,9 +127,20 @@ class VardctL0Config {
   /// Whether to replace the default 3-bucket adaptive-quantization
   /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
   /// with a real per-block rate-distortion search over the same
-  /// candidate multipliers ({1, 2, 4}). Defaults to **off** — see
-  /// `_chooseHfMultRd`'s doc comment and doc/spec_notes.md for the
-  /// calibration status and measured numbers before enabling.
+  /// candidate multipliers ({1, 2, 4}). Defaults to **off** — a
+  /// multi-distance sweep (`tool/calibrate_rd_lambda.dart`) isolated from
+  /// [enableVariableTransforms] found the previously-known-safe,
+  /// `distance=1.0`-only `kLambda` degrades into a real regression as
+  /// distance grows (e.g. gradient RMSE 48-60% over the heuristic by
+  /// `distance>=4.0`) — this search's `refStep^2` lambda scaling has the
+  /// same class of distance-dependent issue RDOQ's old formula had.
+  /// Unlike RDOQ's fix, though, switching to `acScale^2` only mitigates
+  /// the high-distance blowup (verified: near-zero regression at
+  /// `distance>=4.0` at an equivalent `kLambda`) without resolving the
+  /// underlying `distance<=2.0` photo-vs-banding trade-off — so this
+  /// isn't shippable yet either way. See `_chooseHfMultRd`'s doc comment
+  /// and doc/spec_notes.md for the full calibration status before
+  /// enabling or attempting a scaling fix.
   final bool enableRdHfMult;
 
   /// Overrides the rate/distortion trade-off constant `_kRdLambda` used
@@ -2006,6 +2017,26 @@ const _rdHfMultCandidates = [1, 2, 4];
 /// not just this constant, would be needed to close it), not a
 /// calibration shortfall — see doc/spec_notes.md before spending more
 /// time re-sweeping this constant.
+///
+/// **This gap gets worse, not better, at higher `distance` — and it is
+/// partly a `refStep^2`-vs-`acScale^2` scaling issue after all** (a later
+/// multi-distance sweep, isolated from [VardctL0Config.enableVariableTransforms]
+/// to remove a confound in an earlier attempt — see
+/// `tool/calibrate_rd_lambda.dart`'s module doc for the full story and
+/// exact numbers). At this constant's own value (`kLambda=3000`), gradient
+/// RMSE tracks the heuristic closely at `distance=1.0` (0.935 vs. 0.938)
+/// but degrades to a real regression by `distance>=2.0` (1.119 vs. 0.992)
+/// under this file's `refStep^2` scaling. A one-off `acScale^2` patch at
+/// the `distance=1.0`-equivalent `kLambda` (≈0.01, which gives the
+/// identical 0.935 at `distance=1.0`) landed within noise of the
+/// heuristic at `distance>=4.0` (1.045 vs. 1.043, and 1.513 vs. 1.513 —
+/// vs. `refStep^2`'s +60% and +48% at those same distances) — genuinely
+/// better, not a dead end like this comment previously (and wrongly)
+/// concluded. It does not fix the `distance<=2.0` case, though:
+/// that's the photo-vs-banding trade-off described above, which is about
+/// the distortion metric itself, not lambda's units. Net: a future
+/// attempt should start from `acScale^2` scaling, not `refStep^2`, but
+/// still needs the banding-aware distortion term to actually ship.
 const _kRdLambda = 3000.0;
 
 /// Real per-block rate-distortion search replacing the crude 3-bucket
