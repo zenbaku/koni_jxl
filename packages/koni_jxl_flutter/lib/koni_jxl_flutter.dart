@@ -5,4 +5,5 @@ export 'package:koni_jxl/koni_jxl.dart';
 export 'src/jxl_animation_view.dart';
 export 'src/jxl_codec.dart';
 export 'src/jxl_image_provider.dart';
+export 'src/jxl_page_prefetcher.dart';
 export 'src/jxl_progressive_image.dart';

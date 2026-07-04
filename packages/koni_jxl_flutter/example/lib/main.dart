@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:koni_jxl_flutter/koni_jxl_flutter.dart';
 
+import 'reader_demo.dart';
+
 void main() => runApp(const JxlExampleApp());
 
 class JxlExampleApp extends StatelessWidget {
@@ -30,10 +32,32 @@ class _JxlGalleryPageState extends State<JxlGalleryPage> {
     ('Palette image', 'assets/palette.jxl'),
   ];
 
+  static final _readerDemoIndex = samples.length;
+
   var _index = 0;
+
+  Widget _navBar() => NavigationBar(
+        selectedIndex: _index,
+        onDestinationSelected: (i) => setState(() => _index = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.menu_book), label: 'Manga'),
+          NavigationDestination(icon: Icon(Icons.layers), label: 'Alpha'),
+          NavigationDestination(icon: Icon(Icons.palette), label: 'Palette'),
+          NavigationDestination(
+              icon: Icon(Icons.auto_stories), label: 'Reader'),
+        ],
+      );
 
   @override
   Widget build(BuildContext context) {
+    if (_index == _readerDemoIndex) {
+      // JxlReaderDemo brings its own AppBar (page counter, jump buttons);
+      // this outer Scaffold just supplies the shared bottom nav bar.
+      return Scaffold(
+        body: const JxlReaderDemo(),
+        bottomNavigationBar: _navBar(),
+      );
+    }
     final (title, asset) = samples[_index];
     return Scaffold(
       appBar: AppBar(title: Text('koni_jxl — $title')),
@@ -61,15 +85,7 @@ class _JxlGalleryPageState extends State<JxlGalleryPage> {
           ),
         ),
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.menu_book), label: 'Manga'),
-          NavigationDestination(icon: Icon(Icons.layers), label: 'Alpha'),
-          NavigationDestination(icon: Icon(Icons.palette), label: 'Palette'),
-        ],
-      ),
+      bottomNavigationBar: _navBar(),
     );
   }
 }
