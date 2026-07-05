@@ -244,4 +244,126 @@ void main() {
       }
     }
   });
+
+  // Tranche C (ROADMAP.md/spec_notes.md): the first "bespoke" transform
+  // type -- unlike Tranche A/B (plain separable DCTs, differing only in
+  // dctSelect footprint), the decoder reconstructs DCT4x4
+  // (vardct_inverter.dart's TransformMethod.dct4 case) via a hand-derived
+  // formula: a single-stage Hadamard-type butterfly (`_auxDCT2`, s=2)
+  // combining the 4 quadrants' DC terms, plus a real 4x4 IDCT per
+  // quadrant. `_decodeDct4`/`_encodeDct4` below mirror that formula and
+  // its verified forward inverse directly (the same "duplicate the
+  // decoder's private arithmetic in test code" pattern the LLF-inversion
+  // test above already uses for `_finalizeLLF`) -- this is the PERMANENT
+  // form of a check first done numerically in Python during planning (a
+  // 64x64 basis-injection matrix, M @ E == I to 4.4e-16; see
+  // doc/spec_notes.md), not a new derivation.
+  group('DCT4x4 (Tranche C, bespoke, first slice)', () {
+    // Mirrors vardct_inverter.dart's TransformMethod.dct4 case exactly,
+    // for a single isolated 8x8 block at the origin (ppgY=ppgX=ppfY=ppfX=0).
+    List<Float32List> decodeDct4(List<Float32List> cc) {
+      final (d00, d01, d10, d11) = _dct4Butterfly(cc[0][0].toDouble(),
+          cc[0][1].toDouble(), cc[1][0].toDouble(), cc[1][1].toDouble());
+      final quadDC = [
+        Float32List.fromList([d00, d01]),
+        Float32List.fromList([d10, d11]),
+      ];
+      final fb = List.generate(8, (_) => Float32List(8));
+      final s0 = List.generate(4, (_) => Float32List(4));
+      final s1 = List.generate(4, (_) => Float32List(4));
+      final s2 = List.generate(4, (_) => Float32List(4));
+      final s3 = List.generate(4, (_) => Float32List(4));
+      for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+          s0[0][0] = quadDC[y][x];
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
+              s0[iy][ix] = cc[y + iy * 2][x + ix * 2];
+            }
+          }
+          inverseDCT2D(s0, s1, 0, 0, 0, 0, 4, 4, s2, s3, true);
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              fb[4 * y + iy][4 * x + ix] = s1[iy][ix];
+            }
+          }
+        }
+      }
+      return fb;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's computeCoeffBuf TransformMethod.dct4
+    // branch exactly (the production forward derivation under test).
+    List<Float32List> encodeDct4(List<Float32List> pixels) {
+      final cc = List.generate(8, (_) => Float32List(8));
+      final quadDC = List.generate(2, (_) => Float32List(2));
+      final quadTransposed = List.generate(4, (_) => Float32List(4));
+      final quadCoeffs = List.generate(4, (_) => Float32List(4));
+      final scratch0 = List.generate(4, (_) => Float32List(4));
+      final scratch1 = List.generate(4, (_) => Float32List(4));
+      for (var qy = 0; qy < 2; qy++) {
+        for (var qx = 0; qx < 2; qx++) {
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              quadTransposed[ix][iy] = pixels[qy * 4 + iy][qx * 4 + ix];
+            }
+          }
+          forwardDCT2D(
+              quadTransposed, quadCoeffs, 0, 0, 0, 0, 4, 4, scratch0, scratch1);
+          quadDC[qy][qx] = quadCoeffs[0][0];
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              if (iy == 0 && ix == 0) continue;
+              cc[qy + iy * 2][qx + ix * 2] = quadCoeffs[iy][ix];
+            }
+          }
+        }
+      }
+      final (e00, e01, e10, e11) = _dct4Butterfly(
+          quadDC[0][0].toDouble(),
+          quadDC[0][1].toDouble(),
+          quadDC[1][0].toDouble(),
+          quadDC[1][1].toDouble());
+      cc[0][0] = e00 / 4;
+      cc[0][1] = e01 / 4;
+      cc[1][0] = e10 / 4;
+      cc[1][1] = e11 / 4;
+      return cc;
+    }
+
+    test(
+        'forward derivation followed by the real decoder reconstruction '
+        'is the identity, over random 8x8 blocks', () {
+      final rng = math.Random(6);
+      for (var trial = 0; trial < 50; trial++) {
+        final pixels = List.generate(
+            8,
+            (_) => Float32List.fromList(
+                List.generate(8, (_) => rng.nextDouble() * 10 - 5)));
+        final cc = encodeDct4(pixels);
+        final recon = decodeDct4(cc);
+        for (var y = 0; y < 8; y++) {
+          for (var x = 0; x < 8; x++) {
+            expect(recon[y][x], closeTo(pixels[y][x], 1e-3),
+                reason: 'trial $trial, pixel ($y, $x)');
+          }
+        }
+      }
+    });
+  });
 }
+
+/// The decoder's `_auxDCT2` (`vardct_inverter.dart`) single-stage (`s=2`,
+/// `num=1`) 2x2 Hadamard-type butterfly — see
+/// `vardct_l0_encoder.dart`'s `_dct4QuadrantButterfly` doc comment for the
+/// verified self-inverse-up-to-4 property this relies on (and the warning
+/// about NOT reusing it for DCT2x2's multi-stage cascade, where that
+/// property does not hold).
+(double, double, double, double) _dct4Butterfly(
+        double c00, double c01, double c10, double c11) =>
+    (
+      c00 + c01 + c10 + c11,
+      c00 + c01 - c10 - c11,
+      c00 - c01 + c10 - c11,
+      c00 - c01 - c10 + c11,
+    );

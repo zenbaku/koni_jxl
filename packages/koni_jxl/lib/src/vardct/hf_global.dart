@@ -307,6 +307,31 @@ List<Float32List> getDCTQuantWeights(
   return weights;
 }
 
+/// Computes the raw (pre-inversion) DCT4x4 quantization weight matrix for
+/// one channel: a 2x-nearest-neighbor-upsampled 4x4 quant-weight table (see
+/// [getDCTQuantWeights]) with 3 low-frequency positions overridden by
+/// [overrides] (`target[1][0]`, `target[0][1]` divided by `overrides[0]`,
+/// `target[1][1]` divided by `overrides[1]`). Public for the same reason as
+/// [getDCTQuantWeights] itself: so the lossy encoder can build the exact
+/// same table it quantizes against as what this file writes to the
+/// bitstream and what the decoder rebuilds — single-sourced, not
+/// independently re-derived (see `vardct_l0_encoder.dart`'s
+/// `rawWeightByType`).
+List<Float32List> getDct4x4QuantWeights(
+    List<double> dctParam, List<double> overrides) {
+  final target = floatMatrix(8, 8);
+  final w = getDCTQuantWeights(4, 4, dctParam);
+  for (var y = 0; y < 8; y++) {
+    for (var x = 0; x < 8; x++) {
+      target[y][x] = w[y ~/ 2][x ~/ 2];
+    }
+  }
+  target[1][0] /= overrides[0];
+  target[0][1] /= overrides[0];
+  target[1][1] /= overrides[1];
+  return target;
+}
+
 /// HfGlobal: the 17 dequantization weight matrices plus the HF preset count.
 final class HfGlobal {
   HfGlobal(BitReader reader, Frame frame) {
@@ -397,8 +422,18 @@ final class HfGlobal {
             3, (_) => List<double>.generate(6, (_) => 64.0 * reader.readF16()));
         return DctParams(null, m, encodingMode);
       case TransformMode.dct4:
+        // NOT *64 (unlike hornuss/dct2 below, and unlike a dct-shaped
+        // table's own first value via _readDCTParams) -- a real decoder
+        // bug, found and fixed via the lossy encoder's DCT4x4 support
+        // (vardct_l0_encoder.dart): reading these 2 raw overrides per
+        // channel with *64 (matching hornuss/dct2's own pattern, and
+        // jxlatte's identical inherited mistake) round-trips through this
+        // decoder perfectly but was found to disagree with djxl once an
+        // encoder could actually exercise a *custom* (non-default) DCT4x4
+        // quant table -- nothing ever had before, since no natural corpus
+        // file happens to trigger it. See doc/spec_notes.md.
         final m = List.generate(
-            3, (_) => List<double>.generate(2, (_) => 64.0 * reader.readF16()));
+            3, (_) => List<double>.generate(2, (_) => reader.readF16()));
         return DctParams(_readDCTParams(reader), m, encodingMode);
       case TransformMode.dct:
         return DctParams(_readDCTParams(reader), null, encodingMode);
@@ -491,17 +526,8 @@ final class HfGlobal {
           weights[index][c] = getDCTQuantWeights(
               tt.matrixHeight, tt.matrixWidth, p.dctParam![c]);
         case TransformMode.dct4:
-          final target = floatMatrix(8, 8);
-          final w = getDCTQuantWeights(4, 4, p.dctParam![c]);
-          for (var y = 0; y < 8; y++) {
-            for (var x = 0; x < 8; x++) {
-              target[y][x] = w[y ~/ 2][x ~/ 2];
-            }
-          }
-          target[1][0] /= p.param![c][0];
-          target[0][1] /= p.param![c][0];
-          target[1][1] /= p.param![c][1];
-          weights[index][c] = target;
+          weights[index][c] =
+              getDct4x4QuantWeights(p.dctParam![c], p.param![c]);
         case TransformMode.dct2:
           final w = floatMatrix(8, 8);
           w[0][0] = 1.0;

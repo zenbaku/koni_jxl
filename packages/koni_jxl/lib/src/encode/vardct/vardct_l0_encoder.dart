@@ -8,9 +8,11 @@ import '../../util/math_helper.dart';
 import '../../vardct/dct.dart';
 import '../../vardct/hf_block_context.dart';
 import '../../vardct/hf_coefficients.dart' show HfCoefficients;
-import '../../vardct/hf_global.dart' show defaultDctParams, getDCTQuantWeights;
+import '../../vardct/hf_global.dart'
+    show DctParams, defaultDctParams, getDCTQuantWeights, getDct4x4QuantWeights;
 import '../../vardct/hf_pass.dart' show getNaturalOrder;
-import '../../vardct/transform_type.dart' show TransformMode, TransformType;
+import '../../vardct/transform_type.dart'
+    show TransformMethod, TransformMode, TransformType;
 import '../context_tree.dart';
 import '../entropy_writer.dart';
 import '../headers.dart';
@@ -45,6 +47,7 @@ class VardctL0Config {
     this.maxTransformSize = 16,
     this.transformRdLambdaOverrideBeyond16,
     this.enableRectangularTransforms = false,
+    this.enableBespokeTransforms = false,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
     this.enableRdoq = true,
@@ -199,6 +202,22 @@ class VardctL0Config {
   /// that's off by default.
   final bool enableRectangularTransforms;
 
+  /// Whether to also try Tranche C's "bespoke" transform types (types with
+  /// no shared plain-DCT machinery — DCT4x4 is the first; Hornuss, DCT2x2,
+  /// DCT4x8/8x4, and AFV0-3 remain unimplemented) at the bootstrap-leaf
+  /// level, as alternative encodings of the *same* 8x8 footprint plain
+  /// DCT8x8 already occupies — not a merge into a larger footprint like
+  /// every Tranche A/B type. Reuses `tryMergeLevel` unchanged: called with
+  /// a `dctSelectHeight==dctSelectWidth==1` target, it already degenerates
+  /// into exactly this "replace one already-placed 8x8-footprint block if
+  /// the real assembled cost is lower" decision, so no separate mechanism
+  /// was needed (see doc/spec_notes.md for why an earlier draft's separate
+  /// chooser design was dropped). Defaults to **off** for the same reason
+  /// [enableRectangularTransforms] does: existence is a completeness goal
+  /// (ROADMAP.md), the default is a separate, real-content-ROI question not
+  /// yet evaluated.
+  final bool enableBespokeTransforms;
+
   /// Whether to replace the default 3-bucket adaptive-quantization
   /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
   /// with a real per-block rate-distortion search over the same
@@ -304,6 +323,8 @@ final _tt256x128 = TransformType.byType(
     25); // DCT 256x128: orderID 12, parameterIndex 16, flip
 final _tt128x256 = TransformType.byType(
     26); // DCT 128x256: orderID 12, parameterIndex 16, no flip
+final _tt4x4 = TransformType.byType(
+    3); // DCT4x4 (Tranche C, bespoke): orderID 1, parameterIndex 3, TransformMethod.dct4
 
 /// Transform types this encoder can currently emit, largest reused
 /// mechanically wherever code is already N-way (context/rawWeight lookup,
@@ -335,6 +356,7 @@ final _activeTransformTypes = [
   _tt64x128,
   _tt256x128,
   _tt128x256,
+  _tt4x4,
 ];
 
 /// The square sizes beyond the always-on 8x8/16x16 level, in ascending
@@ -437,14 +459,58 @@ Uint8List encodeLossyVardctL0(
   // weight table by the same factor (see doc/spec_notes.md), giving a
   // fineness knob with no ceiling — unlike globalScale, whose bitstream
   // field caps how much finer than baseline it can reach.
-  List<List<double>> customParams(TransformType tt) => [
-        for (var c = 0; c < 3; c++)
-          [
-            defaultDctParams[tt.parameterIndex].dctParam![c][0] *
-                config.acScale,
-            ...defaultDctParams[tt.parameterIndex].dctParam![c].skip(1),
-          ],
-      ];
+  // Dispatches by each parameterIndex's real TransformMode (bitstream quant
+  // weight encoding mode, not TransformType.transformMethod's pixel
+  // reconstruction algorithm) rather than assuming every active type is
+  // `TransformMode.dct`-shaped -- that assumption held for all 18 plain-DCT
+  // types (Tranches A/B) but breaks the moment a bespoke type (Tranche C)
+  // is active: `TransformMode.dct4`'s default params carry a *nested* 4x4
+  // dctParam table plus 2 separate override values, a structurally
+  // different shape `getDCTQuantWeights(pixelHeight, pixelWidth, ...)`
+  // can't consume directly. `acScale`'s "scale band[0]" fineness-knob
+  // mechanism still applies to the nested dctParam table unchanged (see
+  // getDCTQuantWeights's own doc comment for why scaling only band[0]
+  // scales the whole interpolated table uniformly); the 2 override values
+  // are left at their unscaled defaults for now -- since both the weight
+  // table built here and the params written to the bitstream derive from
+  // this SAME DctParams, that's a rate-tuning choice, not a correctness
+  // one (see getDct4x4QuantWeights's doc comment for the single-sourcing
+  // this depends on).
+  DctParams customParams(TransformType tt) {
+    final base = defaultDctParams[tt.parameterIndex];
+    final scaledDctParam = [
+      for (var c = 0; c < 3; c++)
+        [base.dctParam![c][0] * config.acScale, ...base.dctParam![c].skip(1)],
+    ];
+    switch (base.mode) {
+      case TransformMode.dct:
+        return DctParams(scaledDctParam, null, TransformMode.dct);
+      case TransformMode.dct4:
+        return DctParams(scaledDctParam, base.param, TransformMode.dct4);
+      default:
+        throw UnsupportedError(
+            'transform mode ${base.mode} not yet supported by the lossy encoder');
+    }
+  }
+
+  List<List<Float32List>> rawWeightsFor(TransformType tt, DctParams p) {
+    switch (p.mode) {
+      case TransformMode.dct:
+        return [
+          for (var c = 0; c < 3; c++)
+            getDCTQuantWeights(tt.pixelHeight, tt.pixelWidth, p.dctParam![c]),
+        ];
+      case TransformMode.dct4:
+        return [
+          for (var c = 0; c < 3; c++)
+            getDct4x4QuantWeights(p.dctParam![c], p.param![c]),
+        ];
+      default:
+        throw UnsupportedError(
+            'transform mode ${p.mode} not yet supported by the lossy encoder');
+    }
+  }
+
   // Keyed by tt.type, not parameterIndex: distinct transform types can
   // share a parameterIndex (e.g. DCT8x16/16x8), but each still needs its
   // own weight matrix at its own pixelHeight/pixelWidth.
@@ -453,11 +519,7 @@ Uint8List encodeLossyVardctL0(
   };
   final rawWeightByType = {
     for (final tt in _activeTransformTypes)
-      tt.type: [
-        for (var c = 0; c < 3; c++)
-          getDCTQuantWeights(
-              tt.pixelHeight, tt.pixelWidth, customParamsByType[tt.type]![c]),
-      ],
+      tt.type: rawWeightsFor(tt, customParamsByType[tt.type]!),
   };
   final globalScaleF = 65536.0 / config.globalScale;
   final scaleFactor = [
@@ -561,7 +623,8 @@ Uint8List encodeLossyVardctL0(
         config.transformRdLambdaOverride,
         config.maxTransformSize,
         config.transformRdLambdaOverrideBeyond16,
-        config.enableRectangularTransforms);
+        config.enableRectangularTransforms,
+        config.enableBespokeTransforms);
 
     Uint8List assemble(List<_PlacedBlock> blocks, List<Int32List> dcInt) =>
         _finishEncode(
@@ -684,7 +747,7 @@ Uint8List _finishEncode(
     List<Float32List> scratchA,
     List<Float32List> scratchB,
     VardctL0Config config,
-    Map<int, List<List<double>>>? customParamsByIndex,
+    Map<int, DctParams>? customParamsByIndex,
     int width,
     int height) {
   final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
@@ -1039,7 +1102,8 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     double? lambdaOverride,
     int maxTransformSize,
     double? lambdaOverrideBeyond16,
-    bool enableRectangularTransforms) {
+    bool enableRectangularTransforms,
+    bool enableBespokeTransforms) {
   final ctx8 = ctxByType[_tt8.type]!;
   // 1. Bootstrap: quantize the whole image as all-8x8, committing into
   // dcIntBootstrap — this becomes (unmodified) the "off" candidate's DC
@@ -1259,6 +1323,33 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     }
   }
 
+  // 3.5. Bespoke pre-pass (Tranche C) at the bootstrap tier: try DCT4x4 as
+  // an *alternative* encoding of the same 8x8 footprint plain DCT8x8
+  // already occupies — not a merge into a larger footprint like every
+  // Tranche A/B type above. `tryMergeLevel` degenerates cleanly to exactly
+  // this "replace one already-placed 1x1-footprint block if the real
+  // assembled cost is lower" decision when `targetType.dctSelectHeight ==
+  // dctSelectWidth == 1` (true of DCT4x4): `strideY = strideX = 1`, the
+  // containment loop runs exactly once, `canPair` is always true — no
+  // separate mechanism was needed (an earlier design draft proposed one;
+  // dropped after design review found this reuse, see doc/spec_notes.md).
+  // Order relative to the rectangular pre-pass above doesn't affect
+  // correctness: DCT4x4's footprint is geometrically identical to plain
+  // 8x8 (same 1x1 `dctSelect` cell), so the containment guard treats it
+  // the same as any other already-placed 1x1 block regardless of which
+  // pre-pass ran first — only which greedy opportunity gets found first,
+  // same caveat already documented for the rectangular list's own internal
+  // ordering. Off by default ([VardctL0Config.enableBespokeTransforms]).
+  if (enableBespokeTransforms) {
+    final (next, dcNext, changed) =
+        tryMergeLevel(layout, dcInt, _tt4x4, lambda);
+    if (changed) {
+      layout = next;
+      dcInt = dcNext;
+      candidates.add((layout, dcInt));
+    }
+  }
+
   // 4. The always-on 8x8-vs-16x16 decision, now routed through the same
   // shared closure as every other level — required, not just uniform: once
   // the rectangular pre-pass can run first, this level must see whatever
@@ -1332,6 +1423,35 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
 /// scaling either direction cancels) to recover the four DC-plane values
 /// that will reconstruct it. For an 8x8 block this degenerates to the
 /// trivial 1x1 case (`llfScale[0] == 1.0`, no inversion needed).
+/// The decoder's `_auxDCT2` (`vardct_inverter.dart`) single-stage (`s=2`,
+/// `num=1`) 2x2 Hadamard-type butterfly, applied here to invert it: given
+/// this isolated application's OWN output, applying the SAME formula again
+/// recovers exactly 4x the original input at every position — verified by
+/// hand three times and numerically (2000 random trials, max deviation
+/// 1e-14). This is used by `TransformMethod.dct4`'s forward derivation
+/// (`_PlacedBlock.computeCoeffBuf`) to combine the 4 quadrants' own DC terms
+/// back into the coefficient grid's top-left 2x2 corner, mirroring
+/// `_auxDCT2`'s role in the decoder's `TransformMethod.dct4` case exactly.
+///
+/// **Do NOT reuse this for DCT2x2's 3-stage cascade** (`_auxDCT2` called at
+/// `s=2`, then `4`, then `8`, each stage's output feeding the next): that
+/// composition was checked independently (a 64x64 basis-injection matrix,
+/// see doc/spec_notes.md) and found NOT self-inverse this way — its Gram
+/// matrix has a tiered 64/16/4 diagonal, not a uniform 4, because the
+/// overlapping multi-stage structure doesn't preserve the single-stage
+/// property. A hand-proof (or numeric check) of one isolated application
+/// does not extend to a multi-stage cascade built from it — verify any
+/// future reuse of this shape numerically against the real decoder logic
+/// before trusting it, don't assume.
+(double, double, double, double) _dct4QuadrantButterfly(
+        double c00, double c01, double c10, double c11) =>
+    (
+      c00 + c01 + c10 + c11,
+      c00 + c01 - c10 - c11,
+      c00 - c01 + c10 - c11,
+      c00 - c01 - c10 + c11,
+    );
+
 class _PlacedBlock {
   _PlacedBlock(this.by, this.bx, this.tt);
 
@@ -1377,9 +1497,55 @@ class _PlacedBlock {
     // _maxTransformPixelSize's doc comment) — forwardDCT2D only ever
     // touches the [0, ph) x [0, pw) sub-region a call passes explicitly, so
     // one pair covers every active transform type without a size dispatch.
-    for (var c = 0; c < 3; c++) {
-      forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, ph, pw,
-          scratchA, scratchB);
+    if (tt.transformMethod == TransformMethod.dct4) {
+      // Verified as the exact algebraic inverse of the decoder's
+      // TransformMethod.dct4 case (vardct_inverter.dart) via a 64x64
+      // basis-injection matrix check (M @ E == I to 4.4e-16) before being
+      // trusted — see doc/spec_notes.md. Per quadrant: forwardDCT2D of the
+      // TRANSPOSED quadrant recovers the coefficient grid that
+      // inverseDCT2D(...,transposed=true) would reconstruct, since
+      // transposed=true computes transpose(inverseDCT2D(...,false)) and
+      // forwardDCT2D is already the proven exact inverse of
+      // inverseDCT2D(...,false) (every Tranche A/B LLF-inversion test
+      // depends on this). The 4 quadrants' own DC terms (position (0,0) of
+      // each quadrant's forward DCT) are then combined via
+      // _dct4QuadrantButterfly, mirroring the decoder's own _auxDCT2 call.
+      final quadTransposed = List.generate(4, (_) => Float32List(4));
+      final quadCoeffs = List.generate(4, (_) => Float32List(4));
+      for (var c = 0; c < 3; c++) {
+        final quadDC = List.generate(2, (_) => Float32List(2));
+        for (var qy = 0; qy < 2; qy++) {
+          for (var qx = 0; qx < 2; qx++) {
+            for (var iy = 0; iy < 4; iy++) {
+              final srcRow = planes[c][by * 8 + qy * 4 + iy];
+              final srcBase = bx * 8 + qx * 4;
+              for (var ix = 0; ix < 4; ix++) {
+                quadTransposed[ix][iy] = srcRow[srcBase + ix];
+              }
+            }
+            forwardDCT2D(quadTransposed, quadCoeffs, 0, 0, 0, 0, 4, 4, scratchA,
+                scratchB);
+            quadDC[qy][qx] = quadCoeffs[0][0];
+            for (var iy = 0; iy < 4; iy++) {
+              for (var ix = 0; ix < 4; ix++) {
+                if (iy == 0 && ix == 0) continue;
+                coeffBuf[c][qy + iy * 2][qx + ix * 2] = quadCoeffs[iy][ix];
+              }
+            }
+          }
+        }
+        final (e00, e01, e10, e11) = _dct4QuadrantButterfly(
+            quadDC[0][0], quadDC[0][1], quadDC[1][0], quadDC[1][1]);
+        coeffBuf[c][0][0] = e00 / 4;
+        coeffBuf[c][0][1] = e01 / 4;
+        coeffBuf[c][1][0] = e10 / 4;
+        coeffBuf[c][1][1] = e11 / 4;
+      }
+    } else {
+      for (var c = 0; c < 3; c++) {
+        forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, ph, pw,
+            scratchA, scratchB);
+      }
     }
 
     final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
@@ -2065,33 +2231,76 @@ void _writeHfMetadata(
   _writeModularStream(w, [xFromY, bFromY, blockInfo, sharpness]);
 }
 
+/// Writes a `_readDCTParams`-shaped table (`hf_global.dart`): a shared
+/// nested encoding used both standalone (`TransformMode.dct`) and inside
+/// `TransformMode.dct4`'s custom-param write.
+void _writeDctParamTable(BitWriter w, List<List<double>> dctParam) {
+  w.writeBits(dctParam[0].length - 1, 4); // num_params - 1
+  for (final p in dctParam) {
+    // p[0] is divided by 64 on read (hf_global.dart's _readDCTParams).
+    w.writeF16(p[0] / 64.0);
+    for (final v in p.skip(1)) {
+      w.writeF16(v);
+    }
+  }
+}
+
 /// HfGlobal + the single HfPass: quant weight tables (the library default
 /// for every one of the 17 parameter slots when [customParamsByIndex] is
-/// null; otherwise a custom `TransformMode.dct` table for each entry in
-/// [customParamsByIndex] — this encoder only ever emits transform types
-/// 0 (DCT8x8, parameter slot 0) and 4 (DCT16x16, parameter slot 4) — with
-/// the library default for the other 15/16 slots, which costs 0 further
-/// bits each), a single HF preset shared by every group (cheapest choice;
-/// costs 0 bits only when [numGroups] == 1), and natural (unpermuted)
-/// coefficient order.
-void _writeHfGlobalAndPass(BitWriter w, int numGroups,
-    Map<int, List<List<double>>>? customParamsByIndex) {
+/// null; otherwise a custom table for each entry in [customParamsByIndex],
+/// encoded per that entry's own `DctParams.mode` — this encoder only ever
+/// emits custom params for `TransformMode.dct` (plain DCT types) and
+/// `TransformMode.dct4` (DCT4x4) slots, with the library default for every
+/// other slot, which costs 0 further bits each), a single HF preset shared
+/// by every group (cheapest choice; costs 0 bits only when [numGroups] ==
+/// 1), and natural (unpermuted) coefficient order.
+void _writeHfGlobalAndPass(
+    BitWriter w, int numGroups, Map<int, DctParams>? customParamsByIndex) {
   w.writeBool(customParamsByIndex == null); // quant_all_default
   if (customParamsByIndex != null) {
     for (var index = 0; index < 17; index++) {
-      final params = customParamsByIndex[index];
-      if (params == null) {
+      final p = customParamsByIndex[index];
+      if (p == null) {
         w.writeBits(TransformMode.library, 3); // 0 further bits
         continue;
       }
-      w.writeBits(TransformMode.dct, 3);
-      w.writeBits(params[0].length - 1, 4); // num_params - 1
-      for (final p in params) {
-        // p[0] is divided by 64 on read (hf_global.dart's _readDCTParams).
-        w.writeF16(p[0] / 64.0);
-        for (final v in p.skip(1)) {
-          w.writeF16(v);
-        }
+      switch (p.mode) {
+        case TransformMode.dct:
+          w.writeBits(TransformMode.dct, 3);
+          _writeDctParamTable(w, p.dctParam!);
+        case TransformMode.dct4:
+          // The 2 raw overrides per channel FIRST, then the nested
+          // dct-shaped table (matches _setupDctParam's read order). The
+          // overrides are written WITHOUT the *64 scaling _readDCTParams
+          // applies to a table's own first value — writing/reading them
+          // with *64 (matching hf_global.dart's _setupDctParam literally,
+          // which does apply it) round-trips through OUR OWN decoder
+          // perfectly but was found to disagree with djxl (confirmed via a
+          // real round-trip test, not assumed): djxl reconstructs a block
+          // averaging toward its overall DC, having lost almost all of the
+          // per-quadrant detail these override positions carry (`target[1]
+          // [0]`/`target[0][1]`/`target[1][1]` are exactly the coefficient
+          // positions holding the quadrant-DC-redistribution terms) — a
+          // genuine decoder bug, inherited (jxlatte has the identical *64),
+          // never caught before since nothing ever exercised a *custom*
+          // (non-default) DCT4x4 quant table until this encoder existed.
+          // Fixed on both sides (see _setupDctParam's dct4 case) and
+          // reverified against djxl. See doc/spec_notes.md — hornuss/dct2/
+          // afv's `_setupDctParam` cases have the SAME `64.0 *` pattern on
+          // their own override-shaped params and are suspected to share
+          // this bug, but are unverified (no encoder exists yet to test
+          // them against djxl) — don't assume they're fine, check when
+          // implementing those types.
+          w.writeBits(TransformMode.dct4, 3);
+          for (final ch in p.param!) {
+            for (final v in ch) {
+              w.writeF16(v);
+            }
+          }
+          _writeDctParamTable(w, p.dctParam!);
+        default:
+          throw UnsupportedError(
+              'custom weight write not implemented for mode ${p.mode}');
       }
     }
   }

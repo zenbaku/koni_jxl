@@ -122,11 +122,12 @@ quality lives.
     this gap, and `enableVariableTransforms` now defaults to **on**.
   Full 27-transform-type support (this encoder only added 8x8/16x16 as of
   round 6; rounds 7/8 completed Tranche A — all square DCT sizes, 8x8
-  through 256x256, 6 of 27 types; rounds 9/10 below completed Tranche B —
-  all 12 rectangular types, 18 of 27 total; 9 remain, all in Tranche C)
-  and a real rate-distortion search over transform size itself (rounds
-  6-10 choose between fixed candidates per region, not a search) remain
-  open — see round 10's write-up for the phased plan covering the rest.
+  through 256x256, 6 of 27 types; rounds 9/10 completed Tranche B — all 12
+  rectangular types, 18 of 27 total; round 11 below started Tranche C with
+  DCT4x4, 19 of 27 total; 8 remain) and a real rate-distortion search over
+  transform size itself (rounds 6-11 choose between fixed candidates per
+  region, not a search) remain open — see round 11's write-up for the
+  phased plan covering the rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -576,6 +577,60 @@ output for where the gap actually is.
   stays off by default (no real-manga check run for the full set yet).
   This completes Tranche B (12 of 27 types now implemented, 9 to go —
   all in Tranche C). See doc/spec_notes.md for the full write-up.
+
+- ✅ **Round 11 / Tranche C started: DCT4x4, the first "bespoke" transform
+  type.** Unlike Tranche A/B (plain DCTs sharing one merge-cascade
+  architecture), Tranche C's 9 types have no shared forward-transform
+  machinery — the decoder reconstructs each via hand-derived formulas.
+  Found most of the surrounding machinery (natural order, AC scatter,
+  dequant loop, DC/LLF routing) is nonetheless already fully generic; only
+  weight-table construction and pixel reconstruction are genuinely bespoke
+  per type. A first derivation attempt (DCT2x2, hand-proved "self-inverse
+  up to /4" for its 3-stage butterfly cascade) was caught WRONG by a
+  design-review pass that built the real 64x64 linear map via basis
+  injection — proof of one isolated stage doesn't extend to a multi-stage
+  composition built from it. Switched to DCT4x4 (reuses the *verified*
+  isolated single-stage case plus the already-generic `forwardDCT2D`),
+  numerically confirmed end to end (a 64x64 basis-injection matrix,
+  `M @ E == I` to 4.4e-16; 200 random-trial round-trips) before writing any
+  production code, then re-derived as a permanent Dart identity test.
+  Dropped an initially-planned new "bespoke vs. plain 8x8" chooser
+  mechanism after design review found `tryMergeLevel` already degenerates
+  to exactly that decision for a 1x1-footprint target type — zero new
+  merge logic needed, just `_tt4x4` added to the existing bootstrap
+  pre-pass list, gated by a new `enableBespokeTransforms` flag (off by
+  default, mirrors `enableRectangularTransforms`'s precedent). Fixed two
+  real plumbing gaps found by design review (weight-table construction and
+  bitstream writing both assumed every type is `TransformMode.dct`-shaped,
+  wrong for `TransformMode.dct4`) structurally, by extracting
+  `getDct4x4QuantWeights` so both sides derive from the same function on
+  the same params, rather than testing around the divergence.
+  **Found and fixed a real, previously-undiscovered decoder bug** along
+  the way: `_setupDctParam`'s `TransformMode.dct4` case read its 2 raw
+  override values with an erroneous `*64` scaling (inherited — jxlatte has
+  the identical mistake), silently corrupting exactly the coefficient
+  positions carrying quadrant-DC-redistribution detail whenever a *custom*
+  (non-default) DCT4x4 quant table was used — never caught before since no
+  encoder had ever exercised that path. Found via the classic signature
+  (our own decoder self-consistently correct, djxl very wrong), confirmed
+  as a real bug (not "beyond jxlatte's capability") by running jxlatte on
+  the same file and finding it agreed with our decoder, then root-caused
+  and fixed on both the read and write sides, reverified against djxl.
+  `hornuss`/`dct2`/`afv`'s own override reads have the identical `*64`
+  pattern and are suspected to share this bug — flagged in code for
+  whoever implements those types next, not fixed blind (unverifiable
+  without an encoder to test them yet). An advisor review caught that
+  every test so far forced a *uniform* tally, leaving DCT4x4's
+  interleaving with plain DCT8x8/merged DCT16x16 in the same bitstream
+  completely unexercised end-to-end (the same tier-interaction shape as
+  Tranche B's flip=false gap) — added a mixed-layout config (checkerboard
+  half + gradient half) that genuinely mixes all three transform types,
+  round-tripped through djxl at 4 distances, passed first try. Full suite
+  green (351 tests, up from 342). Default-path A/B (git stash, same real
+  manga page) confirmed byte-identical output, comparable timing.
+  `enableBespokeTransforms` stays off by default. This starts Tranche C
+  (19 of 27 types now implemented, 8 to go). See doc/spec_notes.md for the
+  full write-up.
 
 ---
 

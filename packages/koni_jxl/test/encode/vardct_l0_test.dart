@@ -1292,6 +1292,215 @@ void main() {
     }
   });
 
+  // Tranche C (ROADMAP.md/spec_notes.md), first slice: DCT4x4 -- unlike
+  // Tranche A/B (plain DCTs, differing only in dctSelect footprint), this
+  // is the first "bespoke" transform type (no shared plain-DCT machinery).
+  // Config found empirically (jxl.encdebug tallies), not guessed: a 32x32
+  // canvas with a 4x4-quadrant checkerboard (period 4, so DC jumps sharply
+  // every 4 pixels in both axes) makes every block choose DCT4x4 over
+  // plain DCT8x8 -- the per-quadrant DC term captures the level jump
+  // directly, which an 8x8 DCT can only approximate via AC ringing.
+  //
+  // Looped over distances spanning the normal range (0.5 to 4.0), NOT just
+  // the default 1.0 -- deliberately, per this project's own RDOQ/hfMult
+  // lambda-scaling history (see doc/spec_notes.md): `usesCustomWeights`
+  // (and therefore the whole per-mode weight-table/bitstream-write
+  // dispatch this slice added -- see VardctL0Config.enableBespokeTransforms
+  // and _writeHfGlobalAndPass) is dead code at distance=1.0
+  // (acScale==1.0), so a suite that only tested there would pass even if
+  // that plumbing were completely broken. This same config was confirmed
+  // (via the encdebug tally) to make DCT4x4 win outright at every one of
+  // these four distances, not just one.
+  for (final distance in [0.5, 1.0, 2.0, 4.0]) {
+    test(
+        'DCT4x4 (Tranche C, opt-in) genuinely wins on a 4x4-quadrant '
+        'checkerboard and round-trips correctly at distance=$distance', () {
+      const size = 32;
+      final pixels = Uint8List(size * size * 3);
+      var i = 0;
+      for (var y = 0; y < size; y++) {
+        for (var x = 0; x < size; x++) {
+          final qy = y ~/ 4, qx = x ~/ 4;
+          final v = (qy + qx).isEven ? 40 : 210;
+          pixels[i++] = v;
+          pixels[i++] = v;
+          pixels[i++] = v;
+        }
+      }
+      final base = VardctL0Config.fromDistance(distance);
+      final withBespoke = encodeLossyVardctL0(pixels,
+          width: size,
+          height: size,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: true));
+      final withoutBespoke = encodeLossyVardctL0(pixels,
+          width: size,
+          height: size,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: false));
+      expect(withBespoke.length, lessThan(withoutBespoke.length),
+          reason: 'DCT4x4 (${withBespoke.length}B) should beat plain 8x8 '
+              '(${withoutBespoke.length}B) at this config');
+
+      double decodeVsOriginal(Uint8List encoded) {
+        final decoded = JxlDecoder.decode(encoded).toRgba8();
+        var sumSq = 0.0;
+        var n = 0;
+        for (var p = 0; p < size * size; p++) {
+          for (var c = 0; c < 3; c++) {
+            final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+            sumSq += d * d;
+            n++;
+          }
+        }
+        return math.sqrt(sumSq / n);
+      }
+
+      final bespokeRmse = decodeVsOriginal(withBespoke);
+      final plainRmse = decodeVsOriginal(withoutBespoke);
+      expect(bespokeRmse, lessThan(plainRmse * 2 + 1),
+          reason: 'DCT4x4 RMSE-vs-original ($bespokeRmse) should be in the '
+              'same ballpark as plain 8x8 ($plainRmse), not blown up by a '
+              'forward-transform or quant-weight/bitstream-mode error');
+
+      final image = JxlDecoder.decode(withBespoke);
+      expect(image.width, size);
+      expect(image.height, size);
+
+      if (!_haveDjxl) return;
+      final dir = Directory.systemTemp.createTempSync('koni_lossy_dct4x4');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(withBespoke);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        expect(ref.width, size);
+        expect(ref.height, size);
+
+        var sumSq = 0.0;
+        var n = 0;
+        for (var c = 0; c < 3; c++) {
+          final ours = channelAsInts(image.channels[c], 255);
+          final theirs = ref.intPlanes![c];
+          for (var j = 0; j < size * size; j++) {
+            final d = ours[j] - theirs[j];
+            sumSq += d * d;
+            n++;
+          }
+        }
+        final rmse = math.sqrt(sumSq / n);
+        expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    });
+  }
+
+  // Every test above forces a UNIFORM tally (every 8x8 cell picks DCT4x4),
+  // so the block-info stream never actually interleaves transform-type IDs
+  // {0 (DCT8x8), 3 (DCT4x4), 4 (DCT16x16)} in one bitstream, and
+  // tryMergeLevel's 16x16 merge pass never sees a DCT4x4 leaf next to a
+  // plain 8x8 leaf. That is exactly the kind of tier-interaction gap this
+  // project got burned by once already (Tranche B's flip=false blind spot)
+  // and the *self-consistent-but-wrong* decoder bug earlier in this same
+  // round -- both were invisible to single-transform-type tests. This test
+  // forces a genuine mix: left half a 4x4-quadrant checkerboard (favors
+  // DCT4x4), right half a smooth gradient (favors DCT8x8/merged DCT16x16).
+  // Confirmed via the jxl.encdebug tally at these exact distances:
+  //   0.5 -> {DCT 4x4: 32, DCT 16x16: 6, DCT 8x8: 8}  (all three types)
+  //   1.0 -> {DCT 4x4: 32, DCT 16x16: 8}
+  //   2.0 -> {DCT 4x4: 32, DCT 8x8: 32}
+  //   4.0 -> {DCT 4x4: 32, DCT 8x8: 32}
+  for (final distance in [0.5, 1.0, 2.0, 4.0]) {
+    test(
+        'DCT4x4 (Tranche C, opt-in) round-trips correctly in a MIXED layout '
+        'alongside plain DCT8x8/DCT16x16 at distance=$distance', () {
+      const size = 64;
+      final pixels = Uint8List(size * size * 3);
+      var i = 0;
+      for (var y = 0; y < size; y++) {
+        for (var x = 0; x < size; x++) {
+          int v;
+          if (x < size ~/ 2) {
+            final qy = y ~/ 4, qx = x ~/ 4;
+            v = (qy + qx).isEven ? 40 : 210;
+          } else {
+            v = (y * 200 / size).round().clamp(0, 255);
+          }
+          pixels[i++] = v;
+          pixels[i++] = v;
+          pixels[i++] = v;
+        }
+      }
+      final base = VardctL0Config.fromDistance(distance);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: size,
+          height: size,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: true));
+
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, size);
+      expect(image.height, size);
+
+      var sumSq = 0.0;
+      var n = 0;
+      final decoded = image.toRgba8();
+      for (var p = 0; p < size * size; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      expect(math.sqrt(sumSq / n), lessThan(30.0),
+          reason: 'decode-vs-original RMSE should stay bounded in a mixed '
+              'layout, not just in the all-DCT4x4 case');
+
+      if (!_haveDjxl) return;
+      final dir = Directory.systemTemp.createTempSync('koni_lossy_dct4x4_mix');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        expect(ref.width, size);
+        expect(ref.height, size);
+
+        var dSumSq = 0.0;
+        var dn = 0;
+        for (var c = 0; c < 3; c++) {
+          final ours = channelAsInts(image.channels[c], 255);
+          final theirs = ref.intPlanes![c];
+          for (var j = 0; j < size * size; j++) {
+            final d = ours[j] - theirs[j];
+            dSumSq += d * d;
+            dn++;
+          }
+        }
+        final rmse = math.sqrt(dSumSq / dn);
+        expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    });
+  }
+
   test('finer quantization improves RMSE', () {
     if (!_haveDjxl) return;
     final pixels = _synthetic(64, 64, 9);

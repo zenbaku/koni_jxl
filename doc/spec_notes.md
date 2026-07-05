@@ -2006,6 +2006,186 @@ derivation mirroring the decoder's bespoke inverse code, closer to a
 handful of small research tasks than the mechanical generalization
 Tranches A and B turned out to be.
 
+### Lossy (VarDCT) encoder — Tranche C, first slice: DCT4x4, and a real decoder bug found along the way
+
+Tranche C's 9 types (Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0-3) are
+qualitatively different from A/B: the decoder (`vardct_inverter.dart`)
+reconstructs each via hand-derived, non-separable-DCT formulas, so there's
+no shared forward-transform machinery to fan out. This entry covers the
+first type, DCT4x4, end to end — including a wrong initial derivation
+caught before shipping, and a genuine inherited decoder bug found (and
+fixed) via the new encoder's own verification.
+
+**What's actually shared vs. bespoke, found by tracing the full decode
+path before assuming "no shared machinery" applied everywhere**: natural
+coefficient order (`getNaturalOrder`, keyed only by shape — all 9 bespoke
+types report `pixelHeight=pixelWidth=8`, `dctSelectHeight=dctSelectWidth=1`,
+so they get the same generic 8x8 scan order plain DCT8x8 uses), the AC
+coefficient scatter (`hf_coefficients.dart`, generic per-position write,
+`flip=false` for all 9 so no transpose), and the dequant loop (generic,
+skips only the single `(0,0)` LLF position) are all **already fully
+generic** — zero changes needed. `quantizeCandidate`/`commit`'s
+`numBlocks==1` path (true for all 9, since `dctSelectHeight=
+dctSelectWidth=1`) already reads `coeffBuf[c][0][0]` directly as the
+block's DC value, the same path plain DCT8x8 uses — so DC/LLF routing
+needed zero changes either. What's genuinely bespoke, confined to two
+places: `hf_global.dart`'s per-mode weight-table *construction*, and
+`vardct_inverter.dart`'s per-`TransformMethod` pixel-reconstruction switch.
+
+**A wrong derivation, caught before any code was written**: the first
+planning pass proposed DCT2x2 as the first slice, on a hand-derived claim
+that its 3-stage `_auxDCT2` cascade (`s=2` then `4` then `8`) is
+self-inverse up to a factor of 4 (applying the same formula to its own
+output recovers `4x` the input). A design-review pass built the actual
+64x64 linear map by basis-vector injection (feed each of 64 unit impulses
+through the real 3-stage cascade, assemble the resulting matrix) and
+proved this false: the map's Gram matrix has a **tiered** diagonal
+(64/16/4, not a uniform 4) — the 3 overlapping stages interact in a way a
+single-stage hand-proof doesn't cover, since each stage reads decimated
+positions but writes interleaved ones (a Cooley-Tukey-style butterfly,
+which needs its transpose to invert, not a self-application). The
+*isolated single-stage* case (`s=2`, `num=1` — what DCT4x4 and Hornuss
+actually use for their DC-redistribution step) was then separately
+verified — by hand three times and numerically (2000 random trials, max
+deviation 1e-14) — to genuinely be self-inverse up to `/4`; the bug was
+specifically in extrapolating a single stage's proof to the multi-stage
+cascade built from it. **Generalizable lesson, on top of the RDOQ ripple-
+effect lesson this project already learned**: a hand-proof (or even a
+numeric check) of one isolated computational step does not establish
+correctness of a multi-stage composition built from repeating it — verify
+the *actual composition* numerically, not just its building block.
+
+DCT4x4 was chosen as the corrected first slice specifically because its
+forward derivation reuses the already-fully-generic, already-decoder-
+verified `forwardDCT2D` (no new DCT-basis code at all) combined with just
+the one verified single-stage butterfly — the least additional unverified
+surface of any Tranche C type. The full composition (`forwardDCT2D` of a
+transposed 4x4 quadrant, for each of 4 quadrants, plus the butterfly
+combining the 4 quadrants' own DC terms) was **numerically verified
+end-to-end** the same way the DCT2x2 error was caught — not assumed: a
+Python script built the real decoder's `TransformMethod.dct4` case
+(`vardct_inverter.dart:263-280`) as a 64x64 matrix via basis injection,
+built the proposed forward derivation as a matching 64x64 matrix, and
+confirmed `M @ E == I` (max deviation 4.4e-16) plus 200 random-trial
+round-trips (max error 4.4e-15). This was then re-derived as a permanent
+Dart identity test (`test/encode/vardct_forward_test.dart`, mirroring the
+existing "duplicate the decoder's private formula in test code" pattern
+already used for the LLF-inversion tests).
+
+**Architecture: no new decision mechanism needed.** An early draft planned
+a separate "bespoke vs. plain 8x8" chooser, since Tranche C types are
+*alternative* encodings of the same 8x8 footprint (not merges into a
+larger one, unlike every Tranche A/B type). Design review found this
+unnecessary: `tryMergeLevel`, called with a `targetType` whose
+`dctSelectHeight==dctSelectWidth==1` (true of DCT4x4), already degenerates
+exactly into "replace this one already-placed 1x1-footprint block if the
+real assembled cost is lower" — `strideY=strideX=1`, the containment loop
+runs once, `canPair` is always true. Building a separate mechanism would
+have risked re-deriving the containment-guard logic slightly differently
+— the exact class of drift that caused Tranche B's own containment-guard
+bug. `enableBespokeTransforms` (new config flag, off by default, mirrors
+`enableRectangularTransforms`'s precedent of one flag meant to eventually
+gate the whole tranche) just adds `_tt4x4` to the existing bootstrap-tier
+pre-pass list.
+
+**Two real plumbing gaps, found by design review before implementation,
+neither hypothetical**: (1) `rawWeightByType`/`customParams` assumed every
+active type's quant weights come from `getDCTQuantWeights(pixelHeight,
+pixelWidth, dctParam)` called directly at the full 8x8 size — correct for
+every `TransformMode.dct` type shipped so far, wrong for DCT4x4, whose
+real construction (`hf_global.dart`) calls `getDCTQuantWeights(4,4,...)`
+(a 4x4 sub-call), upsamples 2x, then overrides 3 positions from separate
+values. (2) `_writeHfGlobalAndPass` hardcoded `TransformMode.dct` for
+every custom quant entry (a comment noted "this encoder only ever emits
+types 0 and 4" — true until now) — silently wrong for any non-dct mode,
+with no exception thrown anywhere (`TransformType.validateIndex` doesn't
+catch it), meaning **silent pixel corruption, not a crash**, and only
+triggered at a non-default distance. **Fixed structurally, not by
+testing-around-it**: extracted `getDct4x4QuantWeights` (public, mirrors
+the `getDCTQuantWeights`/`getNaturalOrder` reuse precedent) so the
+decoder's `_generateWeights` and the encoder's weight construction call
+the exact same function on the exact same params — the table the encoder
+quantizes against and the table the decoder rebuilds can no longer
+diverge by construction. `customParams`/`rawWeightByType`/
+`_writeHfGlobalAndPass` all dispatch by each parameter index's real
+`TransformMode` now, not an implicit `TransformMode.dct` assumption.
+
+**A genuine, previously-undiscovered decoder bug, found via djxl** (not
+assumed, not left as "probably fine"): the first full end-to-end test
+(DCT4x4 genuinely winning on a 4x4-quadrant checkerboard, `distance=4.0`)
+passed at `distance=1.0` (library-default weights, no custom write) but
+FAILED against djxl at every non-default distance tested — huge RMSE
+(83.8 on a 0-255 scale) — while **our own decoder achieved RMSE=0 against
+the original pixels**, the classic "self-consistent but wrong" signature.
+Per this project's established methodology, ran jxlatte on the same file
+next: jxlatte reconstructed the *exact same* (correct) pixels our decoder
+did, confirming the deviation from djxl was a real bug shared by both
+decoders (an inherited mistake, not "beyond jxlatte's capability" — this
+warranted a fix, not just documentation). Root cause, found by process of
+elimination (the weight table's *values* couldn't be at fault — the test's
+degenerate all-zero-higher-bands case makes the weight table uniform
+regardless of any indexing convention) then confirmed by testing the
+hypothesis directly against djxl: `_setupDctParam`'s `TransformMode.dct4`
+case (`hf_global.dart`) read its 2 raw per-channel override values with an
+erroneous `*64` scaling (copied from the pattern used for a dct-shaped
+table's own first value, and from `hornuss`/`dct2`'s own override reads —
+jxlatte has the identical `*64` on all three). These 2 override positions
+(`target[1][0]`/`target[0][1]`/`target[1][1]` in the weight table) map
+exactly onto the coefficient positions holding the quadrant-DC-
+redistribution terms (the `_auxDCT2` butterfly's non-DC outputs) — with
+the wrong scale, that signal was almost entirely attenuated while the
+block's overall DC (unaffected by any override) survived, so djxl's
+output converged toward the block average, exactly matching the observed
+symptom. Fixed on both the read (`_setupDctParam`) and write
+(`_writeHfGlobalAndPass`) sides, reverified against djxl — checkerboard
+content at distances 0.5/1.0/2.0/4.0 all now decode correctly through both
+decoders. **`hornuss`/`dct2`/`afv`'s own override reads have the identical
+`*64` pattern and are suspected to share this bug — left unfixed
+(unverifiable without an encoder to exercise them against djxl yet), but
+flagged explicitly in code comments for whoever implements those types
+next: check this before trusting the existing read code.**
+
+Verification, full order: the numerical (Python) forward-derivation proof
+during planning; the permanent Dart identity test; a full end-to-end
+"genuinely wins" test at 4 distances (0.5/1.0/2.0/4.0, config found via
+`jxl.encdebug` tallies — a 32x32 canvas with a 4x4-quadrant checkerboard,
+period 4, makes every block choose DCT4x4 over plain 8x8) with djxl
+round-trip (`rmse < 2.0`) and decode-vs-original RMSE bound at each
+distance — deliberately spanning the distance range, not just 1.0, per
+this project's own RDOQ/hfMult lambda-scaling history (`usesCustomWeights`
+is dead code at the default distance, so a suite that only tested there
+would have shipped the decoder bug above undetected, exactly as 342 prior
+tests already had). Default-path A/B (`git stash`, same real manga page, 3
+trials) confirmed byte-identical output (510690B) and comparable timing.
+
+An advisor review after the above flagged a real remaining gap: every test
+so far forces a *uniform* tally (every 8x8 cell picks DCT4x4), so the
+block-info stream never interleaves transform-type IDs {0, 3, 4} and
+`tryMergeLevel`'s 16x16 merge pass never sees a DCT4x4 leaf beside a plain
+8x8 leaf — the same "tier-interaction desync" shape as Tranche B's
+flip=false gap, and structurally invisible to any single-transform-type
+test. Added a second `jxl.encdebug`-found config (64x64, left half the
+4x4-quadrant checkerboard, right half a smooth gradient) that produces a
+genuine mix — confirmed via the tally at all 4 tested distances: `{DCT
+4x4: 32, DCT 16x16: 6, DCT 8x8: 8}` at 0.5, down to two-type mixes at
+1.0/2.0/4.0 — and round-tripped it through djxl (`rmse < 2.0`) plus a
+decode-vs-original bound. Passed on the first try, all 4 distances.
+
+**Shipped**: DCT4x4 exists, is correct (verified numerically and against
+both djxl and jxlatte, including in mixed layouts alongside plain
+DCT8x8/DCT16x16), and fixed a real, previously-latent decoder bug along
+the way. `VardctL0Config.enableBespokeTransforms` stays off by default
+(existence-vs-ROI split, same as every prior tranche's first slice). Full
+suite green (351 tests, up from 342). Next: mechanically fan
+out to the rest of Tranche C — Hornuss and DCT2x2 (share the verified
+single-stage butterfly, but DCT2x2 specifically needs the corrected
+tiered-scaling-plus-transpose derivation, not the debunked self-inverse
+one), DCT4x8/DCT8x4 (share DCT4x4's "butterfly + sub-block IDCT" shape
+almost exactly), then AFV last (most complex: a 16x16 fixed basis matrix,
+a 3-region split, and a decoder comment flagging a sign combination to
+double-check) — checking the suspected `*64` override bug in each along
+the way, not assuming it's isolated to `dct4`.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
