@@ -94,11 +94,20 @@ void main() {
   // previously only exercised by the *decoder*. One parameterized group
   // covers all four (32, 64, 128, 256) rather than hand-copying a test per
   // size, matching `_decideTransformLayout`'s own generic cascade. Tranche
-  // B's first pair (16x8/8x16, types 6/7) reuses the same loop with
-  // independent height/width — the first genuinely rectangular case here,
-  // exercising the LLF-inversion sub-test below at a non-square
-  // `dctSelectHeight != dctSelectWidth` grid for the first time.
-  for (final typeIndex in [5, 18, 21, 24, 6, 7]) {
+  // B (16x8/8x16 first, types 6/7; then the rest, types 8-11/19/20/22/23/
+  // 25/26) reuses the same loop with independent height/width — the first
+  // genuinely rectangular cases here, exercising the LLF-inversion
+  // sub-test below at a non-square `dctSelectHeight != dctSelectWidth`
+  // grid for the first time.
+  for (final typeIndex in [
+    5, 18, 21, 24, // Tranche A square sizes
+    6, 7, // DCT 16x8/8x16 (2:1 pair)
+    8, 9, // DCT 32x8/8x32 (4:1 line, the only such case in the format)
+    10, 11, // DCT 32x16/16x32 (2:1 pair)
+    19, 20, // DCT 64x32/32x64 (2:1 pair)
+    22, 23, // DCT 128x64/64x128 (2:1 pair)
+    25, 26, // DCT 256x128/128x256 (2:1 pair)
+  ]) {
     final tt = TransformType.byType(typeIndex);
     final ph = tt.pixelHeight, pw = tt.pixelWidth;
 

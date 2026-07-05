@@ -284,18 +284,38 @@ final _tt16x8 =
     TransformType.byType(6); // DCT 16x8: orderID 4, parameterIndex 6, flip
 final _tt8x16 =
     TransformType.byType(7); // DCT 8x16: orderID 4, parameterIndex 6, no flip
+final _tt32x8 =
+    TransformType.byType(8); // DCT 32x8: orderID 5, parameterIndex 7, flip
+final _tt8x32 =
+    TransformType.byType(9); // DCT 8x32: orderID 5, parameterIndex 7, no flip
+final _tt32x16 =
+    TransformType.byType(10); // DCT 32x16: orderID 6, parameterIndex 8, flip
+final _tt16x32 =
+    TransformType.byType(11); // DCT 16x32: orderID 6, parameterIndex 8, no flip
+final _tt64x32 =
+    TransformType.byType(19); // DCT 64x32: orderID 8, parameterIndex 12, flip
+final _tt32x64 = TransformType.byType(
+    20); // DCT 32x64: orderID 8, parameterIndex 12, no flip
+final _tt128x64 =
+    TransformType.byType(22); // DCT 128x64: orderID 10, parameterIndex 14, flip
+final _tt64x128 = TransformType.byType(
+    23); // DCT 64x128: orderID 10, parameterIndex 14, no flip
+final _tt256x128 = TransformType.byType(
+    25); // DCT 256x128: orderID 12, parameterIndex 16, flip
+final _tt128x256 = TransformType.byType(
+    26); // DCT 128x256: orderID 12, parameterIndex 16, no flip
 
 /// Transform types this encoder can currently emit, largest reused
 /// mechanically wherever code is already N-way (context/rawWeight lookup,
 /// quant-weight/order tables); genuinely new work (layout-decision merge
 /// levels, flip/orientation handling) is called out separately in
 /// ROADMAP.md as each size/tranche lands. All of Tranche A (square DCT
-/// sizes) plus Tranche B's first pair (16x8/8x16) is listed here regardless
-/// of [VardctL0Config.maxTransformSize]/[VardctL0Config.
+/// sizes) plus all of Tranche B (12 rectangular types) are listed here
+/// regardless of [VardctL0Config.maxTransformSize]/[VardctL0Config.
 /// enableRectangularTransforms] — preparing a type's context/quant-weight
 /// tables is cheap and does not by itself make the layout decision ever
-/// place it; that's gated purely by [_cascadeSizes]/the rectangular attempt
-/// in `_decideTransformLayout`.
+/// place it; that's gated purely by [_cascadeSizes]/[_cascadeRectPairs]/the
+/// bootstrap-tier rectangular pre-pass in `_decideTransformLayout`.
 final _activeTransformTypes = [
   _tt8,
   _tt16,
@@ -305,12 +325,39 @@ final _activeTransformTypes = [
   _tt256,
   _tt16x8,
   _tt8x16,
+  _tt32x8,
+  _tt8x32,
+  _tt32x16,
+  _tt16x32,
+  _tt64x32,
+  _tt32x64,
+  _tt128x64,
+  _tt64x128,
+  _tt256x128,
+  _tt128x256,
 ];
 
 /// The square sizes beyond the always-on 8x8/16x16 level, in ascending
 /// order — `_decideTransformLayout`'s generic cascade stops at the first
 /// entry wider than [VardctL0Config.maxTransformSize].
 final _cascadeSizes = [_tt32, _tt64, _tt128, _tt256];
+
+/// The "2:1 pair" rectangular type (wide, tall) formed by merging two
+/// same-size square blocks from the cascade level *below* each entry in
+/// [_cascadeSizes] (same index) — e.g. `_cascadeRectPairs[0]` (16x32,
+/// 32x16) merges two 16x16-or-smaller blocks, one level below `_cascadeSizes
+/// [0]` (32x32). Tried in `_decideTransformLayout` immediately before its
+/// paired square merge, same "rectangular nests inside the square region,
+/// so it must run first" argument the bootstrap-tier 16x8/8x16 pre-pass
+/// already established — each pair's smaller dctSelect stride is exactly
+/// half its paired square tier's, so alignment to the rectangular type's
+/// own stride always keeps it within one square-tier-aligned region.
+final _cascadeRectPairs = [
+  (_tt16x32, _tt32x16),
+  (_tt32x64, _tt64x32),
+  (_tt64x128, _tt128x64),
+  (_tt128x256, _tt256x128),
+];
 
 /// Scratch-buffer side length shared by every transform-pipeline call
 /// (`computeCoeffBuf`, `_decideTransformLayout`, `_chooseHfMultRd`,
@@ -1183,19 +1230,26 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   var layout = bootstrapBlocks;
   var dcInt = dcIntBootstrap;
 
-  // 3. Rectangular pre-pass (Tranche B's first pair): wide (8x16) then tall
-  // (16x8), each its own real-assembled candidate, tried directly on the
+  // 3. Rectangular pre-pass at the bootstrap tier: the "2:1 pair" (wide
+  // 8x16, tall 16x8) then the "4:1 line" pair (wide 8x32, tall 32x8, the
+  // only 4:1 case in the whole format — no 16x8-square exists to pair
+  // further, so this merges four 8x8-or-smaller blocks in a line instead
+  // of two), each its own real-assembled candidate, tried directly on the
   // bootstrap before the square 16x16 decision below. Every 16x8/8x16
   // footprint nests cleanly inside exactly one 2x2 16x16-pixel region (each
   // spans one axis fully and the other partially, always within a single
   // 16x16-region's bounds), so running rectangular first and feeding the
   // result into the (generalized) 16x16 level next never presents that
-  // level with a partial overlap — the reverse order would. off by default
+  // level with a partial overlap — the reverse order would. 32x8/8x32
+  // does *not* nest inside a 16x16 region (it's 4 cells wide/tall, wider
+  // than 16x16's 2-cell span) — safe regardless, since `tryMergeLevel`'s
+  // containment guard rejects the 16x16 level ever trying to absorb part
+  // of an already-placed 32x8/8x32 block. Off by default
   // ([VardctL0Config.enableRectangularTransforms]); see that field's doc
   // comment for why (existence-vs-default, same split as
   // [VardctL0Config.maxTransformSize]).
   if (enableRectangularTransforms) {
-    for (final tt in [_tt8x16, _tt16x8]) {
+    for (final tt in [_tt8x16, _tt16x8, _tt8x32, _tt32x8]) {
       final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, tt, lambda);
       if (changed) {
         layout = next;
@@ -1228,12 +1282,34 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   // but the cascade still tries the next size up on the unchanged layout —
   // see this function's doc comment for why "no 32x32 merge anywhere"
   // doesn't provably rule out a 64x64 merge helping regardless.
+  //
+  // Each tier's own "2:1 pair" rectangular type (see [_cascadeRectPairs])
+  // is tried immediately before that tier's square merge, gated by the
+  // same [enableRectangularTransforms] flag and only when the tier itself
+  // is within [maxTransformSize] — no reason to try e.g. a 64x32 merge if
+  // 64x64 itself isn't being tried. Same rectangular-before-square nesting
+  // argument as the bootstrap-tier pre-pass: each pair's smaller stride is
+  // exactly half its square tier's, so alignment to the rectangular type's
+  // own stride always keeps it within one square-tier-aligned region.
   final lambdaBeyond16 =
       (lambdaOverrideBeyond16 ?? _kTransformRdLambdaBeyond16) *
           refStep *
           refStep;
-  for (final tt in _cascadeSizes) {
+  for (var idx = 0; idx < _cascadeSizes.length; idx++) {
+    final tt = _cascadeSizes[idx];
     if (tt.pixelWidth > maxTransformSize) break;
+    if (enableRectangularTransforms) {
+      final (wide, tall) = _cascadeRectPairs[idx];
+      for (final rtt in [wide, tall]) {
+        final (next, dcNext, changed) =
+            tryMergeLevel(layout, dcInt, rtt, lambdaBeyond16);
+        if (changed) {
+          layout = next;
+          dcInt = dcNext;
+          candidates.add((layout, dcInt));
+        }
+      }
+    }
     final (next, dcNext, changed) =
         tryMergeLevel(layout, dcInt, tt, lambdaBeyond16);
     if (!changed) continue; // try the next size up on the unchanged layout

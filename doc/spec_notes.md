@@ -1882,6 +1882,130 @@ merges four same-size 8x8 blocks in a line, since no intermediate
 format, confirmed by checking there is no 64x16/128x32/256x64 type in
 the spec).
 
+### Lossy (VarDCT) encoder — Tranche B completed: the remaining 10 rectangular types
+
+The fan-out was genuinely mechanical, as anticipated: `tryMergeLevel`
+already takes `(strideY, strideX)` as parameters, so no new merge logic
+was needed, only new type constants, an extension of the bootstrap-tier
+pre-pass, and a per-tier lookup for the "2:1 pair" that goes with each
+`_cascadeSizes` entry.
+
+**Bootstrap-tier pre-pass**: extended from `[_tt8x16, _tt16x8]` to
+`[_tt8x16, _tt16x8, _tt8x32, _tt32x8]` — the "4:1 line" case tried
+alongside the "2:1 pair," both on the bootstrap, before the square 16x16
+decision. Order between them doesn't affect correctness (only which
+opportunities a greedy pass happens to find first): DCT 32x8/8x32 does
+*not* nest inside a 16x8/8x16 footprint or vice versa, but
+`tryMergeLevel`'s containment guard (round 9) already makes any
+non-nesting interaction safe — whichever runs second simply can't touch
+cells the first already committed, falling through to "keep as-is"
+rather than corrupting anything.
+
+**Per-cascade-tier pairs**: a new `_cascadeRectPairs` list, index-aligned
+with `_cascadeSizes`, pairs each square tier with its wide/tall
+rectangular siblings (`_tt32` → `(_tt16x32, _tt32x16)`, `_tt64` →
+`(_tt32x64, _tt64x32)`, etc.). The `_cascadeSizes` loop now tries a
+tier's rectangular pair immediately before that tier's own square merge,
+gated by both `enableRectangularTransforms` and the tier being within
+`maxTransformSize` (no reason to try e.g. a 64x32 merge if 64x64 itself
+isn't in play). The same nesting argument round 9 established for
+16x8/8x16-before-16x16 generalizes cleanly to every tier: each pair's
+smaller dctSelect stride is exactly half its square tier's own stride
+(e.g. 32x16's width-stride is 2, half of 32x32's 4), so alignment to the
+rectangular type's own stride always keeps it within one
+square-tier-aligned region — verified, not just argued, by the
+containment guard being a structural no-op at every tier (same as
+round 9), confirmed by the default-path A/B below.
+
+**Verification, "prove genuinely, don't assume" as always**:
+
+1. Identity + LLF-inversion tests extended to all 10 new types (types 8,
+   9, 10, 11, 19, 20, 22, 23, 25, 26) — confirms `forwardDCT2D`/
+   `inverseDCT2D` and the LLF-inversion relationship hold at every new
+   `dctSelectHeight`x`dctSelectWidth` grid, from 4x1 (32x8) up to 32x16
+   (256x128) — 20 new tests, all pass.
+2. A `jxl.encdebug`-driven hunt confirmed every one of the 12 rectangular
+   types (not assumed from a first sweep) genuinely gets chosen as a
+   real-assembled winner somewhere across real content configs — a
+   comprehensive existence check, not just "compiles without crashing."
+   One type (DCT 32x8) was initially absent from a broad sweep using
+   flat/uniform stripe content; tracing why revealed the same "flat
+   content has no AC-overhead savings to exploit" mechanism round 8
+   documented for a perfectly-flat 256x256 image — DC representation
+   cost is always native-8x8-granularity regardless of AC transform
+   choice, so content with zero AC energy anywhere has no incentive to
+   merge at any size. Switching to a smooth gradient (real AC content,
+   not flat) found DCT 32x8 winning immediately (a 128x128 vertical
+   gradient at distance=16).
+3. A cross-tier correctness test (that same 128x128/distance=16 config,
+   which has DCT 32x8 coexisting with DCT 16x16 in the chosen layout) —
+   this catches a class of bug a single-tier test structurally cannot:
+   the 32-tier's rectangular pre-pass incorrectly assuming the 16-tier
+   hasn't already committed something in its way. Uses the same
+   decode-vs-original relative-bound check round 9 introduced (not just
+   decode-vs-djxl), since the flip-semantics gap that check closes
+   applies to every new "tall" (`flip=true`) type here too, not only DCT
+   8x16.
+4. A "genuinely wins" test at the opposite end of the size range from
+   round 9's own: DCT 256x128 (a 256x256 single-group vertical gradient
+   at distance=32, `maxTransformSize: 256`) — confirms the fan-out isn't
+   just non-crashing at the largest sizes but a real winner there too.
+5. A gap in the above, caught by advisor review rather than self-check:
+   every test above that used a gradient used a *vertical* one, so every
+   "genuinely wins" winner across this round (32x8, 256x128) was a
+   `flip=true` ("tall") type. `flip=false` ("wide") types — 8x32, 16x32,
+   32x64, 64x128, 128x256, five of this round's ten new types — were
+   only exercised by the identity/LLF tests, which never touch
+   `_scanChannelValues`/`_rdoqBlockChannel` at all, leaving `flip=false`
+   proven at exactly one size overall (8x16, from round 9). Closed with
+   a horizontal-gradient mirror of the 256x128 test, swept until DCT
+   128x256 (the largest `flip=false` type) was the outright winner:
+   `flip=false` is now proven correct at both size extremes (8x16 and
+   128x256), with the code being manifestly size-independent
+   (`acData[oy * n + ox]`-style indexing, no per-size branching) closing
+   the sizes in between by the same generic-code argument round 9 itself
+   relied on for the square cascade.
+
+**One real finding from this verification, documented rather than
+"fixed"**: the cross-tier config (item 3 above) has
+`enableRectangularTransforms: true` producing a slightly *larger* file
+(956B) than square-only (901B) at that exact point. This is not a
+regression — it's the exact consequence round 9's own doc comment on
+`VardctL0Config.enableRectangularTransforms` already predicted: once the
+rectangular pre-pass runs ahead of *every* square level (not just the
+16x16 one, now that this round wired it into every `_cascadeSizes`
+tier), "square-only" is even less likely to coincidentally be reproduced
+as a byproduct of the rectangular-enabled run's candidate list. The
+guarantee remains exactly what it always was — never worse than plain
+8x8/bootstrap — and that guarantee holds here too (both 956B and 901B
+comfortably beat the all-8x8 bootstrap). The permanent test for this
+config asserts round-trip correctness and the decode-vs-original bound,
+deliberately *not* a "beats square-only" assertion, so this expected
+behavior doesn't get miscategorized as a bug by a future test failure.
+
+**Default-path regression check**: the same `git stash` A/B methodology
+every prior round used — 3 trials, the same real manga page,
+`enableRectangularTransforms` at its default (`false`) before vs. after
+this round's changes — found byte-identical output (510690B) and
+comparable timing, confirming `_activeTransformTypes` growing from 8 to
+18 entries (each new entry's context/quant-weight table construction is
+a one-time, per-encode-call cost, same as every prior round's finding)
+doesn't regress the untouched default path.
+
+**Shipped**: all 12 of Tranche B's rectangular types exist, are correct,
+and are covered by tests, including both flip polarities at both size
+extremes. `VardctL0Config.enableRectangularTransforms`
+stays off by default — no real-manga check has been run for the full
+set yet, matching round 9's own reasoning for not evaluating the
+default prematurely. This completes Tranche B (12 of 27 types now
+implemented, 18 total counting Tranche A). Tranche C (9 bespoke
+single-footprint types — Hornuss, DCT2x2, DCT4x4, DCT4x8/8x4, AFV0-3)
+remains fully unscoped and is qualitatively different work: no shared
+machinery to lean on, each needs a from-scratch forward-transform
+derivation mirroring the decoder's bespoke inverse code, closer to a
+handful of small research tasks than the mechanical generalization
+Tranches A and B turned out to be.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

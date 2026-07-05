@@ -122,12 +122,11 @@ quality lives.
     this gap, and `enableVariableTransforms` now defaults to **on**.
   Full 27-transform-type support (this encoder only added 8x8/16x16 as of
   round 6; rounds 7/8 completed Tranche A — all square DCT sizes, 8x8
-  through 256x256, 6 of 27 types; round 9 below started Tranche B with
-  the first rectangular pair, DCT 16x8/8x16, 8 of 27 types; 19 remain
-  across Tranches B/C) and a real rate-distortion search over transform
-  size itself (rounds 6-9 choose between fixed candidates per region, not
-  a search) remain open — see round 9's write-up for the phased plan
-  covering the rest.
+  through 256x256, 6 of 27 types; rounds 9/10 below completed Tranche B —
+  all 12 rectangular types, 18 of 27 total; 9 remain, all in Tranche C)
+  and a real rate-distortion search over transform size itself (rounds
+  6-10 choose between fixed candidates per region, not a search) remain
+  open — see round 10's write-up for the phased plan covering the rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -527,6 +526,56 @@ output for where the gap actually is.
   remaining four "2:1 pair" levels (32x16/16x32, 64x32/32x64,
   128x64/64x128, 256x128/128x256) and the one "4:1 line" case (32x8/8x32
   — merges four 8x8 blocks in a line, the only 4:1 case in the format).
+
+- ✅ **Round 10 / Tranche B completed: the remaining 10 rectangular
+  types.** The fan-out round 9 scoped for later — mechanical, since
+  `tryMergeLevel` already generalizes over any `(strideY, strideX)`.
+  Added all 10 remaining types (32x8/8x32, the format's only "4:1 line"
+  case; 32x16/16x32, 64x32/32x64, 128x64/64x128, 256x128/128x256, four
+  "2:1 pairs" one at each cascade tier). The bootstrap-tier pre-pass now
+  tries 8x16, 16x8, 8x32, 32x8 in that order before the square 16x16
+  decision (safe regardless of order — the containment guard already
+  handles their non-nesting geometry); each `_cascadeSizes` tier's own
+  "2:1 pair" (`_cascadeRectPairs`, new — a lookup table pairing each
+  square tier with its wide/tall rectangular siblings) is tried
+  immediately before that tier's square merge, gated by both
+  `enableRectangularTransforms` and the tier itself being within
+  `maxTransformSize`. Verified with the same "prove genuinely, don't
+  assume" discipline: identity + LLF-inversion tests extended to all 10
+  new types (confirmed correct at every new `dctSelectHeight`x
+  `dctSelectWidth` grid, from 4x1 up to 32x16); a `jxl.encdebug`-driven
+  hunt confirmed every one of the 12 rectangular types (not just the ones
+  that happened to appear in a first sweep) gets chosen as a genuine
+  winner somewhere across real content configs — including DCT 32x8, the
+  one type a first broad sweep missed because *perfectly flat* content
+  has zero AC-domain benefit to merging regardless of transform size
+  (matching round 8's "flat content has no AC-overhead savings" finding);
+  a cross-tier correctness test (a config with DCT 32x8 and DCT 16x16
+  coexisting) catching the class of bug a single-tier test can't
+  (tier-interaction desync); and a "genuinely wins" test at the opposite
+  end of the size range from round 9's own (DCT 256x128, the largest
+  pair). A gap caught by advisor review, not self-check: every gradient
+  test above was vertical, so every winner proven was `flip=true`
+  ("tall") — `flip=false` ("wide") types were left proven at only one
+  size (8x16, round 9). Closed with a horizontal-gradient mirror of the
+  256x128 test, finding DCT 128x256 (the largest `flip=false` type) as
+  an outright winner — `flip=false` now proven at both size extremes,
+  with the code's manifest size-independence covering the sizes between.
+  **One real finding, documented rather than "fixed"**: the
+  cross-tier config found (128x128 canvas, distance=16) has
+  `enableRectangularTransforms: true` producing a slightly *larger* file
+  than square-only at that specific point — expected per round 9's own
+  documented caveat (the guarantee is "vs. plain 8x8," not "vs.
+  square-only," once the rectangular pre-pass runs ahead of *every*
+  square level, not just the 16x16 one) and not something worth
+  "fixing." Full suite green (342 tests, up from 319). Default-path A/B
+  (git stash, same real manga page) confirmed byte-identical output,
+  comparable timing — `_activeTransformTypes` growing from 8 to 18
+  entries doesn't regress the untouched default path, same finding round
+  8/9 already established for smaller growth. `enableRectangularTransforms`
+  stays off by default (no real-manga check run for the full set yet).
+  This completes Tranche B (12 of 27 types now implemented, 9 to go —
+  all in Tranche C). See doc/spec_notes.md for the full write-up.
 
 ---
 

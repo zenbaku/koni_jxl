@@ -974,6 +974,324 @@ void main() {
     }
   });
 
+  test(
+      'the rest of Tranche B (32x8/8x32 through 256x128/128x256) places, '
+      'entropy-codes, and round-trips correctly across tiers', () {
+    // Correctness coverage for the remaining 10 rectangular types (the
+    // "4:1 line" case 32x8/8x32, and the "2:1 pair" at each of the four
+    // higher cascade tiers) - mechanically fanned out from 16x8/8x16's
+    // proven tryMergeLevel architecture, per ROADMAP.md/spec_notes.md:
+    // this only needs to prove each size places and round-trips
+    // correctly, not that it helps (existence is a completeness goal,
+    // independent of manga ROI). A single config exercising two
+    // different tiers at once (16x16 alongside 32x8) catches a class of
+    // bug a single-tier test can't: cross-tier interaction, e.g. the
+    // 32-tier's rectangular pre-pass incorrectly assuming the 16-tier
+    // hasn't already committed something in its way.
+    //
+    // Config found empirically (jxl.encdebug tallies), not guessed: a
+    // 128x128 vertical gradient at distance=16 was swept until the
+    // *chosen* candidate contained DCT 32x8 (the 4:1 line case) sharing
+    // the layout with DCT 16x16 blocks.
+    const size = 128;
+    final pixels = Uint8List(size * size * 3);
+    var i = 0;
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        final v = (y * 255 / size).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(16.0);
+    final withRect = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableRectangularTransforms: true));
+    final squareOnly = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableRectangularTransforms: false));
+
+    // NOT a "genuinely wins vs. square-only" assertion here (unlike the
+    // mixed-shape test above): with the rectangular pre-pass now running
+    // before every square level, not just the 16x16 one, "square-only"
+    // is no longer guaranteed to be beaten -- see VardctL0Config.
+    // enableRectangularTransforms's doc comment on why the guarantee is
+    // "vs. plain 8x8/bootstrap," not "vs. square-only." This config
+    // happens to still round-trip correctly either way; the point of
+    // this test is placement/entropy-coding correctness across tiers,
+    // not a compression win.
+    double decodeVsOriginal(Uint8List encoded) {
+      final decoded = JxlDecoder.decode(encoded).toRgba8();
+      var sumSq = 0.0;
+      var n = 0;
+      for (var p = 0; p < size * size; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      return math.sqrt(sumSq / n);
+    }
+
+    final rectRmse = decodeVsOriginal(withRect);
+    final squareRmse = decodeVsOriginal(squareOnly);
+    expect(rectRmse, lessThan(squareRmse * 2 + 1),
+        reason: 'rectangular RMSE-vs-original ($rectRmse) should be in the '
+            'same ballpark as square-only ($squareRmse), not blown up by a '
+            'coefficient-scan/flip error at any of the new sizes');
+
+    final image = JxlDecoder.decode(withRect);
+    expect(image.width, size);
+    expect(image.height, size);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_rectfanout');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(withRect);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, size);
+      expect(ref.height, size);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < size * size; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
+  test(
+      'DCT 256x128/128x256 (the largest rectangular pair) genuinely wins '
+      'and round-trips correctly', () {
+    // Mirrors the 16x8/8x16 "genuinely wins" test at the opposite end of
+    // Tranche B's size range -- proves the fan-out to the largest pair
+    // isn't just non-crashing but a real, real-assembled winner too, not
+    // just tried-and-discarded. Config found empirically: a 256x256
+    // single-group vertical gradient at distance=32 with maxTransformSize
+    // 256, swept until the chosen candidate was DCT 256x128 outright.
+    const size = 256;
+    final pixels = Uint8List(size * size * 3);
+    var i = 0;
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        final v = (y * 255 / size).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(32.0);
+    final withRect = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            maxTransformSize: 256,
+            enableRectangularTransforms: true));
+    final squareOnly = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            maxTransformSize: 256,
+            enableRectangularTransforms: false));
+    expect(withRect.length, lessThan(squareOnly.length),
+        reason: 'DCT 256x128 (${withRect.length}B) should beat square-only '
+            '(${squareOnly.length}B) at this config');
+
+    double decodeVsOriginal(Uint8List encoded) {
+      final decoded = JxlDecoder.decode(encoded).toRgba8();
+      var sumSq = 0.0;
+      var n = 0;
+      for (var p = 0; p < size * size; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      return math.sqrt(sumSq / n);
+    }
+
+    final rectRmse = decodeVsOriginal(withRect);
+    final squareRmse = decodeVsOriginal(squareOnly);
+    expect(rectRmse, lessThan(squareRmse * 2 + 1),
+        reason: 'rectangular RMSE-vs-original ($rectRmse) should be in the '
+            'same ballpark as square-only ($squareRmse)');
+
+    final image = JxlDecoder.decode(withRect);
+    expect(image.width, size);
+    expect(image.height, size);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_rect256128');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(withRect);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, size);
+      expect(ref.height, size);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < size * size; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
+  test(
+      'DCT 128x256 (the largest flip=false rectangular type) genuinely '
+      'wins and round-trips correctly', () {
+    // Mirrors the 256x128 test above with the orientation flipped: every
+    // other "genuinely wins" test in this tranche (16x8, the cross-tier
+    // 32x8 test, 256x128) happens to land on a *tall* (flip=true) winner,
+    // since they all use vertical gradients. flip=false is only proven
+    // once, at the smallest size (8x16, from the first-slice test) --
+    // _scanChannelValues/_rdoqBlockChannel's flip=false branch is
+    // exercised at every size in between only by the identity/LLF tests
+    // in vardct_forward_test.dart, which never touch that scan path at
+    // all. A horizontal gradient here favors wide (flip=false) blocks,
+    // proving DCT 128x256 specifically -- the largest flip=false type --
+    // closing that gap at the opposite size extreme from 8x16. Config
+    // found empirically: a 256x256 single-group horizontal gradient at
+    // distance=32 with maxTransformSize 256, swept until the chosen
+    // candidate was DCT 128x256 outright.
+    const size = 256;
+    final pixels = Uint8List(size * size * 3);
+    var i = 0;
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        final v = (x * 255 / size).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(32.0);
+    final withRect = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            maxTransformSize: 256,
+            enableRectangularTransforms: true));
+    final squareOnly = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            maxTransformSize: 256,
+            enableRectangularTransforms: false));
+    expect(withRect.length, lessThan(squareOnly.length),
+        reason: 'DCT 128x256 (${withRect.length}B) should beat square-only '
+            '(${squareOnly.length}B) at this config');
+
+    double decodeVsOriginal(Uint8List encoded) {
+      final decoded = JxlDecoder.decode(encoded).toRgba8();
+      var sumSq = 0.0;
+      var n = 0;
+      for (var p = 0; p < size * size; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      return math.sqrt(sumSq / n);
+    }
+
+    final rectRmse = decodeVsOriginal(withRect);
+    final squareRmse = decodeVsOriginal(squareOnly);
+    expect(rectRmse, lessThan(squareRmse * 2 + 1),
+        reason: 'rectangular RMSE-vs-original ($rectRmse) should be in the '
+            'same ballpark as square-only ($squareRmse), not blown up by a '
+            'flip=false coefficient-scan error');
+
+    final image = JxlDecoder.decode(withRect);
+    expect(image.width, size);
+    expect(image.height, size);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_rect128256');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(withRect);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, size);
+      expect(ref.height, size);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < size * size; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
   test('finer quantization improves RMSE', () {
     if (!_haveDjxl) return;
     final pixels = _synthetic(64, 64, 9);
