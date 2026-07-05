@@ -64,19 +64,23 @@ playback, background-isolate encode), use
 - Real HF coefficient context model, adaptive per-block quantization,
   per-region chroma-from-luma, a learned DC context tree, gradient/
   weighted-predictor DC prediction, a per-AC-coefficient rate-distortion
-  search (RDOQ, on by default), multi-group and multi-LF-group support
-- Gaborish/EPF filters and adaptive 8x8/16x16 transform size are
-  implemented but **off by default** — both help photographic content
-  but measurably hurt manga's screentone/line-art content (see
+  search (RDOQ, on by default), adaptive 8x8/16x16 transform-size
+  selection (on by default), multi-group and multi-LF-group support
+- Gaborish/EPF filters and an additional 32x32 transform size are
+  implemented but **off by default** — filters measurably help
+  photographic content but hurt manga's screentone/line-art content;
+  32x32 helps synthetic/corpus content with large flat regions but was
+  found, against real manga chapter pages, to win only -0.0% to -0.6%
+  there for a ~40% encode-time cost (see
   [doc/spec_notes.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/spec_notes.md)
-  in the repository)
+  in the repository for both sets of numbers)
 - Correctness is djxl-verified; **compression efficiency is a work in
   progress, with real wins already banked** — on manga-typical
   screentone content at low-to-mid `distance` (0.5-2.0), files are
   already *smaller* than `cjxl -e1` (0.81-0.94x, measured); on smooth
   photographic content the gap is larger (1.5x+), mostly structural
-  (only 2 of 27 transform types implemented, no transform-type RD search
-  yet). See
+  (only 3 of 27 transform types implemented — 8x8, 16x16, 32x32 opt-in —
+  no transform-type RD search yet). See
   [doc/BENCHMARKS.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/BENCHMARKS.md)
   in the repository for the full, reproducible comparison
 

@@ -132,24 +132,30 @@ content). 8/16-bit gray/RGB with optional alpha.
 **Lossy** (`encodeLossy`, RGB 8-bit, any width/height): real HF
 coefficient context model, adaptive per-block quantization, per-region
 chroma-from-luma, a learned DC context tree, gradient/weighted-predictor
-DC prediction, a per-AC-coefficient rate-distortion search (RDOQ,
-on by default), and multi-group/multi-LF-group support for arbitrarily
-large images. Gaborish/EPF filters and adaptive 8x8/16x16 transform size
-are available but off by default — both measurably help smooth
-photographic content but hurt manga's screentone/line-art content, so
-they're opt-in (see `doc/spec_notes.md` for the numbers). Correctness is
-solid (djxl-verified against the shared corpus and hand-written test
-patterns); **compression efficiency is a work in progress, with real
-wins already banked**: on manga-typical screentone content at low-to-mid
-`distance` (0.5–2.0), files are already *smaller* than `cjxl -e1`
-(0.81-0.94x, measured — the gap flips past `distance` 2.0, where the
-RDOQ heuristics weren't tuned); on smooth/photographic content the gap
-is larger (1.5x+ vs. `cjxl -e1` at `distance=1.0`). See
-[doc/BENCHMARKS.md](doc/BENCHMARKS.md) for the full table, including
-`cjxl -e7`'s real RD search (0.37-0.54x on manga content — the headroom
-tracked below). The remaining gap is mostly structural — only 2 of the
-format's 27 transform types are implemented, and there's no RD search
-over transform-type choice yet — tracked in ROADMAP.md.
+DC prediction, a per-AC-coefficient rate-distortion search (RDOQ, on by
+default), adaptive 8x8/16x16 transform-size selection (on by default — a
+bootstrap-frozen bit-rate estimate with a real-assembly safety net, so it
+can never produce a larger file than leaving it off), and multi-group/
+multi-LF-group support for arbitrarily large images. Gaborish/EPF filters
+and an additional 32x32 transform size are implemented but **off by
+default** — 32x32 measurably helps synthetic/corpus content with large
+flat regions but was found, when tested against real `manga_samples/`
+chapter pages, to win only -0.0% to -0.6% there for a ~40% encode-time
+cost (see `doc/spec_notes.md` for the numbers and the reasoning); filters
+similarly help smooth photographic content but hurt manga's screentone/
+line-art content. Correctness is solid (djxl-verified against the shared
+corpus and hand-written test patterns); **compression efficiency is a
+work in progress, with real wins already banked**: on manga-typical
+screentone content at low-to-mid `distance` (0.5–2.0), files are already
+*smaller* than `cjxl -e1` (0.81-0.94x, measured — the gap flips past
+`distance` 2.0, where the RDOQ heuristics weren't tuned); on smooth/
+photographic content the gap is larger (1.5x+ vs. `cjxl -e1` at
+`distance=1.0`). See [doc/BENCHMARKS.md](doc/BENCHMARKS.md) for the full
+table, including `cjxl -e7`'s real RD search (the headroom tracked
+below). The remaining gap is mostly structural — only 3 of the format's
+27 transform types are implemented (8x8, 16x16, 32x32 opt-in), and
+there's no RD search over transform-type choice yet — tracked in
+ROADMAP.md.
 
 Flutter: `encodeJxlFromRgba` / `encodeJxlFromUiImage` (lossless) and
 `encodeJxlLossyFromRgba` / `encodeJxlLossyFromUiImage` (lossy, alpha

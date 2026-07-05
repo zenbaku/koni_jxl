@@ -108,10 +108,11 @@ quality lives.
     later session replaced the proxy with a real bootstrap-based
     estimate plus a whole-image real-assembly safety net, closing exactly
     this gap, and `enableVariableTransforms` now defaults to **on**.
-  Full 27-transform-type support (this encoder only added 8x8/16x16) and
-  a real rate-distortion search over transform size itself (round 6
-  chooses between two fixed candidates per region, not a search) remain
-  open if a non-manga use case ever needs them.
+  Full 27-transform-type support (this encoder only added 8x8/16x16 as of
+  round 6; DCT 32x32 added in round 7 below, 24 types remain) and a real
+  rate-distortion search over transform size itself (round 6/7 choose
+  between fixed candidates per region, not a search) remain open — see
+  round 7's write-up for the phased plan covering the rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -323,6 +324,68 @@ output for where the gap actually is.
   gate), each with >=15% margin over the value measured with this
   encoder's actual shipped defaults (RDOQ + variable transforms on):
   0.5→0.6, 1.0→1.0, 2.0→1.0, 4.0→1.0, 8.0→1.6.
+- ✅ **Compression efficiency, round 7 / full 27-transform-type support,
+  Tranche A: DCT 32x32 shipped, off by default.** The start of "full
+  27-transform-type support" (this section's long-standing open item),
+  scoped via `EnterPlanMode` given the size: 18 of the 27 types share
+  `TransformMethod.dct` (any size, decoder's `forwardDCT2D`/`inverseDCT2D`
+  already fully generic) vs. 9 bespoke single-footprint types with no
+  generic form at all vs. 6 "wide" rectangular types needing new
+  flip/orientation handling the encoder doesn't have yet — three tranches
+  (A: more square DCT sizes; B: rectangular pairs; C: bespoke types), only
+  Tranche A's first size scoped for implementation now.
+  Generalized the encoder's hardcoded-to-2 `rawWeight8`/`rawWeight16`
+  dispatch to N-way by adding a `rawWeight` field to the already
+  per-type-keyed `_TransformCtx` (byte-identical output verified before/
+  after); generalized the 16x16-only hand-unrolled 2x2 DC/LLF-inversion
+  formula to the real `inverseDCT2D`-based generic form (verified against
+  the decoder's `_finalizeLLF` construction directly in
+  `vardct_forward_test.dart` at 32x32's non-trivial 4x4 grid — a ~2-byte
+  drift on existing 16x16 output from the different float-rounding path,
+  fine since lossy correctness is RMSE-gated, not bit-exact); added a
+  second, structurally identical bootstrap-frozen merge pass in
+  `_decideTransformLayout` (16x16/8x8-mix → 32x32 per 32x32-pixel region).
+  **Caught a real safety-net gap before shipping**: the new level's own
+  per-region estimate picked a real, if modest, size *regression* vs. the
+  level-1-only decision on some content (still smaller than plain 8x8, so
+  the existing two-candidate safety net didn't catch it) — the same
+  "estimates can't resolve near-ties, verify by real assembly" lesson
+  RDOQ and round 6 both already learned, recurring one level deeper.
+  Fixed by extending `_decideTransformLayout`'s return to a third,
+  optional candidate and having `encodeLossyVardctL0` assemble a real
+  body for level-1-only *and* level-1-plus-32x32, keeping whichever is
+  genuinely smaller — `VardctL0Config.enableTransform32`'s own safety net,
+  independent of `enableVariableTransforms`'s.
+  **Calibration and synthetic/corpus benchmarking initially looked like a
+  clear win** (`tool/calibrate_transform32_lambda.dart`,
+  `_kTransformRdLambda32 = 3000.0`, real wins up to -9.8% on synthetic
+  patterns, -1.6% to -9.7% on the corpus' `color_cover`, and -7.6% to
+  -16.7% on `gray_screentone` at distance 0.5-4.0), enough to briefly ship
+  it on by default. **That default was reverted after testing real
+  `manga_samples/` chapter pages** (gitignored, copyrighted — a B&W
+  screentone-heavy title and a flat-color "digital colored comics" title,
+  6 pages total): the actual win there is -0.0% to -0.6%, an order of
+  magnitude below every synthetic/corpus figure, for the same ~40%
+  encode-time cost measured everywhere (a third `_finishEncode`
+  real-assembly pass — unavoidable once 32x32 fires at all, which it does
+  even on real pages, just barely). RMSE stayed flat; this is a value
+  judgment, not a bug: `gray_screentone`'s flat-region density (a
+  synthetic proxy with panels/speech-bubbles/a solid black polygon) turns
+  out to overstate what real manga pages actually contain. Same
+  "synthetic validation didn't survive contact with real content" pattern
+  already hit for L3's variable-transforms, RDOQ's lambda scaling, and
+  hfMult's banding blind spot. `VardctL0Config.enableTransform32` defaults
+  to **false**; the feature remains correct, never-worse, and available as
+  an opt-in for content that genuinely has large flat regions. See
+  doc/spec_notes.md for the full write-up (both the synthetic numbers and
+  the real-manga finding that reverted the default) and doc/BENCHMARKS.md
+  for the updated numbers. 64x64/128x128/256x256 should be small
+  follow-ups now that the plumbing is generic (one more size in the map +
+  one more quadtree merge level + recalibrate each) — but any future size
+  needs the SAME real-content validation step before defaulting on, not
+  just synthetic/corpus calibration; Tranches B (rectangular, needs
+  flip/orientation handling) and C (bespoke single-footprint types, no
+  generic form) remain fully unscoped.
 
 ---
 

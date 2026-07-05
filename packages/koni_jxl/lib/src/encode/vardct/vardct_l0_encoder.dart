@@ -42,6 +42,8 @@ class VardctL0Config {
     this.enableFilters = false,
     this.enableVariableTransforms = true,
     this.transformRdLambdaOverride,
+    this.enableTransform32 = false,
+    this.transform32RdLambdaOverride,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
     this.enableRdoq = true,
@@ -124,6 +126,53 @@ class VardctL0Config {
   /// Null (the default) uses the shipped, calibrated constant.
   final double? transformRdLambdaOverride;
 
+  /// Whether to add a second, structurally identical merge level on top of
+  /// [enableVariableTransforms]'s 8x8-vs-16x16 decision: for every
+  /// 2x2-aligned 32x32-pixel region (four already-decided 16x16-or-8x8
+  /// candidates), compare their real summed `distortion + lambda * rate`
+  /// cost against a candidate 32x32 block's, using the same frozen
+  /// bootstrap code-length table `_decideTransformLayout` already builds.
+  /// Defaults to **off**. A multi-distance calibration
+  /// (`tool/calibrate_transform32_lambda.dart`) at the shipped
+  /// `_kTransformRdLambda32` looked like a clear win on synthetic patterns
+  /// (up to -9.8%) and the corpus' `gray_screentone`/`color_cover` goldens
+  /// (-1.6% to -16.7% at distance 0.5-4.0) — enough to briefly ship this
+  /// on by default. **That default was reverted after testing real
+  /// `manga_samples/` chapter pages** (both a B&W screentone-heavy title
+  /// and a flat-color "digital colored comics" title): the actual win
+  /// there is -0.0% to -0.6%, a full order of magnitude below every
+  /// synthetic/corpus figure above, for the *same* ~40% encode-time cost
+  /// measured everywhere else (a third real-assembly pass is unavoidable
+  /// once 32x32 fires at all — the level2-skip optimization below doesn't
+  /// help once it fires even a little, which it does on real pages). RMSE
+  /// stayed flat and no correctness issue appeared — this is a value
+  /// judgment, not a bug: `gray_screentone`'s flat panel/speech-bubble/
+  /// solid-black-polygon regions are a more exaggerated proxy for "flat
+  /// area density" than real pages actually have. This is the same
+  /// "synthetic validation didn't survive contact with real content"
+  /// pattern already hit for L3's variable-transforms, RDOQ's lambda
+  /// scaling, and hfMult's banding blind spot — see doc/spec_notes.md for
+  /// the full real-manga numbers. The feature is correct and never-worse
+  /// (real-assembly-verified either way), so it's left available as an
+  /// opt-in for content that genuinely has large flat regions — just not
+  /// a default win for this project's manga use case. Has no effect
+  /// unless [enableVariableTransforms] is also true (32x32 is only ever
+  /// considered as a merge of already-decided smaller candidates, never
+  /// placed directly). Needs its **own** real-assembly comparison against
+  /// the level-1 (8x8/16x16) layout, not just against plain 8x8 — see
+  /// `_decideTransformLayout`'s doc comment for why the two-candidate
+  /// safety net `enableVariableTransforms` alone uses isn't sufficient
+  /// once a second merge level exists; with that three-way comparison in
+  /// place, enabling this can still never produce a larger file than
+  /// leaving it off.
+  final bool enableTransform32;
+
+  /// Overrides the rate/distortion trade-off constant `_kTransformRdLambda32`
+  /// used by [enableTransform32] (a runtime knob rather than a recompile,
+  /// purely so a calibration tool can sweep it in one process). Null (the
+  /// default) uses the shipped, calibrated constant.
+  final double? transform32RdLambdaOverride;
+
   /// Whether to replace the default 3-bucket adaptive-quantization
   /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
   /// with a real per-block rate-distortion search over the same
@@ -198,6 +247,23 @@ const _channelOrder = [1, 0, 2];
 
 final _tt8 = TransformType.byType(0); // DCT 8x8: orderID 0, parameterIndex 0
 final _tt16 = TransformType.byType(4); // DCT 16x16: orderID 2, parameterIndex 4
+final _tt32 = TransformType.byType(5); // DCT 32x32: orderID 3, parameterIndex 5
+
+/// Transform types this encoder can currently emit, largest reused
+/// mechanically wherever code is already N-way (context/rawWeight lookup,
+/// quant-weight/order tables); genuinely new work (layout-decision merge
+/// levels, flip/orientation handling) is called out separately in
+/// ROADMAP.md as each size/tranche lands.
+final _activeTransformTypes = [_tt8, _tt16, _tt32];
+
+/// Scratch-buffer side length shared by every transform-pipeline call
+/// (`computeCoeffBuf`, `_decideTransformLayout`, `_chooseHfMultRd`,
+/// `_chooseAcRdoq`) — sized to the largest [_activeTransformTypes] member's
+/// `pixelHeight`/`pixelWidth`. `forwardDCT2D`/`inverseDCT2D` only ever touch
+/// the `[0, height) x [0, width)` sub-region a call passes explicitly, so
+/// one shared, reused, max-sized pair works for every smaller size too —
+/// bump this when a larger type is added, no other change needed here.
+const _maxTransformPixelSize = 32;
 
 /// LF groups are 256x256 blocks (2048x2048 pixels) — `frame.dart`'s
 /// `header.lfGroupDim` (`groupDim << 3`, `groupDim` hardcoded to 256 for
@@ -276,15 +342,20 @@ Uint8List encodeLossyVardctL0(
             ...defaultDctParams[tt.parameterIndex].dctParam![c].skip(1),
           ],
       ];
-  final customDctParams8 = customParams(_tt8);
-  final customDctParams16 = customParams(_tt16);
-  final rawWeight8 = [
-    for (var c = 0; c < 3; c++) getDCTQuantWeights(8, 8, customDctParams8[c]),
-  ];
-  final rawWeight16 = [
-    for (var c = 0; c < 3; c++)
-      getDCTQuantWeights(16, 16, customDctParams16[c]),
-  ];
+  // Keyed by tt.type, not parameterIndex: distinct transform types can
+  // share a parameterIndex (e.g. DCT8x16/16x8), but each still needs its
+  // own weight matrix at its own pixelHeight/pixelWidth.
+  final customParamsByType = {
+    for (final tt in _activeTransformTypes) tt.type: customParams(tt),
+  };
+  final rawWeightByType = {
+    for (final tt in _activeTransformTypes)
+      tt.type: [
+        for (var c = 0; c < 3; c++)
+          getDCTQuantWeights(
+              tt.pixelHeight, tt.pixelWidth, customParamsByType[tt.type]![c]),
+      ],
+  };
   final globalScaleF = 65536.0 / config.globalScale;
   final scaleFactor = [
     globalScaleF * math.pow(0.8, config.xqmScale - 2.0),
@@ -302,16 +373,25 @@ Uint8List encodeLossyVardctL0(
   // per-64x64-region fit layered on top for true AC coefficients (see
   // _ChromaFromLumaFit's doc comment for why DC can't use the per-region
   // value) — replacing the format's neutral defaults (kX = 0, kB = 1.0).
-  final scratch8a = List.generate(8, (_) => Float32List(8));
-  final scratch8b = List.generate(8, (_) => Float32List(8));
-  final scratch16a = List.generate(16, (_) => Float32List(16));
-  final scratch16b = List.generate(16, (_) => Float32List(16));
-  final cfl = _chromaFromLumaFit(planes, bh, bw, scratch8a, scratch8b);
+  // Always native 8x8-granularity regardless of which HF transform types
+  // are active, so this scratch pair is dedicated and unrelated to
+  // _maxTransformPixelSize below.
+  final cflScratchA = List.generate(8, (_) => Float32List(8));
+  final cflScratchB = List.generate(8, (_) => Float32List(8));
+  final cfl = _chromaFromLumaFit(planes, bh, bw, cflScratchA, cflScratchB);
+  // Shared scratch for the transform pipeline proper (computeCoeffBuf,
+  // _decideTransformLayout, _chooseHfMultRd, _chooseAcRdoq): one reused,
+  // max-sized pair covers every active transform type (see
+  // _maxTransformPixelSize's doc comment).
+  final scratchA = List.generate(
+      _maxTransformPixelSize, (_) => Float32List(_maxTransformPixelSize));
+  final scratchB = List.generate(
+      _maxTransformPixelSize, (_) => Float32List(_maxTransformPixelSize));
   // Reference AC step at the first (lowest-frequency, most perceptually
   // important) Y position: the scale against which "how smooth is this
   // block" is judged, so heuristics adapt with `distance` instead of using
   // an absolute threshold tuned for one quantization strength.
-  final refStep = scaleFactor[1] / rawWeight8[1][0][1];
+  final refStep = scaleFactor[1] / rawWeightByType[_tt8.type]![1][0][1];
 
   // 4.5. Context/grouping setup: hoisted ahead of layout/quantization since
   // it only depends on image size, not on which transform types end up
@@ -320,7 +400,8 @@ Uint8List encodeLossyVardctL0(
   // RD-hfMult search in step 5.5).
   final hfctx = HfBlockContext.defaults();
   final ctxByType = {
-    for (final tt in [_tt8, _tt16]) tt.type: _TransformCtx(tt, hfctx),
+    for (final tt in _activeTransformTypes)
+      tt.type: _TransformCtx(tt, hfctx, rawWeightByType[tt.type]!),
   };
   // ceilDiv(trueSize, 256) == ceilDiv(paddedSize, 256) always (padding adds
   // at most 7 pixels, far short of a 256 boundary, and true/padded sizes
@@ -337,8 +418,8 @@ Uint8List encodeLossyVardctL0(
   final usesCustomWeights = config.acScale != 1.0;
   final customParamsByIndex = usesCustomWeights
       ? {
-          _tt8.parameterIndex: customDctParams8,
-          _tt16.parameterIndex: customDctParams16
+          for (final tt in _activeTransformTypes)
+            tt.parameterIndex: customParamsByType[tt.type]!,
         }
       : null;
 
@@ -351,103 +432,101 @@ Uint8List encodeLossyVardctL0(
   // 8x8-block granularity regardless of the HF transform covering it (see
   // _PlacedBlock's doc comment on the LLF relationship for 16x16).
   if (config.enableVariableTransforms) {
-    // _decideTransformLayout returns *two* fully independent candidates
-    // (its doc comment explains why) — assemble a real body for each and
-    // keep whichever is genuinely smaller, so this feature can never
-    // regress vs `enableVariableTransforms: false` alone, matching the
-    // real-assembly safety net this file's other RD features already use.
+    // _decideTransformLayout returns two or three fully independent
+    // candidates (its doc comment explains why) — assemble a real body for
+    // each and keep whichever is genuinely smaller, so this feature (and
+    // enableTransform32 layered on top of it) can never regress vs
+    // `enableVariableTransforms: false` alone, matching the real-assembly
+    // safety net this file's other RD features already use.
     final dcIntBootstrap = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
-    final (bootstrapBlocks, mixedBlocks, dcIntFinal) = _decideTransformLayout(
+    final (
+      bootstrapBlocks,
+      level1Blocks,
+      level1DcInt,
+      level2Blocks,
+      level2DcInt
+    ) = _decideTransformLayout(
         planes,
         cfl,
         refStep,
         sd,
-        rawWeight8,
-        rawWeight16,
         scaleFactor,
         dcIntBootstrap,
         bh,
         bw,
-        scratch8a,
-        scratch8b,
-        scratch16a,
-        scratch16b,
+        scratchA,
+        scratchB,
         hfctx,
         ctxByType,
         groupsX,
         groupsY,
-        config.transformRdLambdaOverride);
-    final bodyOff = _finishEncode(
-        bootstrapBlocks,
-        dcIntBootstrap,
-        bh,
-        bw,
-        groupsX,
-        groupsY,
-        numGroups,
-        hfctx,
-        ctxByType,
-        planes,
-        cfl,
-        refStep,
-        sd,
-        rawWeight8,
-        rawWeight16,
-        scaleFactor,
-        scratch8a,
-        scratch8b,
-        scratch16a,
-        scratch16b,
-        config,
-        customParamsByIndex,
-        width,
-        height);
-    // No region swapped to 16x16: mixedBlocks/dcIntFinal are content-
+        config.transformRdLambdaOverride,
+        config.enableTransform32,
+        config.transform32RdLambdaOverride);
+
+    Uint8List assemble(List<_PlacedBlock> blocks, List<Int32List> dcInt) =>
+        _finishEncode(
+            blocks,
+            dcInt,
+            bh,
+            bw,
+            groupsX,
+            groupsY,
+            numGroups,
+            hfctx,
+            ctxByType,
+            planes,
+            cfl,
+            refStep,
+            sd,
+            scaleFactor,
+            scratchA,
+            scratchB,
+            config,
+            customParamsByIndex,
+            width,
+            height);
+
+    final bodyOff = assemble(bootstrapBlocks, dcIntBootstrap);
+    var chosen = bodyOff;
+    var chosenLabel = 'off';
+
+    // No region swapped to 16x16: level1Blocks/level1DcInt are content-
     // identical to bootstrapBlocks/dcIntBootstrap (every kept cell is an
-    // exact `.copy()`, and dcIntFinal is an untouched clone), so assembling
-    // an "on" body would just reproduce bodyOff at ~2x the RDOQ/clustering/
+    // exact `.copy()`, and level1DcInt is an untouched clone), so assembling
+    // this body would just reproduce bodyOff at ~2x the RDOQ/clustering/
     // assembly cost for zero size difference — exactly the case for
     // manga's dominant content types, where this feature is default-on but
-    // rarely (if ever) picks 16x16. `mixedBlocks.length == bh * bw` iff
+    // rarely (if ever) picks 16x16. `level1Blocks.length == bh * bw` iff
     // zero swaps happened (each swap removes 3 entries from the flat list).
-    if (mixedBlocks.length == bh * bw) {
-      if (const bool.fromEnvironment('jxl.encdebug')) {
-        // ignore: avoid_print
-        print('vardct variable-transform candidates: zero 16x16 swaps, '
-            'skipped "on" assembly (off=${bodyOff.length}B)');
+    if (level1Blocks.length != bh * bw) {
+      final bodyOn1 = assemble(level1Blocks, level1DcInt);
+      if (bodyOn1.length < chosen.length) {
+        chosen = bodyOn1;
+        chosenLabel = 'on1';
       }
-      return bodyOff;
     }
-    final bodyOn = _finishEncode(
-        mixedBlocks,
-        dcIntFinal,
-        bh,
-        bw,
-        groupsX,
-        groupsY,
-        numGroups,
-        hfctx,
-        ctxByType,
-        planes,
-        cfl,
-        refStep,
-        sd,
-        rawWeight8,
-        rawWeight16,
-        scaleFactor,
-        scratch8a,
-        scratch8b,
-        scratch16a,
-        scratch16b,
-        config,
-        customParamsByIndex,
-        width,
-        height);
-    final chosen = bodyOff.length <= bodyOn.length ? bodyOff : bodyOn;
+
+    // level2 (32x32) needs its own comparison against *level1*, not just
+    // bootstrap: the per-region estimate that decides it is only a
+    // bootstrap-frozen approximation (see _decideTransformLayout's doc
+    // comment) and was measured to pick a real, if modest, size
+    // *regression* vs. level1 on some content — still smaller than plain
+    // 8x8, so a two-candidate safety net wouldn't have caught it. This
+    // three-way comparison is what actually makes enableTransform32
+    // provably never-worse than leaving it off.
+    if (level2Blocks != null) {
+      final bodyOn2 = assemble(level2Blocks, level2DcInt!);
+      if (bodyOn2.length < chosen.length) {
+        chosen = bodyOn2;
+        chosenLabel = 'on2';
+      }
+    }
+
     if (const bool.fromEnvironment('jxl.encdebug')) {
       // ignore: avoid_print
       print('vardct variable-transform candidates: off=${bodyOff.length}B '
-          'on=${bodyOn.length}B chosen=${identical(chosen, bodyOff) ? 'off' : 'on'}');
+          'chosen=$chosenLabel (${chosen.length}B)');
     }
     return chosen;
   }
@@ -458,8 +537,17 @@ Uint8List encodeLossyVardctL0(
       for (var bx = 0; bx < bw; bx++) _PlacedBlock(by, bx, _tt8),
   ];
   for (final block in placedBlocks) {
-    block.computeAndQuantize(planes, cfl, refStep, sd, rawWeight8, scaleFactor,
-        dcInt, bw, scratch8a, scratch8b, scratch16a, scratch16b);
+    block.computeAndQuantize(
+        planes,
+        cfl,
+        refStep,
+        sd,
+        ctxByType[_tt8.type]!.rawWeight,
+        scaleFactor,
+        dcInt,
+        bw,
+        scratchA,
+        scratchB);
   }
   return _finishEncode(
       placedBlocks,
@@ -475,13 +563,9 @@ Uint8List encodeLossyVardctL0(
       cfl,
       refStep,
       sd,
-      rawWeight8,
-      rawWeight16,
       scaleFactor,
-      scratch8a,
-      scratch8b,
-      scratch16a,
-      scratch16b,
+      scratchA,
+      scratchB,
       config,
       customParamsByIndex,
       width,
@@ -509,13 +593,9 @@ Uint8List _finishEncode(
     _ChromaFromLumaFit cfl,
     double refStep,
     List<double> sd,
-    List<List<Float32List>> rawWeight8,
-    List<List<Float32List>> rawWeight16,
     List<double> scaleFactor,
-    List<Float32List> scratch8a,
-    List<Float32List> scratch8b,
-    List<Float32List> scratch16a,
-    List<Float32List> scratch16b,
+    List<Float32List> scratchA,
+    List<Float32List> scratchB,
     VardctL0Config config,
     Map<int, List<List<double>>>? customParamsByIndex,
     int width,
@@ -537,15 +617,11 @@ Uint8List _finishEncode(
         cfl,
         refStep,
         sd,
-        rawWeight8,
-        rawWeight16,
         scaleFactor,
         dcInt,
         bw,
-        scratch8a,
-        scratch8b,
-        scratch16a,
-        scratch16b,
+        scratchA,
+        scratchB,
         hfctx,
         ctxByType,
         groupsX,
@@ -565,12 +641,8 @@ Uint8List _finishEncode(
         cfl,
         config.acScale,
         scaleFactor,
-        rawWeight8,
-        rawWeight16,
-        scratch8a,
-        scratch8b,
-        scratch16a,
-        scratch16b,
+        scratchA,
+        scratchB,
         hfctx,
         ctxByType,
         groupsX,
@@ -758,6 +830,19 @@ Uint8List _assembleLfGroupSection(
 /// behind this specific value).
 const _kTransformRdLambda = 3000.0;
 
+/// Rate/distortion trade-off constant for the 16x16/8x8-vs-32x32 merge
+/// level (`VardctL0Config.enableTransform32`), same `lambda = kLambda *
+/// refStep^2` scaling as `_kTransformRdLambda` (identical distortion
+/// metric one level up: `quantizeCandidate`'s weighted-squared-error).
+/// Calibrated via `tool/calibrate_transform32_lambda.dart`'s multi-distance
+/// sweep (0.5-8.0): this value happens to coincide with `_kTransformRdLambda`
+/// — both encode the same underlying trade-off, and the sweep found no
+/// benefit to diverging from it — but the two are independent knobs
+/// (separately overridable) and should be re-swept independently if either
+/// distortion metric or scaling convention ever changes. See
+/// doc/spec_notes.md for the full numbers.
+const _kTransformRdLambda32 = 3000.0;
+
 /// Decides the 8x8-vs-16x16 layout per 16x16-pixel region using a real,
 /// bootstrap-frozen bit-rate estimate instead of the old pre-quantization
 /// coefficient-magnitude proxy this replaced (`_should16x16`/`_bitProxy`,
@@ -767,20 +852,31 @@ const _kTransformRdLambda = 3000.0;
 /// favoring 16x16 there), because it had no visibility into the real
 /// context-adaptive entropy cost (see doc/spec_notes.md's L3 write-up).
 ///
-/// Returns **two** fully independent, already-quantized-and-committed
-/// candidates — `(bootstrapBlocks, dcIntBootstrap already populated
-/// in-place, mixedBlocks, dcIntFinal)` — not just the mixed layout this
+/// Returns **two or three** fully independent, already-quantized-and-
+/// committed candidates — `(bootstrapBlocks, level1Blocks, level1DcInt,
+/// level2Blocks, level2DcInt)`, the last two null unless
+/// [VardctL0Config.enableTransform32] is on — not just the layout this
 /// decision favors: the caller (`encodeLossyVardctL0`) assembles a real
-/// body for *both* and keeps whichever is actually smaller, the same
-/// real-assembly safety net `_chooseAcClustering`/RDOQ already use
-/// elsewhere in this file, applied one level up (per-image instead of
-/// per-block-channel) — this decision's own cost estimate is only ever a
-/// bootstrap-frozen approximation (see point 3 below), so unlike RDOQ it
-/// cannot promise never-worse on its own; the outer safety net is what
-/// makes the combination never-worse. The two candidates share no mutable
-/// `_PlacedBlock` state (see [_PlacedBlock.copy]'s doc comment) — callers
-/// must not run [_PlacedBlock.computeAndQuantize] on any returned block
-/// (both are already committed).
+/// body for *every* non-null candidate and keeps whichever is actually
+/// smaller, the same real-assembly safety net `_chooseAcClustering`/RDOQ
+/// already use elsewhere in this file, applied one level up (per-image
+/// instead of per-block-channel) — this decision's own cost estimate is
+/// only ever a bootstrap-frozen approximation (see point 3 below), so
+/// unlike RDOQ it cannot promise never-worse on its own; the outer safety
+/// net is what makes the combination never-worse. Point 5/6 (the
+/// 16x16/8x8-vs-32x32 merge, when enabled) needs its *own* real-assembly
+/// comparison against level1 specifically, not just against
+/// `bootstrapBlocks` — measured directly (not just theorized): on
+/// `distance=8.0` gradient content, the per-region estimate alone picked
+/// 32x32 for a genuine ~5% size *regression* vs. level1's own decision
+/// (still smaller than plain 8x8, so the two-candidate version of this
+/// safety net wouldn't have caught it) — the same "estimates can't
+/// resolve near-ties, verify by real assembly" lesson RDOQ's own
+/// real-bits check and this function's own level1-vs-bootstrap comparison
+/// already establish, just one level deeper. The candidates share no
+/// mutable `_PlacedBlock` state (see [_PlacedBlock.copy]'s doc comment) —
+/// callers must not run [_PlacedBlock.computeAndQuantize] on any returned
+/// block (all are already committed).
 ///
 /// **Method** (mirrors `_chooseHfMultRd`'s already-shipped
 /// bootstrap-then-freeze pattern, generalized from "which hfMult" to
@@ -819,27 +915,32 @@ const _kTransformRdLambda = 3000.0;
 ///    the bootstrap's 8x8 DC values at those 4 cells with the
 ///    LLF-inverted 16x16-consistent ones); a region that stays 8x8 needs
 ///    no further work — its bootstrap commit already stands.
-(List<_PlacedBlock>, List<_PlacedBlock>, List<Int32List>)
-    _decideTransformLayout(
-        List<List<Float32List>> planes,
-        _ChromaFromLumaFit cfl,
-        double refStep,
-        List<double> sd,
-        List<List<Float32List>> rawWeight8,
-        List<List<Float32List>> rawWeight16,
-        List<double> scaleFactor,
-        List<Int32List> dcIntBootstrap,
-        int bh,
-        int bw,
-        List<Float32List> scratch8a,
-        List<Float32List> scratch8b,
-        List<Float32List> scratch16a,
-        List<Float32List> scratch16b,
-        HfBlockContext hfctx,
-        Map<int, _TransformCtx> ctxByType,
-        int groupsX,
-        int groupsY,
-        double? lambdaOverride) {
+(
+  List<_PlacedBlock> bootstrapBlocks,
+  List<_PlacedBlock> level1Blocks,
+  List<Int32List> level1DcInt,
+  List<_PlacedBlock>? level2Blocks,
+  List<Int32List>? level2DcInt,
+) _decideTransformLayout(
+    List<List<Float32List>> planes,
+    _ChromaFromLumaFit cfl,
+    double refStep,
+    List<double> sd,
+    List<double> scaleFactor,
+    List<Int32List> dcIntBootstrap,
+    int bh,
+    int bw,
+    List<Float32List> scratchA,
+    List<Float32List> scratchB,
+    HfBlockContext hfctx,
+    Map<int, _TransformCtx> ctxByType,
+    int groupsX,
+    int groupsY,
+    double? lambdaOverride,
+    bool enableTransform32,
+    double? lambdaOverride32) {
+  final ctx8 = ctxByType[_tt8.type]!;
+  final ctx16 = ctxByType[_tt16.type]!;
   // 1. Bootstrap: quantize the whole image as all-8x8, committing into
   // dcIntBootstrap — this becomes (unmodified) the "off" candidate's DC
   // plane, so nothing below may overwrite it; the "on" (mixed-layout)
@@ -850,8 +951,8 @@ const _kTransformRdLambda = 3000.0;
       for (var bx = 0; bx < bw; bx++) _PlacedBlock(by, bx, _tt8),
   ];
   for (final block in bootstrapBlocks) {
-    block.computeAndQuantize(planes, cfl, refStep, sd, rawWeight8, scaleFactor,
-        dcIntBootstrap, bw, scratch8a, scratch8b, scratch16a, scratch16b);
+    block.computeAndQuantize(planes, cfl, refStep, sd, ctx8.rawWeight,
+        scaleFactor, dcIntBootstrap, bw, scratchA, scratchB);
     blockAt[block.by * bw + block.bx] = block;
   }
   final bootstrapByGroup =
@@ -874,8 +975,6 @@ const _kTransformRdLambda = 3000.0;
   final lengths = bootstrap.codes.tokenBitLengths();
   final clusterMap = bootstrap.clusterMap;
   final lambda = (lambdaOverride ?? _kTransformRdLambda) * refStep * refStep;
-  final ctx8 = ctxByType[_tt8.type]!;
-  final ctx16 = ctxByType[_tt16.type]!;
 
   // Each bootstrap block's own real rate against the frozen table,
   // precomputed once (every 8x8 cell belongs to exactly one 2x2 region).
@@ -925,10 +1024,10 @@ const _kTransformRdLambda = 3000.0;
             lambda * rate8[i11];
 
         final candidate16 = _PlacedBlock(by, bx, _tt16);
-        final coeffBuf16 = candidate16.computeCoeffBuf(
-            planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+        final coeffBuf16 =
+            candidate16.computeCoeffBuf(planes, cfl, scratchA, scratchB);
         final (mult16, quant16) = candidate16.chooseCandidate(
-            coeffBuf16, refStep, sd, rawWeight16, scaleFactor);
+            coeffBuf16, refStep, sd, ctx16.rawWeight, scaleFactor);
         final rate16 = _blockRate(ctx16, hfctx, quant16.ac,
             predictedOut[blockAt[i00]!]!, clusterMap, lengths);
         final cost16 = quant16.distortion + lambda * rate16;
@@ -948,7 +1047,110 @@ const _kTransformRdLambda = 3000.0;
       }
     }
   }
-  return (bootstrapBlocks, result, dcIntFinal);
+  if (!enableTransform32) {
+    return (bootstrapBlocks, result, dcIntFinal, null, null);
+  }
+
+  // 5/6. Second merge level (Tranche A's first extra size, DCT 32x32),
+  // structurally identical to 3/4 one level up: for every 2x2-aligned
+  // 32x32-pixel region (four already-decided 16x16-or-8x8 candidates from
+  // `result`), compare their real summed cost against a candidate 32x32
+  // block's, reusing the same frozen bootstrap code-length table — sound
+  // for the same reason step 3/4's 16x16 decision already establishes
+  // (transform-type choice never shifts which cluster a token routes to,
+  // only what values land in it). `resultBlockAt` extends `blockAt`'s
+  // one-cell-per-block bootstrap lookup to `result`'s mixed footprints; a
+  // 16x16/8x8 block can never straddle a 4x4-aligned 32x32 region (16x16
+  // blocks only start at even coordinates, and 4 is a multiple of 2), so
+  // every region's distinct blocks are cleanly enumerable via its 16
+  // underlying 8x8-cell positions.
+  final ctx32 = ctxByType[_tt32.type]!;
+  final resultBlockAt = List<_PlacedBlock?>.filled(bh * bw, null);
+  for (final block in result) {
+    final n = block.tt.dctSelectHeight;
+    for (var dy = 0; dy < n; dy++) {
+      for (var dx = 0; dx < n; dx++) {
+        resultBlockAt[(block.by + dy) * bw + (block.bx + dx)] = block;
+      }
+    }
+  }
+  // `result` only ever holds 8x8/16x16 blocks (this is the pass that would
+  // introduce a third type) — rate8 is already precomputed per cell;
+  // 16x16's rate is recomputed on demand (cheap, and only once per
+  // distinct block thanks to `seen` below) rather than threaded out of the
+  // first merge loop, keeping the two passes decoupled.
+  double blockRateIn(_PlacedBlock block) {
+    if (block.tt == _tt8) return rate8[block.by * bw + block.bx];
+    return _blockRate(ctx16, hfctx, block.acInt,
+        predictedOut[blockAt[block.by * bw + block.bx]!]!, clusterMap, lengths);
+  }
+
+  final lambda32 =
+      (lambdaOverride32 ?? _kTransformRdLambda32) * refStep * refStep;
+  final dcIntFinal2 = [for (final ch in dcIntFinal) Int32List.fromList(ch)];
+  final result2 = <_PlacedBlock>[];
+  final covered2 = List<bool>.filled(bh * bw, false);
+  var any32 = false;
+  for (var by = 0; by < bh; by++) {
+    for (var bx = 0; bx < bw; bx++) {
+      if (covered2[by * bw + bx]) continue;
+      final canPair32 =
+          by % 4 == 0 && bx % 4 == 0 && by + 3 < bh && bx + 3 < bw;
+      _PlacedBlock? merged32;
+      if (canPair32) {
+        final seen = <_PlacedBlock>{};
+        var cost16Mix = 0.0;
+        for (var dy = 0; dy < 4; dy++) {
+          for (var dx = 0; dx < 4; dx++) {
+            final block = resultBlockAt[(by + dy) * bw + (bx + dx)]!;
+            if (seen.add(block)) {
+              cost16Mix += block.distortion + lambda32 * blockRateIn(block);
+            }
+          }
+        }
+
+        final candidate32 = _PlacedBlock(by, bx, _tt32);
+        final coeffBuf32 =
+            candidate32.computeCoeffBuf(planes, cfl, scratchA, scratchB);
+        final (mult32, quant32) = candidate32.chooseCandidate(
+            coeffBuf32, refStep, sd, ctx32.rawWeight, scaleFactor);
+        final rate32 = _blockRate(ctx32, hfctx, quant32.ac,
+            predictedOut[blockAt[by * bw + bx]!]!, clusterMap, lengths);
+        final cost32 = quant32.distortion + lambda32 * rate32;
+
+        if (cost32 < cost16Mix) {
+          candidate32.commit(quant32, mult32, dcIntFinal2, bw);
+          merged32 = candidate32;
+        }
+      }
+      if (merged32 != null) {
+        any32 = true;
+        for (var dy = 0; dy < 4; dy++) {
+          for (var dx = 0; dx < 4; dx++) {
+            covered2[(by + dy) * bw + (bx + dx)] = true;
+          }
+        }
+        result2.add(merged32);
+      } else {
+        final block = resultBlockAt[by * bw + bx]!;
+        covered2[by * bw + bx] = true;
+        // Only emit at the block's own origin — a 16x16 block is visited
+        // (and skipped-as-covered) up to 4 times by this raster scan, but
+        // must land in result2 exactly once.
+        if (block.by == by && block.bx == bx) {
+          result2.add(block.copy());
+        }
+      }
+    }
+  }
+  // Mirrors the level1Blocks.length check above: no region actually swapped
+  // to 32x32 means result2/dcIntFinal2 are content-identical to
+  // result/dcIntFinal, so reporting them as absent lets the caller skip a
+  // third real-assembly pass for zero size difference.
+  if (!any32) {
+    return (bootstrapBlocks, result, dcIntFinal, null, null);
+  }
+  return (bootstrapBlocks, result, dcIntFinal, result2, dcIntFinal2);
 }
 
 /// One placed HF block: either an 8x8 or 16x16 DCT at block-grid origin
@@ -998,16 +1200,16 @@ class _PlacedBlock {
   List<List<Float32List>> computeCoeffBuf(
       List<List<Float32List>> planes,
       _ChromaFromLumaFit cfl,
-      List<Float32List> scratch8a,
-      List<Float32List> scratch8b,
-      List<Float32List> scratch16a,
-      List<Float32List> scratch16b) {
-    final n = tt.pixelHeight; // == pixelWidth for both 8x8 and 16x16
+      List<Float32List> scratchA,
+      List<Float32List> scratchB) {
+    final n = tt.pixelHeight; // == pixelWidth for every square type so far
     final coeffBuf = [
       for (var c = 0; c < 3; c++) List.generate(n, (_) => Float32List(n))
     ];
-    final scratchA = n == 8 ? scratch8a : scratch16a;
-    final scratchB = n == 8 ? scratch8b : scratch16b;
+    // scratchA/scratchB are shared, max-sized buffers (see
+    // _maxTransformPixelSize's doc comment) — forwardDCT2D only ever
+    // touches the [0, n) x [0, n) sub-region a call passes explicitly, so
+    // one pair covers every active transform type without a size dispatch.
     for (var c = 0; c < 3; c++) {
       forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, n, n, scratchA,
           scratchB);
@@ -1056,25 +1258,41 @@ class _PlacedBlock {
 
     // DC/LLF: invert the decoder's forward-DCT-of-DC-values relationship
     // (trivial identity when numBlocks == 1). Unaffected by `mult` — DC
-    // uses its own dedicated scale (`sd`), never `hfMult`.
+    // uses its own dedicated scale (`sd`), never `hfMult`. The decoder's
+    // _finalizeLLF (hf_coefficients.dart) builds a block's LLF corner as
+    // `forwardDCT2D(dcPlane, ..., llfH, llfW, ...)` then scales by
+    // `tt.llfScale` elementwise — the exact algebraic inverse (divide by
+    // llfScale, then inverseDCT2D over the same llfH x llfW grid) recovers
+    // the DC-plane values that reconstruct it, for *any* grid size (a
+    // generalization of the 16x16-only 2x2 Hadamard-like closed form this
+    // replaced; verified directly against `_finalizeLLF`'s own construction
+    // in test/encode/vardct_forward_test.dart). Flat layout:
+    // `dc[c * numBlocks + y * llfW + x]`, matching [commit].
     final List<double> dc;
     if (numBlocks == 1) {
       dc = [for (var c = 0; c < 3; c++) coeffBuf[c][0][0] / sd[c]];
     } else {
-      // numBlocks == 4 (16x16): coeffBuf[c][0][0..1] and [1][0..1] are the
-      // true LLF corner (row-major); llfScale is also row-major. Flat
-      // layout: index c * 4 + {0: top-left, 1: top-right, 2: bottom-left,
-      // 3: bottom-right} of the 2x2 DC-plane patch, matching [commit].
-      dc = List<double>.filled(12, 0);
+      dc = List<double>.filled(3 * numBlocks, 0);
+      final unscaled = List.generate(llfH, (_) => Float32List(llfW));
+      final dcGrid = List.generate(llfH, (_) => Float32List(llfW));
+      final llfScratchA = List.generate(llfH, (_) => Float32List(llfW));
+      final llfScratchB = List.generate(llfH, (_) => Float32List(llfW));
       for (var c = 0; c < 3; c++) {
-        final pre00 = coeffBuf[c][0][0] / tt.llfScale[0];
-        final pre01 = coeffBuf[c][0][1] / tt.llfScale[1];
-        final pre10 = coeffBuf[c][1][0] / tt.llfScale[2];
-        final pre11 = coeffBuf[c][1][1] / tt.llfScale[3];
-        dc[c * 4] = (pre00 + pre01 + pre10 + pre11) / sd[c];
-        dc[c * 4 + 1] = (pre00 - pre01 + pre10 - pre11) / sd[c];
-        dc[c * 4 + 2] = (pre00 + pre01 - pre10 - pre11) / sd[c];
-        dc[c * 4 + 3] = (pre00 - pre01 - pre10 + pre11) / sd[c];
+        for (var y = 0; y < llfH; y++) {
+          final srcRow = coeffBuf[c][y];
+          final dstRow = unscaled[y];
+          for (var x = 0; x < llfW; x++) {
+            dstRow[x] = srcRow[x] / tt.llfScale[y * llfW + x];
+          }
+        }
+        inverseDCT2D(unscaled, dcGrid, 0, 0, 0, 0, llfH, llfW, llfScratchA,
+            llfScratchB, false);
+        for (var y = 0; y < llfH; y++) {
+          final row = dcGrid[y];
+          for (var x = 0; x < llfW; x++) {
+            dc[c * numBlocks + y * llfW + x] = row[x] / sd[c];
+          }
+        }
       }
     }
 
@@ -1111,17 +1329,24 @@ class _PlacedBlock {
     hfMult = mult;
     acInt = candidate.ac;
     distortion = candidate.distortion;
-    final numBlocks = tt.dctSelectHeight * tt.dctSelectWidth;
+    final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+    final numBlocks = llfH * llfW;
     if (numBlocks == 1) {
       for (var c = 0; c < 3; c++) {
         dcInt[c][by * bw + bx] = candidate.dc[c].round();
       }
     } else {
+      // Matches quantizeCandidate's flat layout:
+      // dc[c * numBlocks + y * llfW + x].
       for (var c = 0; c < 3; c++) {
-        dcInt[c][by * bw + bx] = candidate.dc[c * 4].round();
-        dcInt[c][by * bw + bx + 1] = candidate.dc[c * 4 + 1].round();
-        dcInt[c][(by + 1) * bw + bx] = candidate.dc[c * 4 + 2].round();
-        dcInt[c][(by + 1) * bw + bx + 1] = candidate.dc[c * 4 + 3].round();
+        final base = c * numBlocks;
+        for (var y = 0; y < llfH; y++) {
+          final row = (by + y) * bw + bx;
+          final srcRow = base + y * llfW;
+          for (var x = 0; x < llfW; x++) {
+            dcInt[c][row + x] = candidate.dc[srcRow + x].round();
+          }
+        }
       }
     }
   }
@@ -1202,12 +1427,9 @@ class _PlacedBlock {
       List<double> scaleFactor,
       List<Int32List> dcInt,
       int bw,
-      List<Float32List> scratch8a,
-      List<Float32List> scratch8b,
-      List<Float32List> scratch16a,
-      List<Float32List> scratch16b) {
-    final coeffBuf = computeCoeffBuf(
-        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
+      List<Float32List> scratchA,
+      List<Float32List> scratchB) {
+    final coeffBuf = computeCoeffBuf(planes, cfl, scratchA, scratchB);
     final (mult, candidate) =
         chooseCandidate(coeffBuf, refStep, sd, rawWeight, scaleFactor);
     commit(candidate, mult, dcInt, bw);
@@ -1219,7 +1441,7 @@ class _PlacedBlock {
 /// default HfBlockContext's empty qfThresholds make the hfMult argument a
 /// no-op regardless of the real per-block adaptive multiplier).
 class _TransformCtx {
-  _TransformCtx(this.tt, HfBlockContext hfctx)
+  _TransformCtx(this.tt, HfBlockContext hfctx, this.rawWeight)
       : blockCtx = [
           for (var c = 0; c < 3; c++)
             HfCoefficients.getBlockContext(hfctx, c, tt.orderID, 1, 0),
@@ -1232,6 +1454,15 @@ class _TransformCtx {
   final List<int> blockCtx;
   late final List<int> histCtx;
   final Int32List order;
+
+  /// Per-channel (semantic index order: 0=X, 1=Y, 2=B) [tt.pixelHeight] x
+  /// [tt.pixelWidth] quant weight matrix, mirroring the decoder's
+  /// `getDCTQuantWeights` exactly. Keying this by transform type here (not
+  /// threading `rawWeight8`/`rawWeight16`-style parameters everywhere) is
+  /// what lets every caller look up the right table for a mixed-type block
+  /// list via `ctxByType[block.tt.type]!.rawWeight` regardless of how many
+  /// transform types are active.
+  final List<List<Float32List>> rawWeight;
   int get numBlocks => tt.dctSelectHeight * tt.dctSelectWidth;
   int get orderSize => tt.pixelHeight * tt.pixelWidth;
 }
@@ -2072,15 +2303,11 @@ void _chooseHfMultRd(
     _ChromaFromLumaFit cfl,
     double refStep,
     List<double> sd,
-    List<List<Float32List>> rawWeight8,
-    List<List<Float32List>> rawWeight16,
     List<double> scaleFactor,
     List<Int32List> dcInt,
     int bw,
-    List<Float32List> scratch8a,
-    List<Float32List> scratch8b,
-    List<Float32List> scratch16a,
-    List<Float32List> scratch16b,
+    List<Float32List> scratchA,
+    List<Float32List> scratchB,
     HfBlockContext hfctx,
     Map<int, _TransformCtx> ctxByType,
     int groupsX,
@@ -2105,10 +2332,9 @@ void _chooseHfMultRd(
       ? <int, int>{for (final m in _rdHfMultCandidates) m: 0}
       : null;
   for (final block in placedBlocks) {
-    final coeffBuf = block.computeCoeffBuf(
-        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
-    final rawWeight = block.tt == _tt16 ? rawWeight16 : rawWeight8;
+    final coeffBuf = block.computeCoeffBuf(planes, cfl, scratchA, scratchB);
     final ctx = ctxByType[block.tt.type]!;
+    final rawWeight = ctx.rawWeight;
     final predicted = predictedOut[block]!;
 
     var bestCost = double.infinity;
@@ -2428,12 +2654,8 @@ void _chooseAcRdoq(
     _ChromaFromLumaFit cfl,
     double acScale,
     List<double> scaleFactor,
-    List<List<Float32List>> rawWeight8,
-    List<List<Float32List>> rawWeight16,
-    List<Float32List> scratch8a,
-    List<Float32List> scratch8b,
-    List<Float32List> scratch16a,
-    List<Float32List> scratch16b,
+    List<Float32List> scratchA,
+    List<Float32List> scratchB,
     HfBlockContext hfctx,
     Map<int, _TransformCtx> ctxByType,
     int groupsX,
@@ -2455,10 +2677,9 @@ void _chooseAcRdoq(
 
   for (final block in placedBlocks) {
     if (block.hfMult == _rdoqExemptHfMult) continue;
-    final coeffBuf = block.computeCoeffBuf(
-        planes, cfl, scratch8a, scratch8b, scratch16a, scratch16b);
-    final rawWeight = block.tt == _tt16 ? rawWeight16 : rawWeight8;
+    final coeffBuf = block.computeCoeffBuf(planes, cfl, scratchA, scratchB);
     final ctx = ctxByType[block.tt.type]!;
+    final rawWeight = ctx.rawWeight;
     final predicted = predictedOut[block]!;
     for (final c in _channelOrder) {
       _rdoqBlockChannel(

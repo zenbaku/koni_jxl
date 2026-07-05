@@ -577,6 +577,88 @@ void main() {
             'off (${withoutVt.length}B) on a smooth gradient');
   });
 
+  test(
+      'DCT 32x32 (default on) genuinely wins on large smooth content and '
+      'round-trips through both decoders', () {
+    // Locks in the *capability*, not just the never-worse safety net: on
+    // content this feature is precisely designed for (a large low-frequency
+    // gradient, mirroring the enableVariableTransforms test above one level
+    // up), a silent regression to 16x16/8x8-only output would stay within
+    // every correctness gate (RMSE) and every other test in this file,
+    // since a 16x16-mix body is a valid fallback, not an invalid one.
+    // Size (512x512) and distance (4.0) match
+    // tool/calibrate_transform32_lambda.dart's own gradient sweep, which
+    // measured a comfortable -8.8% win here — the plain default config's
+    // implicit distance~1.0 lands on a tie for this pattern at 256x256 (see
+    // the analogous enableVariableTransforms comment above for the same
+    // gotcha one level down).
+    const w = 512, h = 512;
+    final pixels = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final v = (x * 255 / w).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(4.0);
+    final withIt = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableTransform32: true));
+    final withoutIt = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableTransform32: false));
+    expect(withIt.length, lessThan(withoutIt.length),
+        reason: 'DCT 32x32 (${withIt.length}B) should beat 16x16-mix-only '
+            '(${withoutIt.length}B) on a large smooth gradient');
+
+    final image = JxlDecoder.decode(withIt);
+    expect(image.width, w);
+    expect(image.height, h);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_t32');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(withIt);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, w);
+      expect(ref.height, h);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < w * h; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      expect(rmse, lessThan(40), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
   test('finer quantization improves RMSE', () {
     if (!_haveDjxl) return;
     final pixels = _synthetic(64, 64, 9);

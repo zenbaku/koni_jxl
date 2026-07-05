@@ -1345,6 +1345,218 @@ format's 27 transform types and no rate-distortion search over transform
 size itself (this fix chooses between two fixed candidates per region, not
 a search) — see ROADMAP.md.
 
+### Lossy (VarDCT) encoder — full 27-transform-type support, Tranche A: DCT 32x32
+
+Start of ROADMAP.md's long-standing "full 27-transform-type support" item.
+Scoped via `EnterPlanMode` given the size — a research pass (reading
+`transform_type.dart`, `dct.dart`, `hf_coefficients.dart`,
+`vardct_inverter.dart`, `hf_global.dart`) found the 27 types split cleanly
+by how much of the decoder's existing machinery the encoder can reuse:
+
+- **18 types share `TransformMethod.dct`** (plain separable DCT, any
+  size/aspect ratio) — `forwardDCT2D`/`inverseDCT2D` (`dct.dart`) are
+  already fully generic over any power-of-2 height/width and already
+  exercised for all 18 sizes on decode; `getDCTQuantWeights`/
+  `getNaturalOrder` are likewise generic and already imported by the
+  encoder.
+- **9 types** (Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0-3) have no
+  generic form at all — each is a bespoke, hand-derived transform in
+  `vardct_inverter.dart`'s per-method switch, with no shared machinery a
+  forward mirror could lean on.
+- **6 of the 18 `dct`-method types are "wide" rectangular** and need
+  orientation/transpose (`flip`) handling that doesn't exist in the
+  encoder at all yet (`_scanChannelValues` hardcodes the square-only
+  assumption with a comment saying so).
+
+Three tranches fall out, cheapest-reuse first: **A** (more square DCT
+sizes: 32x32, 64x64, 128x128, 256x256), **B** (12 rectangular `dct`-method
+types, needs the new flip/orientation layer), **C** (9 bespoke
+single-footprint types, needs from-scratch forward derivations). Only
+Tranche A's first size, DCT 32x32, was scoped for implementation — proving
+the generalized architecture end to end before spending more time on the
+rest.
+
+**What had to generalize.** `rawWeight8`/`rawWeight16` were threaded as
+two explicit parameters through ~15 call sites with two literal dispatch
+points (`block.tt == _tt16 ? rawWeight16 : rawWeight8`) — doesn't scale
+past 2 types. Fixed by adding a `rawWeight` field to `_TransformCtx`,
+which was *already* keyed by transform type in `ctxByType` and *already*
+threaded through every relevant function for context/order lookups — one
+more field, not new plumbing. Verified byte-identical output before/after
+this refactor against `doc/BENCHMARKS.md`'s recorded numbers (113457
+bytes at `color_cover` `distance=1.0`, matched exactly). Scratch buffers
+(`scratch8a/8b` + `scratch16a/16b`, 4 params) generalized to one reused,
+max-sized pair — `forwardDCT2D`/`inverseDCT2D` only ever touch the
+`[0, n) x [0, n)` sub-region a call passes explicitly, so a single 32x32
+buffer safely serves 8x8/16x16/32x32 alike.
+
+**DC/LLF inversion, generalized and verified before trusting it.**
+`quantizeCandidate`'s DC handling hand-unrolled 16x16's case as a literal
+2x2 Hadamard-like closed form (`dc[c*4] = (pre00+pre01+pre10+pre11)/
+sd[c]`, etc.) — hardcoded to exactly 4 positions. The decoder's own
+`_finalizeLLF` (`hf_coefficients.dart`) builds a block's LLF corner as
+`forwardDCT2D(dcPlane, ..., dctSelectHeight, dctSelectWidth, ...)` then
+scales by `tt.llfScale` elementwise — for *any* grid size, not just 2x2 —
+so the true algebraic inverse (divide by `llfScale`, then `inverseDCT2D`
+over the same grid) generalizes cleanly. Verified directly, not assumed:
+`test/encode/vardct_forward_test.dart` gained a test constructing a real
+DC-plane 4x4 grid (32x32's `dctSelectHeight/Width`), running it through
+`_finalizeLLF`'s exact forward construction, then confirming the proposed
+inverse recovers the original values — before the encoder's real pipeline
+was trusted to rely on it. Switching 16x16 to the same generic path (no
+special-casing kept) caused a ~2-byte drift on existing output (a
+different floating-point path, not a different answer) — acceptable
+since this project's lossy correctness gate is RMSE/max-based, not
+bit-exact, unlike the lossless encoder.
+
+**The layout decision: one more quadtree level, and a real safety-net gap
+caught before shipping.** `_decideTransformLayout`'s existing 8x8-vs-16x16
+decision is exactly a one-level bootstrap-frozen quadtree merge (quantize
+everything as 8x8, then for every 2x2-aligned region compare real cost
+against a 16x16 candidate). Round 7 adds a second, structurally identical
+pass one level up: for every 2x2-aligned 32x32-pixel region (four
+already-decided 16x16-or-8x8 candidates), compare their real summed cost
+against a candidate 32x32's, reusing the same frozen bootstrap code-length
+table (sound for the identical reason the first level's own doc comment
+already establishes — transform-type choice never shifts which cluster a
+token routes to, only what value lands there).
+
+An end-to-end smoke test (encode with the new level on vs. off, compare
+bytes) surfaced a real gap: on `distance=8.0` gradient content, the new
+level's own per-region estimate picked a real, if modest, size
+*regression* vs. the level-1-only decision (1916 bytes vs. 1817) — still
+smaller than plain 8x8, so the *existing* two-candidate safety net
+(mixed-layout vs. plain-8x8 bootstrap) wouldn't have caught it. This is
+the same "estimates can't resolve near-ties, verify by real assembly"
+lesson RDOQ's real-bits check and the first merge level's own outer
+safety net both already establish — recurring one level deeper, because
+a per-region *estimate* is still only ever a bootstrap-frozen
+approximation regardless of how many levels deep it's nested. **Fix**:
+extended `_decideTransformLayout`'s return from a 2-candidate to a
+2-or-3-candidate tuple (`bootstrapBlocks` always, `level1Blocks` always,
+`level2Blocks` only when `enableTransform32`), and `encodeLossyVardctL0`
+now assembles a real body for *every* non-null candidate via the existing
+`_finishEncode` machinery and keeps the genuinely smallest — reusing the
+same real-assembly mechanism the outer level already uses, not a new one.
+Re-running the smoke test confirmed the fix: the `distance=8.0` regression
+case now correctly falls back to the level-1-only body (1817 bytes)
+instead of the worse level-2 result. **Generalizable lesson for any
+future N-level merge/cascade in this codebase**: adding a new level on
+top of an existing "provably never-worse" safety net needs the new
+level's *own* real-assembly comparison against the immediately-prior
+level, not just against the original baseline — being not-worse-than-the-
+oldest-baseline is a different (weaker) guarantee, and it fails silently
+(a bytes regression, not a crash) unless something specifically compares
+against the immediately-prior state.
+
+**Calibration** (`tool/calibrate_transform32_lambda.dart`, same
+multi-distance methodology as round 6's fix — sweep 0.5-8.0, not one
+point). Baseline is level-1-only (`enableVariableTransforms: true,
+enableTransform32: false`, this encoder's actual pre-round-7 default),
+not plain 8x8, since the question is specifically "does level 2 help
+beyond level 1" — matching why level 2 needs its own safety net above.
+`_kTransformRdLambda32 = 3000.0` (same value as `_kTransformRdLambda`,
+the sweep found no benefit to diverging) clears a manga-neutral-or-better
+gate at *every* tested distance:
+
+| distance | color_cover | gradient | screentone (synthetic) | lineArt (synthetic) |
+|---|---|---|---|---|
+| 0.5 | -5.1%/rmse-0.9% | -7.6% | -0.5% | 0% |
+| 1.0 | -1.6%/rmse-1.4% | -0.8% | 0% | 0% |
+| 2.0 | -3.2%/rmse-7.1% | -1.3% | 0% | 0% |
+| 4.0 | -6.6%/rmse-2.2% | -8.8% | 0% | 0% |
+| 8.0 | -9.7%/rmse+0.5% | 0% | 0% | 0% |
+
+Higher `kLambda` values (10000-100000) plateau rather than diverge — a
+reassuring sign this constant sits in a stable region, not at a knife's
+edge (unlike hfMult's lambda, which needed a scaling-formula fix; this
+merge level uses the same rounding-error distortion metric round 6's
+constant already validated as correctly `refStep^2`-scaled).
+
+**Real-corpus validation found an even bigger effect than the synthetic
+sweep suggested** (`tool/bench_lossy_vs_cjxl.dart`, comparing
+`enableTransform32: true` vs. `false`, both through `djxl`): on
+`color_cover`, -1.6% to -9.7% smaller at every distance, matching the
+synthetic numbers closely. On `gray_screentone` (1536x2200, the corpus'
+real manga-page proxy — halftone dots *and* panel borders, speech-bubble
+interiors, a solid black polygon) the win is far larger: -7.6% to -16.7%
+smaller across `distance` 0.5-4.0, essentially flat at `distance=8.0`.
+The synthetic screentone/line-art patterns in the calibration tool are
+pure repeating dot/line texture with no flat regions at all — real manga
+pages are a *mix* of that texture and large flat areas (panels, bubble
+backgrounds), and flat regions are exactly where a bigger transform pays
+off most. Concretely, this **flips** the `cjxl -e1` comparison at
+`distance=4.0` from worse (1.03x, the pre-round-7 figure in
+`doc/BENCHMARKS.md`) to better (0.95x) — a qualitative, not just
+quantitative, improvement the synthetic-pattern-only calibration
+undersold. No evidence of `doc/spec_notes.md`'s inherited large-DCT
+decode-side deviation ("DCT 16x32 and larger") causing problems here:
+`djxl` round-trip RMSE and max-diff both tracked expected growth with
+`distance` at every measurement, with no anomalous spike specific to
+enabling 32x32.
+
+**Encode-time cost, measured before the shipping decision.** The
+never-worse guarantee requires a third real `_finishEncode` assembly pass
+(bootstrap-only, level-1, level-2) whenever `enableTransform32` fires at
+all, and that pass is the actual bottleneck, not the RD search that picks
+between them: `gray_screentone` AOT encode time went from ~16-17s to
+~24s/page (~40% slower). This cost is paid whenever the feature is on and
+32x32 is picked anywhere in the image — which turned out to matter a lot
+for the shipping decision below.
+
+**REAL-MANGA VALIDATION REVERSED THE DEFAULT.** Briefly shipped
+`enableTransform32` on by default on the strength of the synthetic and
+corpus numbers above — then tested against real `manga_samples/` chapter
+pages (gitignored, copyrighted, never committed — one B&W screentone-heavy
+title, one flat-color "digital colored comics" title, 6 pages total, both
+distance=1.0 and distance=4.0, `enableVariableTransforms: true` in both
+arms so only the level-2 effect was isolated). The result: **-0.0% to
+-0.6%** — a full order of magnitude below every synthetic/corpus figure
+above — for the *same* ~40% encode-time cost measured everywhere else (the
+level2-skip optimization that avoids the third assembly pass when nothing
+merges doesn't help here: 32x32 *does* fire on real pages, just barely
+enough to matter). RMSE was unchanged across every page; no correctness
+issue, no anomalous large-DCT-deviation spike — this is a value judgment,
+not a bug. Root cause: `gray_screentone`'s flat panel/speech-bubble/
+solid-black-polygon regions are a more exaggerated proxy for "flat-area
+density" than real manga pages actually have — the corpus golden was
+designed to *exercise* the feature, not to *represent* typical page
+content, and round 7 conflated the two. This is the exact same "synthetic
+validation didn't survive contact with real content" pattern already
+documented for L3's variable-transforms (screentone/line-art regressed
+20-31% on first real testing), RDOQ's lambda scaling (safe at
+distance=1.0, roughly doubled RMSE at distance=8.0), and hfMult's banding
+blind spot (a proxy metric structurally can't see banding sensitivity) —
+now a fourth instance, and a reminder that this project's own corpus
+goldens are still synthetic proxies, not a substitute for the real
+`manga_samples/` content the decoder's *decode*-side validation already
+insists on (see the M0-M7 real-world validation note above).
+
+**Shipped**: the architecture, the never-worse safety net, and the opt-in
+knob are all correct and stay. `VardctL0Config.enableTransform32` defaults
+to **false** — reverted from a brief on-by-default ship once the real-manga
+numbers came in. Full test suite green (306 tests, including a dedicated
+capability-regression test that forces the flag on so the feature itself
+stays covered even with the default off) with `koni_jxl_flutter`'s suite
+also green. See `doc/BENCHMARKS.md` for the updated headline numbers
+(reverted to reflect the off default).
+
+**What's next.** 64x64/128x128/256x256 (the rest of Tranche A) should be
+small follow-ups now that the plumbing is generic — each is "one more
+size in `_activeTransformTypes` + one more quadtree merge level (32x32→
+64x64, etc.) + its own calibration sweep." `_maxTransformPixelSize` needs
+bumping to match. **Any future size needs the same real-`manga_samples/`
+validation step before ever defaulting on** — synthetic/corpus numbers
+alone are not sufficient evidence for this project's manga use case,
+per the finding above. Tranche B (12 rectangular types) needs the flip/
+orientation layer this round deliberately didn't build (`_scanChannelValues`
+and `quantizeCandidate`'s AC loop both currently assume square). Tranche C
+(9 bespoke single-footprint types) needs from-scratch forward derivations
+mirroring `vardct_inverter.dart`'s bespoke inverse code, plus porting
+`HfGlobal`'s private weight-generation logic into encoder-callable form —
+no shared machinery to lean on, closer to a series of small research tasks
+than mechanical generalization. See ROADMAP.md for the phased plan.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

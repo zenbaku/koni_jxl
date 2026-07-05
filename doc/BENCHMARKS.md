@@ -183,22 +183,22 @@ failure; size-ratio is unaffected since it comes from the file directly).
 ```
 === gray_screentone_d0_e7.pgm (1536x2200) — manga-style ===
 distance  encoder    bytes   size-ratio  rmse    encode-ms
-  0.5     koni_jxl  1291227      0.81x    0.79    17372
-  0.5     cjxl -e1  1593598      1.00x     NaN      103
-  1.0     koni_jxl  1050127      0.83x    1.50    17131
-  1.0     cjxl -e1  1259603      1.00x     NaN      103
-  2.0     koni_jxl   912628      0.94x    3.05    17017
-  2.0     cjxl -e1   966259      1.00x     NaN      105
-  4.0     koni_jxl   723852      1.03x    6.05    16798
+  0.5     koni_jxl  1291275      0.81x    0.79    17850
+  0.5     cjxl -e1  1593598      1.00x     NaN      109
+  1.0     koni_jxl  1050127      0.83x    1.50    17698
+  1.0     cjxl -e1  1259603      1.00x     NaN      109
+  2.0     koni_jxl   912676      0.94x    3.05    17039
+  2.0     cjxl -e1   966259      1.00x     NaN      103
+  4.0     koni_jxl   723901      1.03x    6.05    16886
   4.0     cjxl -e1   702533      1.00x     NaN      101
-  8.0     koni_jxl   553880      1.31x   10.72    16579
-  8.0     cjxl -e1   423540      1.00x     NaN       97
+  8.0     koni_jxl   553928      1.31x   10.72    16744
+  8.0     cjxl -e1   423540      1.00x     NaN       99
 
 === color_cover_d0_e7.ppm (1024x1536) — smooth/photographic ===
 distance  encoder    bytes   size-ratio  rmse    encode-ms
-  1.0     koni_jxl   113457      1.52x    1.53     5646
-  1.0     cjxl -e1    74624      1.00x    2.70       52
-  1.0     cjxl -e7    49577      0.66x    1.39      745
+  1.0     koni_jxl   113455      1.52x    1.53     5991
+  1.0     cjxl -e1    74624      1.00x    2.70       54
+  1.0     cjxl -e7    49577      0.66x    1.39      787
 ```
 
 (Full output, including `-e7` rows for every distance and the `palette16`
@@ -210,24 +210,34 @@ Takeaways:
   `cjxl -e1` (0.81–0.94x its size, at comparable or better RMSE) —
   `cjxl -e1` is the fair speed-matched comparison, since this encoder has
   no rate-distortion search over encoding modes. Past `distance` 2.0 the
-  gap flips (1.03x–1.31x): the RDOQ/quantization heuristics were tuned in
-  that low-to-mid range where manga pages are actually encoded.
-  `cjxl -e7`'s real RD search is smaller everywhere by a wide margin
-  (0.37–0.54x) — the headroom `ROADMAP.md` tracks.
+  gap flips (1.03x at 4.0, 1.31x at 8.0): the RDOQ/quantization heuristics
+  were tuned in the low-to-mid range where manga pages are actually
+  encoded. `cjxl -e7`'s real RD search is smaller everywhere by a wide
+  margin (0.37–0.54x) — the headroom `ROADMAP.md` tracks. **DCT 32x32**
+  (`VardctL0Config.enableTransform32`, see `doc/spec_notes.md`) **can**
+  flip the `distance=4.0` case to 0.95x on this specific corpus image (it
+  has unusually large flat panel/speech-bubble regions) — but it defaults
+  **off**, because testing against real `manga_samples/` chapter pages
+  found the actual win there is -0.0% to -0.6%, not the -7.6% to -16.7%
+  this corpus image suggests, for the same ~40% encode-time cost. The
+  table above reflects the shipped default (`enableTransform32: false`);
+  see the "Real-world manga chapters" section below for the numbers that
+  decided this.
 - On smooth/photographic content the gap to even `-e1` is larger
   (1.5x at `distance=1.0`) — consistent with the lossless table's finding
   that continuous-tone content is this encoder's weakest case relative to
   libjxl.
-- Our own encode time (16–17 s/page here, AOT) is far slower than
-  `cjxl -e1` (~0.1 s) and even `cjxl -e7` (~1.5 s). Some of that gap is
-  intrinsic (pure Dart vs. libjxl's hand-optimized, SIMD-heavy C++
-  encoder; no multi-threading here yet), but not all of it is fairly
+- Our own encode time (~18 s/page here, AOT) is far slower than
+  `cjxl -e1` (~0.1 s) and even `cjxl -e7` (~1.5-2 s). Some of the gap to
+  `cjxl` is intrinsic (pure Dart vs. libjxl's hand-optimized, SIMD-heavy
+  C++ encoder; no multi-threading here yet), but not all of it is fairly
   chargeable to "Dart vs. C++": as the lossless table's AOT-vs-JIT note
-  shows, this specific one-shot-call workload runs 30–50% faster under a
-  plain `dart run` (JIT) than AOT on this machine (`gray_screentone` at
-  `distance=1.0`: 8.6 s JIT vs. 17.1 s AOT), so don't read the absolute
+  shows, this specific one-shot-call workload runs faster under a plain
+  `dart run` (JIT) than AOT on this machine, so don't read the absolute
   encode-ms figures here as a language-speed verdict — the size and RMSE
-  columns are the load-bearing numbers in this table.
+  columns are the load-bearing numbers in this table. (Enabling
+  `enableTransform32` adds a further ~40% on top of these figures — see
+  `doc/spec_notes.md` for why that trade isn't on by default.)
 
 ## Real-world manga chapters (not reproducible from this repo)
 
@@ -253,3 +263,19 @@ a claim to verify:
   spend bits on), so it isn't a fair stand-in for "a real manga page"
   either. Take the "~0.3-1 s/page" figure as unverified until someone
   benchmarks against a clean (non-JPEG-transcoded) manga source.
+- **`VardctL0Config.enableTransform32`'s default was decided here, not on
+  the corpus.** The lossy `gray_screentone`/`color_cover` corpus numbers
+  above (with `enableTransform32: true`) looked like a clear win — up to
+  -16.7% smaller at distance 0.5-4.0 — enough to briefly ship it on by
+  default (see `doc/spec_notes.md`). Testing against 6 real
+  `manga_samples/` pages (a B&W screentone-heavy chapter and a flat-color
+  "digital colored comics" chapter, both at distance 1.0 and 4.0, with
+  `enableVariableTransforms: true` in both arms to isolate just the
+  level-2 effect) found the real win is **-0.0% to -0.6%** — an order of
+  magnitude smaller — for the same ~40% encode-time cost measured on the
+  corpus. RMSE was unchanged; this reverted the default to **off**. The
+  corpus' `gray_screentone` golden overstates how much flat-region content
+  (panels, speech bubbles) real manga pages actually contain relative to
+  halftone/line-art texture — a synthetic proxy built to *exercise* a
+  feature isn't the same as one that *represents* typical content, and
+  this is the concrete number that distinction cost.
