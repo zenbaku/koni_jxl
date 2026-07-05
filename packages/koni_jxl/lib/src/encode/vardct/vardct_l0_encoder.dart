@@ -42,8 +42,8 @@ class VardctL0Config {
     this.enableFilters = false,
     this.enableVariableTransforms = true,
     this.transformRdLambdaOverride,
-    this.enableTransform32 = false,
-    this.transform32RdLambdaOverride,
+    this.maxTransformSize = 16,
+    this.transformRdLambdaOverrideBeyond16,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
     this.enableRdoq = true,
@@ -126,52 +126,45 @@ class VardctL0Config {
   /// Null (the default) uses the shipped, calibrated constant.
   final double? transformRdLambdaOverride;
 
-  /// Whether to add a second, structurally identical merge level on top of
-  /// [enableVariableTransforms]'s 8x8-vs-16x16 decision: for every
-  /// 2x2-aligned 32x32-pixel region (four already-decided 16x16-or-8x8
-  /// candidates), compare their real summed `distortion + lambda * rate`
-  /// cost against a candidate 32x32 block's, using the same frozen
-  /// bootstrap code-length table `_decideTransformLayout` already builds.
-  /// Defaults to **off**. A multi-distance calibration
-  /// (`tool/calibrate_transform32_lambda.dart`) at the shipped
-  /// `_kTransformRdLambda32` looked like a clear win on synthetic patterns
-  /// (up to -9.8%) and the corpus' `gray_screentone`/`color_cover` goldens
-  /// (-1.6% to -16.7% at distance 0.5-4.0) — enough to briefly ship this
-  /// on by default. **That default was reverted after testing real
-  /// `manga_samples/` chapter pages** (both a B&W screentone-heavy title
-  /// and a flat-color "digital colored comics" title): the actual win
-  /// there is -0.0% to -0.6%, a full order of magnitude below every
-  /// synthetic/corpus figure above, for the *same* ~40% encode-time cost
-  /// measured everywhere else (a third real-assembly pass is unavoidable
-  /// once 32x32 fires at all — the level2-skip optimization below doesn't
-  /// help once it fires even a little, which it does on real pages). RMSE
-  /// stayed flat and no correctness issue appeared — this is a value
-  /// judgment, not a bug: `gray_screentone`'s flat panel/speech-bubble/
-  /// solid-black-polygon regions are a more exaggerated proxy for "flat
-  /// area density" than real pages actually have. This is the same
-  /// "synthetic validation didn't survive contact with real content"
-  /// pattern already hit for L3's variable-transforms, RDOQ's lambda
-  /// scaling, and hfMult's banding blind spot — see doc/spec_notes.md for
-  /// the full real-manga numbers. The feature is correct and never-worse
-  /// (real-assembly-verified either way), so it's left available as an
-  /// opt-in for content that genuinely has large flat regions — just not
-  /// a default win for this project's manga use case. Has no effect
-  /// unless [enableVariableTransforms] is also true (32x32 is only ever
-  /// considered as a merge of already-decided smaller candidates, never
-  /// placed directly). Needs its **own** real-assembly comparison against
-  /// the level-1 (8x8/16x16) layout, not just against plain 8x8 — see
-  /// `_decideTransformLayout`'s doc comment for why the two-candidate
-  /// safety net `enableVariableTransforms` alone uses isn't sufficient
-  /// once a second merge level exists; with that three-way comparison in
-  /// place, enabling this can still never produce a larger file than
-  /// leaving it off.
-  final bool enableTransform32;
+  /// How far [enableVariableTransforms]'s layout decision may cascade
+  /// beyond its always-on 8x8-vs-16x16 first level: one of 16 (default —
+  /// stop there), 32, 64, 128, or 256. Each step up adds one more
+  /// structurally identical merge level in `_decideTransformLayout` — for
+  /// every aligned region of four already-decided candidates at the
+  /// current size, compare their real summed `distortion + lambda * rate`
+  /// cost against a freshly quantized candidate of the next size up, using
+  /// the same frozen bootstrap code-length table every level shares — plus
+  /// its own real-assembly comparison against the immediately-prior
+  /// level's actual body (not just against `enableVariableTransforms:
+  /// false`), which is what makes raising this provably never-worse
+  /// regardless of how many levels are enabled (see
+  /// `_decideTransformLayout`'s doc comment for why a weaker "not worse
+  /// than the original baseline" guarantee isn't sufficient once more than
+  /// one extra level exists).
+  ///
+  /// **Existence vs. default are separate questions here.** `maxTransformSize:
+  /// 32` (DCT 32x32, Tranche A's first extra size) is implemented,
+  /// correct, and real-assembly-verified never-worse — but real
+  /// `manga_samples/` chapter pages showed only a -0.0% to -0.6% win for
+  /// the *same* ~40% encode-time cost that looked like -7.6% to -16.7% on
+  /// synthetic patterns and the corpus' `gray_screentone` golden (a
+  /// content-density mismatch, not a bug — see doc/spec_notes.md for the
+  /// full numbers). That's why the default stays 16, not because sizes
+  /// beyond 16 don't work. Full 27-transform-type support is tracked as a
+  /// completeness goal independent of manga ROI (see ROADMAP.md, dated
+  /// 2026-07-05) — raise this deliberately for content that genuinely has
+  /// large flat regions, or to exercise/benchmark the larger sizes; don't
+  /// expect it to help typical manga pages.
+  final int maxTransformSize;
 
-  /// Overrides the rate/distortion trade-off constant `_kTransformRdLambda32`
-  /// used by [enableTransform32] (a runtime knob rather than a recompile,
-  /// purely so a calibration tool can sweep it in one process). Null (the
-  /// default) uses the shipped, calibrated constant.
-  final double? transform32RdLambdaOverride;
+  /// Overrides the shared rate/distortion trade-off constant
+  /// (`_kTransformRdLambdaBeyond16`) used by every cascade level beyond the
+  /// first (16→32, 32→64, 64→128, 128→256) — a runtime knob rather than a
+  /// recompile, purely so a calibration tool can sweep it in one process.
+  /// Null (the default) uses the shipped constant, which calibration found
+  /// no benefit to varying by level (see doc/spec_notes.md). Has no effect
+  /// below `maxTransformSize: 32`.
+  final double? transformRdLambdaOverrideBeyond16;
 
   /// Whether to replace the default 3-bucket adaptive-quantization
   /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
@@ -248,13 +241,28 @@ const _channelOrder = [1, 0, 2];
 final _tt8 = TransformType.byType(0); // DCT 8x8: orderID 0, parameterIndex 0
 final _tt16 = TransformType.byType(4); // DCT 16x16: orderID 2, parameterIndex 4
 final _tt32 = TransformType.byType(5); // DCT 32x32: orderID 3, parameterIndex 5
+final _tt64 =
+    TransformType.byType(18); // DCT 64x64: orderID 7, parameterIndex 11
+final _tt128 =
+    TransformType.byType(21); // DCT 128x128: orderID 9, parameterIndex 13
+final _tt256 =
+    TransformType.byType(24); // DCT 256x256: orderID 11, parameterIndex 15
 
 /// Transform types this encoder can currently emit, largest reused
 /// mechanically wherever code is already N-way (context/rawWeight lookup,
 /// quant-weight/order tables); genuinely new work (layout-decision merge
 /// levels, flip/orientation handling) is called out separately in
-/// ROADMAP.md as each size/tranche lands.
-final _activeTransformTypes = [_tt8, _tt16, _tt32];
+/// ROADMAP.md as each size/tranche lands. All of Tranche A (square DCT
+/// sizes) is listed here regardless of [VardctL0Config.maxTransformSize] —
+/// preparing a type's context/quant-weight tables is cheap and does not by
+/// itself make the layout decision ever place it; that's gated purely by
+/// [_cascadeSizes] in `_decideTransformLayout`.
+final _activeTransformTypes = [_tt8, _tt16, _tt32, _tt64, _tt128, _tt256];
+
+/// The square sizes beyond the always-on 8x8/16x16 level, in ascending
+/// order — `_decideTransformLayout`'s generic cascade stops at the first
+/// entry wider than [VardctL0Config.maxTransformSize].
+final _cascadeSizes = [_tt32, _tt64, _tt128, _tt256];
 
 /// Scratch-buffer side length shared by every transform-pipeline call
 /// (`computeCoeffBuf`, `_decideTransformLayout`, `_chooseHfMultRd`,
@@ -263,7 +271,7 @@ final _activeTransformTypes = [_tt8, _tt16, _tt32];
 /// the `[0, height) x [0, width)` sub-region a call passes explicitly, so
 /// one shared, reused, max-sized pair works for every smaller size too —
 /// bump this when a larger type is added, no other change needed here.
-const _maxTransformPixelSize = 32;
+const _maxTransformPixelSize = 256;
 
 /// LF groups are 256x256 blocks (2048x2048 pixels) — `frame.dart`'s
 /// `header.lfGroupDim` (`groupDim << 3`, `groupDim` hardcoded to 256 for
@@ -432,20 +440,15 @@ Uint8List encodeLossyVardctL0(
   // 8x8-block granularity regardless of the HF transform covering it (see
   // _PlacedBlock's doc comment on the LLF relationship for 16x16).
   if (config.enableVariableTransforms) {
-    // _decideTransformLayout returns two or three fully independent
-    // candidates (its doc comment explains why) — assemble a real body for
-    // each and keep whichever is genuinely smaller, so this feature (and
-    // enableTransform32 layered on top of it) can never regress vs
-    // `enableVariableTransforms: false` alone, matching the real-assembly
-    // safety net this file's other RD features already use.
+    // _decideTransformLayout returns a list of fully independent
+    // candidates, bootstrap always first (its doc comment explains why) —
+    // assemble a real body for each and keep whichever is genuinely
+    // smaller, so this feature (and every cascade level
+    // [VardctL0Config.maxTransformSize] enables beyond 16) can never
+    // regress vs `enableVariableTransforms: false` alone, matching the
+    // real-assembly safety net this file's other RD features already use.
     final dcIntBootstrap = [for (var c = 0; c < 3; c++) Int32List(bh * bw)];
-    final (
-      bootstrapBlocks,
-      level1Blocks,
-      level1DcInt,
-      level2Blocks,
-      level2DcInt
-    ) = _decideTransformLayout(
+    final candidates = _decideTransformLayout(
         planes,
         cfl,
         refStep,
@@ -461,8 +464,8 @@ Uint8List encodeLossyVardctL0(
         groupsX,
         groupsY,
         config.transformRdLambdaOverride,
-        config.enableTransform32,
-        config.transform32RdLambdaOverride);
+        config.maxTransformSize,
+        config.transformRdLambdaOverrideBeyond16);
 
     Uint8List assemble(List<_PlacedBlock> blocks, List<Int32List> dcInt) =>
         _finishEncode(
@@ -487,46 +490,30 @@ Uint8List encodeLossyVardctL0(
             width,
             height);
 
-    final bodyOff = assemble(bootstrapBlocks, dcIntBootstrap);
-    var chosen = bodyOff;
-    var chosenLabel = 'off';
-
-    // No region swapped to 16x16: level1Blocks/level1DcInt are content-
-    // identical to bootstrapBlocks/dcIntBootstrap (every kept cell is an
-    // exact `.copy()`, and level1DcInt is an untouched clone), so assembling
-    // this body would just reproduce bodyOff at ~2x the RDOQ/clustering/
-    // assembly cost for zero size difference — exactly the case for
-    // manga's dominant content types, where this feature is default-on but
-    // rarely (if ever) picks 16x16. `level1Blocks.length == bh * bw` iff
-    // zero swaps happened (each swap removes 3 entries from the flat list).
-    if (level1Blocks.length != bh * bw) {
-      final bodyOn1 = assemble(level1Blocks, level1DcInt);
-      if (bodyOn1.length < chosen.length) {
-        chosen = bodyOn1;
-        chosenLabel = 'on1';
-      }
-    }
-
-    // level2 (32x32) needs its own comparison against *level1*, not just
-    // bootstrap: the per-region estimate that decides it is only a
-    // bootstrap-frozen approximation (see _decideTransformLayout's doc
-    // comment) and was measured to pick a real, if modest, size
-    // *regression* vs. level1 on some content — still smaller than plain
-    // 8x8, so a two-candidate safety net wouldn't have caught it. This
-    // three-way comparison is what actually makes enableTransform32
-    // provably never-worse than leaving it off.
-    if (level2Blocks != null) {
-      final bodyOn2 = assemble(level2Blocks, level2DcInt!);
-      if (bodyOn2.length < chosen.length) {
-        chosen = bodyOn2;
-        chosenLabel = 'on2';
+    // `candidates[0]` is always the plain bootstrap (identical to
+    // `enableVariableTransforms: false`); every later entry already beat
+    // its own immediately-prior candidate's *estimate*, but only a real
+    // assembled-byte comparison against every candidate (not just
+    // adjacent pairs) makes the whole cascade provably never-worse — the
+    // exact gap a real end-to-end smoke test found during the 32x32 slice
+    // (a level's estimate can regress vs. the immediately-prior level even
+    // though it's still smaller than the original bootstrap).
+    var chosen = assemble(candidates[0].$1, candidates[0].$2);
+    final bodyOff = chosen;
+    var chosenLevel = 0;
+    for (var i = 1; i < candidates.length; i++) {
+      final body = assemble(candidates[i].$1, candidates[i].$2);
+      if (body.length < chosen.length) {
+        chosen = body;
+        chosenLevel = i;
       }
     }
 
     if (const bool.fromEnvironment('jxl.encdebug')) {
       // ignore: avoid_print
       print('vardct variable-transform candidates: off=${bodyOff.length}B '
-          'chosen=$chosenLabel (${chosen.length}B)');
+          'chosen=level$chosenLevel (${chosen.length}B) of '
+          '${candidates.length} candidates');
     }
     return chosen;
   }
@@ -830,18 +817,22 @@ Uint8List _assembleLfGroupSection(
 /// behind this specific value).
 const _kTransformRdLambda = 3000.0;
 
-/// Rate/distortion trade-off constant for the 16x16/8x8-vs-32x32 merge
-/// level (`VardctL0Config.enableTransform32`), same `lambda = kLambda *
+/// Shared rate/distortion trade-off constant for every cascade level
+/// beyond the first (16→32, 32→64, 64→128, 128→256 —
+/// `VardctL0Config.maxTransformSize` above 16), same `lambda = kLambda *
 /// refStep^2` scaling as `_kTransformRdLambda` (identical distortion
 /// metric one level up: `quantizeCandidate`'s weighted-squared-error).
-/// Calibrated via `tool/calibrate_transform32_lambda.dart`'s multi-distance
-/// sweep (0.5-8.0): this value happens to coincide with `_kTransformRdLambda`
-/// — both encode the same underlying trade-off, and the sweep found no
-/// benefit to diverging from it — but the two are independent knobs
-/// (separately overridable) and should be re-swept independently if either
-/// distortion metric or scaling convention ever changes. See
-/// doc/spec_notes.md for the full numbers.
-const _kTransformRdLambda32 = 3000.0;
+/// Calibrated for the 16-vs-32 level via
+/// `tool/calibrate_transform32_lambda.dart`'s multi-distance sweep
+/// (0.5-8.0): this value happens to coincide with `_kTransformRdLambda` —
+/// both encode the same underlying trade-off, and the sweep found no
+/// benefit to diverging from it — and a quick real-manga sanity check at
+/// each further size (see doc/spec_notes.md) found no reason to sweep
+/// separately per level either, so one shared constant covers all of
+/// them. The two knobs (this and `_kTransformRdLambda`) remain
+/// independently overridable and should be re-swept independently if
+/// either distortion metric or scaling convention ever changes.
+const _kTransformRdLambdaBeyond16 = 3000.0;
 
 /// Decides the 8x8-vs-16x16 layout per 16x16-pixel region using a real,
 /// bootstrap-frozen bit-rate estimate instead of the old pre-quantization
@@ -852,31 +843,32 @@ const _kTransformRdLambda32 = 3000.0;
 /// favoring 16x16 there), because it had no visibility into the real
 /// context-adaptive entropy cost (see doc/spec_notes.md's L3 write-up).
 ///
-/// Returns **two or three** fully independent, already-quantized-and-
-/// committed candidates — `(bootstrapBlocks, level1Blocks, level1DcInt,
-/// level2Blocks, level2DcInt)`, the last two null unless
-/// [VardctL0Config.enableTransform32] is on — not just the layout this
-/// decision favors: the caller (`encodeLossyVardctL0`) assembles a real
-/// body for *every* non-null candidate and keeps whichever is actually
-/// smaller, the same real-assembly safety net `_chooseAcClustering`/RDOQ
-/// already use elsewhere in this file, applied one level up (per-image
-/// instead of per-block-channel) — this decision's own cost estimate is
-/// only ever a bootstrap-frozen approximation (see point 3 below), so
-/// unlike RDOQ it cannot promise never-worse on its own; the outer safety
-/// net is what makes the combination never-worse. Point 5/6 (the
-/// 16x16/8x8-vs-32x32 merge, when enabled) needs its *own* real-assembly
-/// comparison against level1 specifically, not just against
-/// `bootstrapBlocks` — measured directly (not just theorized): on
-/// `distance=8.0` gradient content, the per-region estimate alone picked
-/// 32x32 for a genuine ~5% size *regression* vs. level1's own decision
-/// (still smaller than plain 8x8, so the two-candidate version of this
-/// safety net wouldn't have caught it) — the same "estimates can't
-/// resolve near-ties, verify by real assembly" lesson RDOQ's own
-/// real-bits check and this function's own level1-vs-bootstrap comparison
-/// already establish, just one level deeper. The candidates share no
-/// mutable `_PlacedBlock` state (see [_PlacedBlock.copy]'s doc comment) —
-/// callers must not run [_PlacedBlock.computeAndQuantize] on any returned
-/// block (all are already committed).
+/// Returns a list of fully independent, already-quantized-and-committed
+/// candidate layouts, always starting with the plain all-8x8 bootstrap and
+/// growing by at most one entry per cascade level that actually changed
+/// something — not just the single layout this decision favors: the
+/// caller (`encodeLossyVardctL0`) assembles a real body for *every*
+/// candidate and keeps whichever is actually smaller, the same
+/// real-assembly safety net `_chooseAcClustering`/RDOQ already use
+/// elsewhere in this file, applied one level up (per-image instead of
+/// per-block-channel) — this decision's own cost estimate is only ever a
+/// bootstrap-frozen approximation (see point 3 below), so unlike RDOQ it
+/// cannot promise never-worse on its own; the outer safety net is what
+/// makes the combination never-worse regardless of how many cascade
+/// levels are enabled. Because the bootstrap candidate is always first in
+/// the list and every later candidate must have beaten its own
+/// immediately-prior candidate to exist at all (see the cascade loop
+/// below), `min(assemble(c).length for c in candidates) <= bootstrap`
+/// holds structurally — this is what closes the exact gap a real
+/// end-to-end smoke test found during the 32x32 slice: a level whose
+/// per-region estimate looks fine in isolation can still be a genuine, if
+/// modest, size *regression* against the immediately-prior level (not
+/// just against the original bootstrap), and a candidate list checked
+/// only pairwise against the oldest baseline would miss that. The
+/// candidates share no mutable `_PlacedBlock` state (see
+/// [_PlacedBlock.copy]'s doc comment) — callers must not run
+/// [_PlacedBlock.computeAndQuantize] on any returned block (all are
+/// already committed).
 ///
 /// **Method** (mirrors `_chooseHfMultRd`'s already-shipped
 /// bootstrap-then-freeze pattern, generalized from "which hfMult" to
@@ -915,13 +907,21 @@ const _kTransformRdLambda32 = 3000.0;
 ///    the bootstrap's 8x8 DC values at those 4 cells with the
 ///    LLF-inverted 16x16-consistent ones); a region that stays 8x8 needs
 ///    no further work — its bootstrap commit already stands.
-(
-  List<_PlacedBlock> bootstrapBlocks,
-  List<_PlacedBlock> level1Blocks,
-  List<Int32List> level1DcInt,
-  List<_PlacedBlock>? level2Blocks,
-  List<Int32List>? level2DcInt,
-) _decideTransformLayout(
+/// 5. For each size in [_cascadeSizes] up to [VardctL0Config.maxTransformSize]
+///    (32, then 64, then 128, then 256), repeat steps 3/4 one level up:
+///    merge the *previous* cascade level's layout (mixed 8x8/16x16/.../
+///    previous-size blocks) into the next size wherever a freshly
+///    quantized candidate of that size beats the real summed cost of the
+///    smaller blocks it would replace, using the same frozen bootstrap
+///    code-length table every level shares (transform-type choice never
+///    shifts which cluster a token routes to, only what value lands
+///    there, regardless of which two sizes are being compared). A level
+///    that merges nothing is skipped (not appended as a candidate) but
+///    the cascade still tries the *next* size up on the unchanged layout
+///    — a size skipping over an intermediate one is architecturally rare
+///    but not provably impossible, and this project's own methodology is
+///    to verify by real assembly rather than assume monotonicity.
+List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     List<List<Float32List>> planes,
     _ChromaFromLumaFit cfl,
     double refStep,
@@ -937,8 +937,8 @@ const _kTransformRdLambda32 = 3000.0;
     int groupsX,
     int groupsY,
     double? lambdaOverride,
-    bool enableTransform32,
-    double? lambdaOverride32) {
+    int maxTransformSize,
+    double? lambdaOverrideBeyond16) {
   final ctx8 = ctxByType[_tt8.type]!;
   final ctx16 = ctxByType[_tt16.type]!;
   // 1. Bootstrap: quantize the whole image as all-8x8, committing into
@@ -1047,110 +1047,138 @@ const _kTransformRdLambda32 = 3000.0;
       }
     }
   }
-  if (!enableTransform32) {
-    return (bootstrapBlocks, result, dcIntFinal, null, null);
-  }
+  // Level-1 is always a candidate slot, but only actually appended when it
+  // changed something — no region swapped to 16x16 means `result`/
+  // `dcIntFinal` are content-identical to `bootstrapBlocks`/
+  // `dcIntBootstrap` (every kept cell is an exact `.copy()`, and
+  // `dcIntFinal` is an untouched clone), so reporting it as a separate
+  // candidate would just make the caller assemble an identical body twice
+  // at ~2x cost for zero size difference — exactly the case for manga's
+  // dominant content types. `result.length == bh * bw` iff zero swaps
+  // happened (each swap removes 3 entries from the flat list).
+  final candidates = <(List<_PlacedBlock>, List<Int32List>)>[
+    (bootstrapBlocks, dcIntBootstrap),
+    if (result.length != bh * bw) (result, dcIntFinal),
+  ];
 
-  // 5/6. Second merge level (Tranche A's first extra size, DCT 32x32),
-  // structurally identical to 3/4 one level up: for every 2x2-aligned
-  // 32x32-pixel region (four already-decided 16x16-or-8x8 candidates from
-  // `result`), compare their real summed cost against a candidate 32x32
-  // block's, reusing the same frozen bootstrap code-length table — sound
-  // for the same reason step 3/4's 16x16 decision already establishes
-  // (transform-type choice never shifts which cluster a token routes to,
-  // only what values land in it). `resultBlockAt` extends `blockAt`'s
-  // one-cell-per-block bootstrap lookup to `result`'s mixed footprints; a
-  // 16x16/8x8 block can never straddle a 4x4-aligned 32x32 region (16x16
-  // blocks only start at even coordinates, and 4 is a multiple of 2), so
-  // every region's distinct blocks are cleanly enumerable via its 16
-  // underlying 8x8-cell positions.
-  final ctx32 = ctxByType[_tt32.type]!;
-  final resultBlockAt = List<_PlacedBlock?>.filled(bh * bw, null);
-  for (final block in result) {
-    final n = block.tt.dctSelectHeight;
-    for (var dy = 0; dy < n; dy++) {
-      for (var dx = 0; dx < n; dx++) {
-        resultBlockAt[(block.by + dy) * bw + (block.bx + dx)] = block;
+  // 5. Generic cascade for every size beyond 16 up to [maxTransformSize]
+  // (Tranche A: 32, then 64, then 128, then 256), structurally identical
+  // to 3/4 one level up each time: for every aligned candidate region
+  // (several already-decided blocks from the *previous* cascade level),
+  // compare their real summed cost against a freshly quantized candidate
+  // of the next size up, reusing the same frozen bootstrap code-length
+  // table — sound for the same reason step 3/4's 16x16 decision already
+  // establishes (transform-type choice never shifts which cluster a
+  // token routes to, only what value lands there). `layoutBlockAt`
+  // extends `blockAt`'s one-cell-per-block bootstrap lookup to the
+  // current layout's mixed footprints; a smaller block can never
+  // straddle a larger aligned region (every footprint starts on a
+  // multiple of its own size, and each cascade size is a multiple of the
+  // previous one), so every region's distinct blocks are cleanly
+  // enumerable via their underlying 8x8-cell positions. A level that
+  // merges nothing is skipped as a *candidate* but the cascade still
+  // tries the next size up on the unchanged layout — see this function's
+  // doc comment for why "no 32x32 merge anywhere" doesn't provably rule
+  // out a 64x64 merge helping regardless.
+  var layout = result;
+  var dcInt = dcIntFinal;
+  final lambdaBeyond16 =
+      (lambdaOverrideBeyond16 ?? _kTransformRdLambdaBeyond16) *
+          refStep *
+          refStep;
+  for (final tt in _cascadeSizes) {
+    if (tt.pixelWidth > maxTransformSize) break;
+    final ctx = ctxByType[tt.type]!;
+    final stride = tt.dctSelectHeight;
+    final layoutBlockAt = List<_PlacedBlock?>.filled(bh * bw, null);
+    for (final block in layout) {
+      final n = block.tt.dctSelectHeight;
+      for (var dy = 0; dy < n; dy++) {
+        for (var dx = 0; dx < n; dx++) {
+          layoutBlockAt[(block.by + dy) * bw + (block.bx + dx)] = block;
+        }
       }
     }
-  }
-  // `result` only ever holds 8x8/16x16 blocks (this is the pass that would
-  // introduce a third type) — rate8 is already precomputed per cell;
-  // 16x16's rate is recomputed on demand (cheap, and only once per
-  // distinct block thanks to `seen` below) rather than threaded out of the
-  // first merge loop, keeping the two passes decoupled.
-  double blockRateIn(_PlacedBlock block) {
-    if (block.tt == _tt8) return rate8[block.by * bw + block.bx];
-    return _blockRate(ctx16, hfctx, block.acInt,
-        predictedOut[blockAt[block.by * bw + block.bx]!]!, clusterMap, lengths);
-  }
+    // An 8x8 block reuses the precomputed `rate8` array; any larger block
+    // (16x16 up to the previous cascade size) gets its real rate computed
+    // on demand against its own bootstrap-origin `predicted` value — cheap,
+    // and only once per distinct block thanks to `seen` below.
+    double blockRateIn(_PlacedBlock block) {
+      if (block.tt == _tt8) return rate8[block.by * bw + block.bx];
+      return _blockRate(
+          ctxByType[block.tt.type]!,
+          hfctx,
+          block.acInt,
+          predictedOut[blockAt[block.by * bw + block.bx]!]!,
+          clusterMap,
+          lengths);
+    }
 
-  final lambda32 =
-      (lambdaOverride32 ?? _kTransformRdLambda32) * refStep * refStep;
-  final dcIntFinal2 = [for (final ch in dcIntFinal) Int32List.fromList(ch)];
-  final result2 = <_PlacedBlock>[];
-  final covered2 = List<bool>.filled(bh * bw, false);
-  var any32 = false;
-  for (var by = 0; by < bh; by++) {
-    for (var bx = 0; bx < bw; bx++) {
-      if (covered2[by * bw + bx]) continue;
-      final canPair32 =
-          by % 4 == 0 && bx % 4 == 0 && by + 3 < bh && bx + 3 < bw;
-      _PlacedBlock? merged32;
-      if (canPair32) {
-        final seen = <_PlacedBlock>{};
-        var cost16Mix = 0.0;
-        for (var dy = 0; dy < 4; dy++) {
-          for (var dx = 0; dx < 4; dx++) {
-            final block = resultBlockAt[(by + dy) * bw + (bx + dx)]!;
-            if (seen.add(block)) {
-              cost16Mix += block.distortion + lambda32 * blockRateIn(block);
+    final dcIntNext = [for (final ch in dcInt) Int32List.fromList(ch)];
+    final next = <_PlacedBlock>[];
+    final covered = List<bool>.filled(bh * bw, false);
+    var anyMerge = false;
+    for (var by = 0; by < bh; by++) {
+      for (var bx = 0; bx < bw; bx++) {
+        if (covered[by * bw + bx]) continue;
+        final canPair = by % stride == 0 &&
+            bx % stride == 0 &&
+            by + stride - 1 < bh &&
+            bx + stride - 1 < bw;
+        _PlacedBlock? merged;
+        if (canPair) {
+          final seen = <_PlacedBlock>{};
+          var costIn = 0.0;
+          for (var dy = 0; dy < stride; dy++) {
+            for (var dx = 0; dx < stride; dx++) {
+              final block = layoutBlockAt[(by + dy) * bw + (bx + dx)]!;
+              if (seen.add(block)) {
+                costIn +=
+                    block.distortion + lambdaBeyond16 * blockRateIn(block);
+              }
             }
           }
-        }
 
-        final candidate32 = _PlacedBlock(by, bx, _tt32);
-        final coeffBuf32 =
-            candidate32.computeCoeffBuf(planes, cfl, scratchA, scratchB);
-        final (mult32, quant32) = candidate32.chooseCandidate(
-            coeffBuf32, refStep, sd, ctx32.rawWeight, scaleFactor);
-        final rate32 = _blockRate(ctx32, hfctx, quant32.ac,
-            predictedOut[blockAt[by * bw + bx]!]!, clusterMap, lengths);
-        final cost32 = quant32.distortion + lambda32 * rate32;
+          final candidate = _PlacedBlock(by, bx, tt);
+          final coeffBuf =
+              candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
+          final (mult, quant) = candidate.chooseCandidate(
+              coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
+          final rate = _blockRate(ctx, hfctx, quant.ac,
+              predictedOut[blockAt[by * bw + bx]!]!, clusterMap, lengths);
+          final cost = quant.distortion + lambdaBeyond16 * rate;
 
-        if (cost32 < cost16Mix) {
-          candidate32.commit(quant32, mult32, dcIntFinal2, bw);
-          merged32 = candidate32;
-        }
-      }
-      if (merged32 != null) {
-        any32 = true;
-        for (var dy = 0; dy < 4; dy++) {
-          for (var dx = 0; dx < 4; dx++) {
-            covered2[(by + dy) * bw + (bx + dx)] = true;
+          if (cost < costIn) {
+            candidate.commit(quant, mult, dcIntNext, bw);
+            merged = candidate;
           }
         }
-        result2.add(merged32);
-      } else {
-        final block = resultBlockAt[by * bw + bx]!;
-        covered2[by * bw + bx] = true;
-        // Only emit at the block's own origin — a 16x16 block is visited
-        // (and skipped-as-covered) up to 4 times by this raster scan, but
-        // must land in result2 exactly once.
-        if (block.by == by && block.bx == bx) {
-          result2.add(block.copy());
+        if (merged != null) {
+          anyMerge = true;
+          for (var dy = 0; dy < stride; dy++) {
+            for (var dx = 0; dx < stride; dx++) {
+              covered[(by + dy) * bw + (bx + dx)] = true;
+            }
+          }
+          next.add(merged);
+        } else {
+          final block = layoutBlockAt[by * bw + bx]!;
+          covered[by * bw + bx] = true;
+          // Only emit at the block's own origin — a multi-cell block is
+          // visited (and skipped-as-covered) more than once by this
+          // raster scan, but must land in `next` exactly once.
+          if (block.by == by && block.bx == bx) {
+            next.add(block.copy());
+          }
         }
       }
     }
+    if (!anyMerge) continue; // try the next size up on the unchanged layout
+    layout = next;
+    dcInt = dcIntNext;
+    candidates.add((layout, dcInt));
   }
-  // Mirrors the level1Blocks.length check above: no region actually swapped
-  // to 32x32 means result2/dcIntFinal2 are content-identical to
-  // result/dcIntFinal, so reporting them as absent lets the caller skip a
-  // third real-assembly pass for zero size difference.
-  if (!any32) {
-    return (bootstrapBlocks, result, dcIntFinal, null, null);
-  }
-  return (bootstrapBlocks, result, dcIntFinal, result2, dcIntFinal2);
+  return candidates;
 }
 
 /// One placed HF block: either an 8x8 or 16x16 DCT at block-grid origin

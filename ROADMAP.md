@@ -7,6 +7,18 @@ beats `cjxl -e3` on real manga pages. This file tracks what's next.
 Status legend: 🔲 not started · 🔨 in progress · ✅ done (kept here for
 context until it ships in a release).
 
+**Full 27-transform-type support's success criterion (settled
+2026-07-05, after round 7 shipped DCT 32x32 off-by-default and it wasn't
+obvious from the outside whether that meant the initiative had stalled):
+this is a completeness goal, not a manga-ROI-gated one.** A transform
+type's *existence* — correctly implemented, djxl-verified, never-worse
+via real-assembly safety net — is not gated on whether it measurably
+helps `manga_samples/` content; keep building out Tranches A/B/C
+regardless. A transform type's *default* (on vs. off) still is gated on
+that, same discipline round 7 already established for 32x32 (correct and
+shipped, but off because the real win there was -0.0% to -0.6%, not
+worth its ~40% encode-time cost). Don't conflate the two again.
+
 ---
 
 ## Headline: lossy (VarDCT) encoding — "a true codec"
@@ -109,10 +121,11 @@ quality lives.
     estimate plus a whole-image real-assembly safety net, closing exactly
     this gap, and `enableVariableTransforms` now defaults to **on**.
   Full 27-transform-type support (this encoder only added 8x8/16x16 as of
-  round 6; DCT 32x32 added in round 7 below, 24 types remain) and a real
-  rate-distortion search over transform size itself (round 6/7 choose
-  between fixed candidates per region, not a search) remain open — see
-  round 7's write-up for the phased plan covering the rest.
+  round 6; rounds 7/8 below completed Tranche A — all square DCT sizes,
+  8x8 through 256x256, 6 of 27 types; 21 remain across Tranches B/C) and a
+  real rate-distortion search over transform size itself (rounds 6/7/8
+  choose between fixed candidates per region, not a search) remain open —
+  see round 8's write-up for the phased plan covering the rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -379,13 +392,49 @@ output for where the gap actually is.
   an opt-in for content that genuinely has large flat regions. See
   doc/spec_notes.md for the full write-up (both the synthetic numbers and
   the real-manga finding that reverted the default) and doc/BENCHMARKS.md
-  for the updated numbers. 64x64/128x128/256x256 should be small
-  follow-ups now that the plumbing is generic (one more size in the map +
-  one more quadtree merge level + recalibrate each) — but any future size
-  needs the SAME real-content validation step before defaulting on, not
-  just synthetic/corpus calibration; Tranches B (rectangular, needs
-  flip/orientation handling) and C (bespoke single-footprint types, no
-  generic form) remain fully unscoped.
+  for the updated numbers.
+- ✅ **Round 8 / full 27-transform-type support, Tranche A completed:
+  64x64/128x128/256x256.** After round 7, it wasn't clear from the outside
+  whether "shipped off-by-default" meant this initiative had stalled —
+  the user had been asking for it across sessions. Asked directly, the
+  success criterion settled (see this file's top note, 2026-07-05):
+  completeness, not manga-ROI-gated. On that basis, finished Tranche A:
+  `VardctL0Config.enableTransform32` (bool) generalized to
+  `maxTransformSize` (16/32/64/128/256), and the hardcoded second merge
+  level generalized to a loop over `_cascadeSizes` up to that value —
+  structurally never-worse (bootstrap is always a candidate, every later
+  one beat its own immediately-prior candidate to exist), not per-level
+  patched, closing round 7's safety-net-gap class of bug generically. All
+  four sizes verified: forward/inverse identity + LLF-inversion tests at
+  every size's `dctSelectHeight` grid, plus a dedicated correctness test
+  for the edge case no smaller size reaches — a 256x256 candidate exactly
+  fills one whole *group*, found to need a 256x256-canvas/distance=64
+  gradient to make the *entire* cascade the real winner (not just an
+  assembled-and-discarded candidate), via `jxl.encdebug` sweeping rather
+  than guessing. Full suite green (313 tests). Also verified the
+  *default* path (`maxTransformSize: 16`, unchanged from round 7) itself
+  didn't regress despite `_activeTransformTypes` now always constructing
+  64x64/128x128/256x256's quant-weight tables even when unused: a
+  controlled `git stash` A/B (3 trials, same real manga page and corpus
+  golden, before vs. after) found byte-identical output and no measurable
+  timing difference — the one-time table cost is negligible against a
+  multi-second encode. Per advice going in
+  (bigger transforms had already helped less than 32x32, which was
+  already negligible), skipped a full multi-distance recalibration in
+  favor of reusing the shared lambda and running one real-manga sanity
+  check first: same two `manga_samples/` chapters round 7 used, real win
+  **-0.1% to -0.6%** (no better than 32x32 alone) for **~2x** encode time
+  (four extra cascade levels tried per image instead of one). No
+  surprise, so no deeper calibration was warranted.
+  `VardctL0Config.maxTransformSize` stays at its default of **16**. This
+  completes Tranche A (all square DCT sizes: 8x8 through 256x256, 6 of 27
+  types now implemented). See doc/spec_notes.md for the full write-up.
+  Tranches B (12 rectangular types, needs a flip/orientation layer
+  `_scanChannelValues`/`quantizeCandidate` don't have yet) and C (9
+  bespoke single-footprint types, needs from-scratch forward derivations,
+  no shared machinery to lean on) remain fully unscoped — per the settled
+  criterion, picking these up next should proceed on completeness
+  grounds, not be blocked on predicting their manga ROI ahead of time.
 
 ---
 

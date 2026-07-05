@@ -66,12 +66,13 @@ playback, background-isolate encode), use
   weighted-predictor DC prediction, a per-AC-coefficient rate-distortion
   search (RDOQ, on by default), adaptive 8x8/16x16 transform-size
   selection (on by default), multi-group and multi-LF-group support
-- Gaborish/EPF filters and an additional 32x32 transform size are
-  implemented but **off by default** — filters measurably help
-  photographic content but hurt manga's screentone/line-art content;
-  32x32 helps synthetic/corpus content with large flat regions but was
-  found, against real manga chapter pages, to win only -0.0% to -0.6%
-  there for a ~40% encode-time cost (see
+- Gaborish/EPF filters and larger square transform sizes up to 256x256
+  (`maxTransformSize`, opt-in) are implemented but **off by default** —
+  filters measurably help photographic content but hurt manga's
+  screentone/line-art content; bigger transforms help synthetic/corpus
+  content with large flat regions but were found, against real manga
+  chapter pages, to win only -0.0% to -0.6% there for a 40-100%+
+  encode-time cost depending on how far the cascade is raised (see
   [doc/spec_notes.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/spec_notes.md)
   in the repository for both sets of numbers)
 - Correctness is djxl-verified; **compression efficiency is a work in
@@ -79,8 +80,10 @@ playback, background-isolate encode), use
   screentone content at low-to-mid `distance` (0.5-2.0), files are
   already *smaller* than `cjxl -e1` (0.81-0.94x, measured); on smooth
   photographic content the gap is larger (1.5x+), mostly structural
-  (only 3 of 27 transform types implemented — 8x8, 16x16, 32x32 opt-in —
-  no transform-type RD search yet). See
+  (only 6 of 27 transform types implemented — 8x8/16x16 on by default,
+  32x32/64x64/128x128/256x256 opt-in — no transform-type RD search yet).
+  Full 27-transform-type support is tracked as a completeness goal
+  independent of manga ROI. See
   [doc/BENCHMARKS.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/BENCHMARKS.md)
   in the repository for the full, reproducible comparison
 

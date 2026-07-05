@@ -1541,21 +1541,116 @@ stays covered even with the default off) with `koni_jxl_flutter`'s suite
 also green. See `doc/BENCHMARKS.md` for the updated headline numbers
 (reverted to reflect the off default).
 
-**What's next.** 64x64/128x128/256x256 (the rest of Tranche A) should be
-small follow-ups now that the plumbing is generic — each is "one more
-size in `_activeTransformTypes` + one more quadtree merge level (32x32→
-64x64, etc.) + its own calibration sweep." `_maxTransformPixelSize` needs
-bumping to match. **Any future size needs the same real-`manga_samples/`
-validation step before ever defaulting on** — synthetic/corpus numbers
-alone are not sufficient evidence for this project's manga use case,
-per the finding above. Tranche B (12 rectangular types) needs the flip/
-orientation layer this round deliberately didn't build (`_scanChannelValues`
-and `quantizeCandidate`'s AC loop both currently assume square). Tranche C
-(9 bespoke single-footprint types) needs from-scratch forward derivations
-mirroring `vardct_inverter.dart`'s bespoke inverse code, plus porting
-`HfGlobal`'s private weight-generation logic into encoder-callable form —
-no shared machinery to lean on, closer to a series of small research tasks
-than mechanical generalization. See ROADMAP.md for the phased plan.
+### Lossy (VarDCT) encoder — Tranche A completed: 64x64/128x128/256x256, a generalized cascade, and a settled success criterion
+
+Round 7 (above) had briefly conflated two separate questions — "does this
+transform type work" and "does it help manga content" — treating a
+negative answer to the second as a reason to slow down on the first. The
+user surfaced this directly after round 7 shipped: full 27-transform-type
+support had been a standing ask across sessions, and it kept looking
+unstarted from the outside because each round scoped down to a small
+provable slice. Asked explicitly, the answer settled the ambiguity (see
+ROADMAP.md, dated 2026-07-05): **full 27-transform-type support is a
+completeness goal, not gated on manga ROI.** A type's *existence* —
+correct, djxl-verified, never-worse — is unconditional; only its
+*default* stays ROI-gated, exactly the split round 7 already used for
+32x32. This round finished Tranche A on that basis.
+
+**Generalized the cascade instead of hand-copying three more merge
+levels.** Round 7's `_decideTransformLayout` had one hardcoded 8x8-vs-16x16
+step plus one hardcoded 16x16-vs-32x32 step; adding 64x64/128x128/256x256
+by copying that second step three more times would have tripled the
+surface area for the exact class of bug round 7 already found once (a
+level's estimate regressing against its immediate predecessor). Instead:
+`VardctL0Config.enableTransform32` (bool) became `maxTransformSize` (int:
+16/32/64/128/256 — a single depth knob, since a clean N-level loop can't
+be driven by N independent booleans), and the second merge step became a
+generic loop over `_cascadeSizes = [32, 64, 128, 256]` that stops at
+`maxTransformSize`. The loop's correctness argument is structural, not
+per-level: `_decideTransformLayout` returns bootstrap always first, and
+every later candidate exists only because it beat its own
+immediately-prior candidate's *estimate* — so `min(assemble(c).length for
+c in candidates) <= assemble(bootstrap).length` holds by construction
+regardless of how many levels fire, closing the round-7 gap generically
+instead of per-level. A level that finds no merge is skipped as a
+candidate, but the cascade still tries the next size up on the unchanged
+layout (an intermediate size finding nothing doesn't provably rule out a
+bigger jump helping — this project's methodology is to verify by real
+assembly, not assume monotonicity). `_kTransformRdLambda32` became
+`_kTransformRdLambdaBeyond16`, shared across all four levels beyond 16 —
+per the advice below, not recalibrated per size.
+
+**Verification, in order** (matches this project's own stated
+methodology): (1) forward/inverse identity + LLF-inversion tests
+(`vardct_forward_test.dart`) at all four new sizes' `dctSelectHeight`
+grids (8, 16, 32 for 64x64/128x128/256x256, matching 32x32's 4x4 case) —
+one parameterized test group instead of four hand-copied ones, mirroring
+the cascade's own genericity. All pass at the same tolerances 32x32
+used. (2) A dedicated end-to-end correctness test exercising the
+edge case no smaller size gets near: a 256x256 candidate exactly fills
+one whole *group* (32x32 8x8-cells, the same granularity
+`groupsX`/`groupsY` partition the image into), a footprint HfMetadata
+placement/entropy-coding had never been asked to handle. Found by
+sweeping canvas size and distance with `jxl.encdebug` (not guessed): a
+256x256 canvas with a smooth gradient at distance=64 is the minimal
+config where the *entire* cascade (8x8→16x16→32x32→64x64→128x128→256x256)
+is the real-assembled winner, not just an intermediate candidate tried
+and discarded — this is now a permanent regression test. (3) Full suite
+green throughout (313 `koni_jxl` tests, `koni_jxl_flutter` unaffected).
+
+**Real-manga sanity check, not a full recalibration.** Advice going in:
+bigger transforms had already helped manga *less* than 32x32 (which was
+already negligible), so repeating the full multi-distance-sweep-plus-
+real-manga dance three more times would mostly re-confirm what round 7
+already found, at real time cost. Instead: reuse the shared lambda
+constant, verify correctness, and run one quick real-manga check to see
+if anything *surprising* shows up before deciding whether deeper
+calibration is warranted. It wasn't needed — the same two
+`manga_samples/` chapters round 7 used (gitignored, copyrighted, never
+committed), `maxTransformSize: 256` vs. `16`, distance 1.0 and 4.0: real
+win **-0.1% to -0.6%**, no better than 32x32 alone, for roughly **2x**
+encode time (not ~1.4x — four extra cascade levels are now tried per
+image instead of one; e.g. one page went from 8.8s to 18.2s at
+distance=1.0). No RMSE change, no anomalous large-DCT deviation. Same
+conclusion as round 7, reached in one quick check instead of a full
+sweep: `VardctL0Config.maxTransformSize` stays at its default of **16**.
+
+**Verified the default path itself didn't regress.** Adding
+`_tt64`/`_tt128`/`_tt256` to `_activeTransformTypes` (built unconditionally
+every encode call, so their quant-weight tables — including a 256x256
+one, 65536 entries per channel — are now always constructed even on the
+default `maxTransformSize: 16` path that never uses them) was flagged as
+worth measuring, not assuming free, before shipping: an isolated
+before/after data point looked suspicious (5% slower at byte-identical
+output on one page). A controlled back-to-back check — `git stash` to the
+pre-round-8 code, 3 trials each on the same real `manga_samples/` page
+and the same corpus golden, same machine, same session — found
+byte-identical output both times and no measurable timing difference
+(8326-8379ms across both versions on the manga page; 16856-16970ms on the
+corpus golden) — the one-time table-construction cost is genuinely
+negligible against a multi-second full-image encode, so no gating was
+needed. This is the generalizable lesson: a single isolated timing sample
+can look like a regression from ordinary system noise — a real A/B on
+identical code paths is what actually answers the question, in either
+direction (this project has hit the opposite mistake — assuming a change
+is free without measuring — often enough that "measure, don't assume" now
+cuts both ways).
+
+**Shipped**: 64x64/128x128/256x256 all exist, are correct, and are
+covered by tests — completing Tranche A. The default remains 16 (the
+same behavior as round 7's shipped state, confirmed unregressed above);
+raising it is a deliberate opt-in for content that genuinely has large
+flat regions, not a recommended default for manga. Tranches B (12
+rectangular types, needs the flip/orientation layer
+`_scanChannelValues` and `quantizeCandidate`'s AC loop don't have yet)
+and C (9 bespoke single-footprint types, needs from-scratch forward
+derivations mirroring `vardct_inverter.dart`'s bespoke inverse code plus
+porting `HfGlobal`'s private weight-generation logic into
+encoder-callable form — no shared machinery to lean on, closer to a
+series of small research tasks than mechanical generalization) remain
+fully unscoped. Per the settled criterion above, future work on either
+should proceed on completeness grounds regardless of any individual
+type's manga ROI — only its default depends on that.
 
 ## Robustness
 

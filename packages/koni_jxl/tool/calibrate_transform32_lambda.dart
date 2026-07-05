@@ -4,21 +4,24 @@ import 'dart:typed_data';
 
 import 'package:koni_jxl/src/encode/vardct/vardct_l0_encoder.dart';
 
-/// Calibrates `_kTransformRdLambda32` (the second, 16x16/8x8-vs-32x32
-/// merge level's rate/distortion trade-off constant,
-/// `VardctL0Config.enableTransform32`) by sweeping it against real corpus
+/// Calibrates `_kTransformRdLambdaBeyond16` (the shared rate/distortion
+/// trade-off constant for every cascade level beyond 16x16,
+/// `VardctL0Config.maxTransformSize`) by sweeping it against real corpus
 /// content, manga-typical screentone/line-art content, and the encoder's
 /// own synthetic regression-test patterns — across the encoder's **full
 /// distance range** (0.5-8.0), the same lesson `calibrate_transform_lambda
 /// .dart` and `calibrate_rdoq_lambda.dart` both learned the hard way: a
 /// single-distance calibration can look perfect at that one point and
-/// still regress badly elsewhere.
+/// still regress badly elsewhere. Written for the 16-vs-32 level
+/// specifically; per ROADMAP.md (2026-07-05) further cascade sizes don't
+/// need this full sweep repeated unless a quick real-manga sanity check at
+/// the shared constant looks surprising.
 ///
 /// The baseline here is `enableVariableTransforms: true,
-/// enableTransform32: false` (this encoder's actual shipped default,
-/// level 1 only) — not `enableVariableTransforms: false` — since the
-/// question this tool answers is specifically "does adding the second
-/// merge level help beyond what level 1 already does," matching
+/// maxTransformSize: 16` (this encoder's actual shipped default, level 1
+/// only) — not `enableVariableTransforms: false` — since the question
+/// this tool answers is specifically "does adding the second merge level
+/// help beyond what level 1 already does," matching
 /// `_decideTransformLayout`'s doc comment on why level 2 needs its own
 /// real-assembly comparison against level 1, not just against plain 8x8.
 ///
@@ -103,8 +106,8 @@ extension on VardctL0Config {
       acScale: acScale,
       enableVariableTransforms: enableVariableTransforms,
       transformRdLambdaOverride: transformRdLambdaOverride,
-      enableTransform32: true,
-      transform32RdLambdaOverride: lambda,
+      maxTransformSize: 32,
+      transformRdLambdaOverrideBeyond16: lambda,
       enableRdHfMult: enableRdHfMult,
       rdHfMultLambdaOverride: rdHfMultLambdaOverride,
       enableRdoq: enableRdoq,

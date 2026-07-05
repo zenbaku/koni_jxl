@@ -611,7 +611,7 @@ void main() {
             quantLF: base.quantLF,
             acScale: base.acScale,
             enableVariableTransforms: true,
-            enableTransform32: true));
+            maxTransformSize: 32));
     final withoutIt = encodeLossyVardctL0(pixels,
         width: w,
         height: h,
@@ -619,7 +619,7 @@ void main() {
             quantLF: base.quantLF,
             acScale: base.acScale,
             enableVariableTransforms: true,
-            enableTransform32: false));
+            maxTransformSize: 16));
     expect(withIt.length, lessThan(withoutIt.length),
         reason: 'DCT 32x32 (${withIt.length}B) should beat 16x16-mix-only '
             '(${withoutIt.length}B) on a large smooth gradient');
@@ -653,6 +653,102 @@ void main() {
         }
       }
       final rmse = math.sqrt(sumSq / n);
+      expect(rmse, lessThan(40), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
+  test(
+      'the full cascade (up to DCT 256x256) places, entropy-codes, and '
+      'round-trips correctly when it genuinely wins', () {
+    // Correctness coverage for 64x64/128x128/256x256 (the rest of Tranche
+    // A, generalized from 32x32's proven architecture — see ROADMAP.md,
+    // 2026-07-05: this is a completeness goal, not gated on real-manga
+    // ROI, so this test only needs to prove each size works, not that it
+    // helps). A 256x256-pixel candidate exactly fills one whole group (32
+    // 8x8-cells square) — a footprint no smaller size gets close to — so
+    // this specifically exercises HfMetadata placement/entropy-coding at
+    // that edge case, not just the merge-decision arithmetic the identity
+    // tests in vardct_forward_test.dart already cover in isolation. Found
+    // empirically (jxl.encdebug) rather than assumed: a 256x256 canvas
+    // (single group) with a smooth gradient at distance=64 is the minimal
+    // config where the *entire* cascade (8x8->16x16->32x32->64x64->
+    // 128x128->256x256) is the genuinely smallest, real-assembled
+    // candidate — not just an intermediate one tried and discarded.
+    const w = 256, h = 256;
+    final pixels = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final v = (x * 255 / w).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = (v * 0.8).round();
+        pixels[i++] = 255 - v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(64.0);
+    final encoded = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            maxTransformSize: 256));
+
+    // Asserts the cascade actually engaged at this config, not just that
+    // the feature is enabled — the test's name promises "when it genuinely
+    // wins," and without this a future change that stopped anything past
+    // 16x16 from ever winning here would stay green while silently
+    // dropping the only coverage of the 256x256-fills-a-group placement
+    // path (128x128 doesn't reach a full 32-cell group; only 256x256 does).
+    final withoutCascade = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            maxTransformSize: 16));
+    expect(encoded.length, lessThan(withoutCascade.length),
+        reason: 'the cascade (${encoded.length}B) should beat '
+            'level-1-only (${withoutCascade.length}B) at this config, '
+            'confirming something past 16x16 genuinely won');
+
+    final image = JxlDecoder.decode(encoded);
+    expect(image.width, w);
+    expect(image.height, h);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_t256');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(encoded);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, w);
+      expect(ref.height, h);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < w * h; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      // Large-DCT content ("16x32 and larger") gets the looser threshold
+      // this project's inherited decode-side deviation already documents
+      // (doc/spec_notes.md) — same generous bound the 32x32 test above
+      // uses, not a tighter 8x8/16x16 bar.
       expect(rmse, lessThan(40), reason: 'rmse $rmse');
     } finally {
       dir.deleteSync(recursive: true);
