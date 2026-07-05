@@ -121,11 +121,13 @@ quality lives.
     estimate plus a whole-image real-assembly safety net, closing exactly
     this gap, and `enableVariableTransforms` now defaults to **on**.
   Full 27-transform-type support (this encoder only added 8x8/16x16 as of
-  round 6; rounds 7/8 below completed Tranche A — all square DCT sizes,
-  8x8 through 256x256, 6 of 27 types; 21 remain across Tranches B/C) and a
-  real rate-distortion search over transform size itself (rounds 6/7/8
-  choose between fixed candidates per region, not a search) remain open —
-  see round 8's write-up for the phased plan covering the rest.
+  round 6; rounds 7/8 completed Tranche A — all square DCT sizes, 8x8
+  through 256x256, 6 of 27 types; round 9 below started Tranche B with
+  the first rectangular pair, DCT 16x8/8x16, 8 of 27 types; 19 remain
+  across Tranches B/C) and a real rate-distortion search over transform
+  size itself (rounds 6-9 choose between fixed candidates per region, not
+  a search) remain open — see round 9's write-up for the phased plan
+  covering the rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -435,6 +437,96 @@ output for where the gap actually is.
   no shared machinery to lean on) remain fully unscoped — per the settled
   criterion, picking these up next should proceed on completeness
   grounds, not be blocked on predicting their manga ROI ahead of time.
+
+- ✅ **Round 9 / Tranche B, first slice: DCT 16x8/8x16.** A research pass
+  found most of the supporting machinery (`transform_type.dart`,
+  `getDCTQuantWeights`, `getNaturalOrder`, `HfMetadata._placeBlock`,
+  `dct.dart`'s forward/inverse DCT, the decoder's flip-aware
+  `hf_coefficients.dart`) already fully generic — written that way from
+  the start, since the decoder always had to handle every type
+  uniformly. What was missing was entirely encoder-side: three functions
+  (`computeCoeffBuf`, `quantizeCandidate`'s AC loop, `chooseCandidate`)
+  collapsed independent height/width into a single `n`; two functions
+  (`_scanChannelValues`, `_rdoqBlockChannel`) hardcoded the transposed
+  (`flip=true`) coefficient access unconditionally — correct for every
+  type shipped so far, wrong for the first `flip=false` block this
+  encoder ever emits (DCT 8x16). All fixed. Per design review, scoped to
+  just this one pair first (not all 12 rectangular types at once) — it
+  exercises every genuinely new axis simultaneously (both flip
+  polarities, a non-square `dctSelect` grid, rectangular placement) so
+  proving it end to end localizes debugging before mechanically fanning
+  out to the rest.
+  The merge cascade itself needed real new logic, not just a parameter
+  tweak: `_decideTransformLayout`'s square-only cascade (one `stride`
+  value driving both axes) was generalized into a `tryMergeLevel`
+  closure taking independent `strideY`/`strideX`, and — this is the part
+  that would have shipped a real bug without the design review — a
+  **containment guard** was added before any merge commits: DCT 16x8 and
+  DCT 8x16 don't nest (each spans cells the other doesn't), so without
+  checking that every block a region's cost-sum collects is *fully
+  contained* in the candidate's own footprint, a committed 8x16 could be
+  silently partially overwritten by a later 16x8 merge, orphaning cells
+  — a corrupt block list, not just a suboptimal choice. The guard is a
+  structural no-op for every existing square level (square sizes always
+  nest cleanly), so Tranche A behavior is provably unaffected; confirmed
+  by a `git stash` A/B (byte-identical output, comparable timing) same as
+  round 8's.
+  A **second real bug was caught mid-implementation, not by review**: the
+  "already generic" DC/LLF-inversion code in `quantizeCandidate`
+  allocated its `inverseDCT2D` scratch buffers sized exactly
+  `(llfH, llfW)` — correct for every square type (where `llfH == llfW`
+  always), but `dct.dart`'s `transposeMatrixInto` writes a `(llfW, llfH)`
+  intermediate partway through, which overflows that buffer the moment a
+  genuinely rectangular grid (16x8's is 2x1) is used. A real end-to-end
+  encode crashed with a `RangeError` — the isolated forward/inverse
+  identity test in `vardct_forward_test.dart` didn't catch it because
+  that test supplies its own (correctly oversized) scratch and never
+  exercises this specific internal allocation. Fixed by sizing scratch to
+  `max(llfH, llfW)` in both axes, matching the convention this file's
+  outer `scratchA`/`scratchB` and `test/vardct/dct_test.dart` already
+  use. This is the concrete case for "prove end to end before trusting
+  code that's merely *written* generically" — the LLF-inversion
+  *formula* was already correct (verified in round 8's identity tests),
+  but its *scratch allocation* was latently wrong the whole time,
+  invisible until a real non-square grid actually ran through it.
+  **A third gap was caught by advisor review, after implementation
+  looked done**: every test so far compared our-decoder-vs-djxl, which
+  cannot catch a semantic coefficient-scan error in the flip branch —
+  both decoders read the same bitstream the same way, so a
+  consistently-wrong scan leaves them agreeing with *each other* while
+  both reconstruct garbage relative to the original pixels. Since DCT
+  8x16 (`flip=false`) is the first non-transposed block this encoder has
+  ever emitted, nothing exercised that branch's correctness at all before
+  this was flagged. Added a decode-vs-*original* RMSE check (not
+  decode-vs-djxl) to the mixed-shape test: measured rectangular-on RMSE
+  (0.48) sits in the same ballpark as square-only (0.43) on the same
+  content, not blown up by an order of magnitude the way a real flip bug
+  would — this is now a permanent regression assertion, not just a
+  one-off manual check.
+  Verification, in order: forward/inverse identity + LLF-inversion tests
+  for the pair (extending round 8's parameterized loop, exercising a
+  genuinely non-square `dctSelect` grid for the first time); a
+  mixed-shape integration test (4 quadrants, each engineered to favor a
+  different shape — horizontal stripes/8x16, vertical stripes/16x8,
+  gradient/16x16, noise/8x8 — found via `jxl.encdebug` tallies to
+  genuinely beat the square-only cascade, not just the bootstrap, with
+  the decode-vs-original check above and a tightened djxl RMSE gate
+  (`<2.0`, this project's standard bar — 16x8/8x16 aren't in the
+  documented "DCT 16x32 and larger" large-DCT deviation bucket, so they
+  don't need the looser `<40` Tranche-A's biggest sizes use); and a
+  multi-group test confirming rectangular blocks placed immediately
+  adjacent to a 32-block group boundary round-trip correctly (not a
+  straddle test — the alignment check already rules straddling out
+  algebraically for every Tranche-B `dctSelect` dimension, all of which
+  divide 32). Full suite green (319 tests).
+  `VardctL0Config.enableRectangularTransforms` (new, orthogonal to
+  `maxTransformSize`) defaults to **false** — existence is unconditional
+  per the settled criterion, the default is a separate, not-yet-evaluated
+  real-content-ROI question, same split every prior size used. Next:
+  mechanically fan out the same `tryMergeLevel` machinery to the
+  remaining four "2:1 pair" levels (32x16/16x32, 64x32/32x64,
+  128x64/64x128, 256x128/128x256) and the one "4:1 line" case (32x8/8x32
+  — merges four 8x8 blocks in a line, the only 4:1 case in the format).
 
 ---
 

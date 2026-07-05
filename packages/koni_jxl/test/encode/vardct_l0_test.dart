@@ -755,6 +755,225 @@ void main() {
     }
   });
 
+  test(
+      'DCT 16x8/8x16 (opt-in, Tranche B) genuinely wins on a mix of '
+      'shapes and round-trips through both decoders', () {
+    // The critical de-risking test for Tranche B's first pair, per the
+    // design review before this landed: forward/inverse identity and
+    // LLF-inversion unit tests (vardct_forward_test.dart) confirm the
+    // math, but every bug that could actually bite lives in the
+    // integration -- emission order (a wide block covers cells to its
+    // right, a tall block covers cells below), flip=false placement (the
+    // *first* non-transposed block this encoder ever emits -- every prior
+    // type, square or the tall member of this very pair, is flip=true),
+    // and the merge cascade's containment guard. A single-shape test
+    // can't catch an emission-order desync between shapes; this one packs
+    // 4 quadrants, each engineered to favor a different shape, into one
+    // canvas so all of them coexist and interleave at their shared
+    // boundaries: horizontal stripes (top-left, favors 8x16 -- constant
+    // across one stripe's width), vertical stripes (top-right, favors
+    // 16x8), a smooth gradient (bottom-left, favors square 16x16), and
+    // noise (bottom-right, stays plain 8x8).
+    //
+    // Canvas size/stripe period/distance found empirically (jxl.encdebug
+    // tallies), not guessed, matching this project's established
+    // methodology (see the 256x256-fills-a-group test above): swept until
+    // the *chosen*, real-assembled candidate contained all four shapes at
+    // once (tally={DCT 8x16: 3, DCT 16x8: 2, DCT 16x16: 1, DCT 8x8: 2})
+    // and genuinely beat the square-only cascade, not just the plain
+    // bootstrap.
+    const size = 32, period = 10;
+    final pixels = Uint8List(size * size * 3);
+    final rng = math.Random(7);
+    var i = 0;
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        final qy = y < size ~/ 2 ? 0 : 1, qx = x < size ~/ 2 ? 0 : 1;
+        final int v;
+        if (qy == 0 && qx == 0) {
+          v = (y ~/ period).isEven ? 30 : 220; // horizontal stripes
+        } else if (qy == 0 && qx == 1) {
+          v = (x ~/ period).isEven ? 30 : 220; // vertical stripes
+        } else if (qy == 1 && qx == 0) {
+          v = (x * 255 / (size ~/ 2)).round().clamp(0, 255); // gradient
+        } else {
+          v = rng.nextInt(256); // noise
+        }
+        pixels[i++] = v;
+        pixels[i++] = v;
+        pixels[i++] = v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(2.0);
+    final withRect = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableRectangularTransforms: true));
+    final squareOnly = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableRectangularTransforms: false));
+    expect(withRect.length, lessThan(squareOnly.length),
+        reason: 'rectangular transforms (${withRect.length}B) should beat '
+            'square-only (${squareOnly.length}B) on this mixed-shape '
+            'content, confirming 16x8/8x16 genuinely won somewhere');
+
+    // Decode-vs-*original* RMSE, not just decode-vs-djxl: a semantic
+    // coefficient-scan error in the flip branch (_scanChannelValues,
+    // _rdoqBlockChannel) would still leave our decoder and djxl agreeing
+    // with EACH OTHER (both read the same, consistently-mis-scanned
+    // bitstream the same way) while both reconstruct transposed garbage
+    // relative to the source pixels — invisible to a decode-vs-djxl-only
+    // check. DCT 8x16 (flip=false) is the first non-transposed block this
+    // encoder has ever emitted (every prior type, square or 16x8, is
+    // flip=true), so nothing before this test exercised that branch at
+    // all. A relative bound (rectangular no worse than ~2x square-only)
+    // sidesteps picking an absolute threshold while still failing loudly
+    // if flip is wrong (which would blow this up by an order of magnitude
+    // or more, not by a small margin).
+    double rmseVsOriginal(Uint8List encoded) {
+      final decoded = JxlDecoder.decode(encoded).toRgba8();
+      var sumSq = 0.0;
+      var n = 0;
+      for (var p = 0; p < size * size; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      return math.sqrt(sumSq / n);
+    }
+
+    final rectRmse = rmseVsOriginal(withRect);
+    final squareRmse = rmseVsOriginal(squareOnly);
+    expect(rectRmse, lessThan(squareRmse * 2 + 1),
+        reason: 'rectangular RMSE-vs-original ($rectRmse) should be in the '
+            'same ballpark as square-only ($squareRmse), not blown up by a '
+            'coefficient-scan/flip error');
+
+    final image = JxlDecoder.decode(withRect);
+    expect(image.width, size);
+    expect(image.height, size);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_rect');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(withRect);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, size);
+      expect(ref.height, size);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < size * size; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      // 16x8/8x16 are NOT in the documented "DCT 16x32 and larger"
+      // large-DCT deviation bucket (doc/spec_notes.md) that justifies the
+      // looser <40 bound the 32x32/256x256 tests above use — this is
+      // small enough to hold this project's standard lossy gate
+      // (measured ~0.48 at this exact config; CLAUDE.md's documented
+      // standard is rmse < 2.0).
+      expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
+  test(
+      'DCT 16x8/8x16 blocks near a 32-block group boundary in a '
+      'multi-group image round-trip correctly', () {
+    // NOT a test that a block can straddle a group boundary -- by the
+    // merge cascade's own `by % strideY == 0 && bx % strideX == 0`
+    // alignment check, and every Tranche-B dctSelect dimension here (1, 2)
+    // dividing 32, straddling is already algebraically impossible. What
+    // this exercises concretely (rather than trusting that algebra alone)
+    // is `_finishEncode`'s group-bucketing (256x256-pixel groups keyed
+    // purely by block origin) with real rectangular blocks landing
+    // immediately adjacent to a group boundary on both sides: a
+    // multi-group canvas (512 pixels wide = 2 groups of 32 blocks) with
+    // uniform horizontal-stripe content (favoring 8x16) spanning the
+    // group-0/group-1 boundary at block-column 32, djxl round-tripped.
+    const w = 512, h = 32, period = 10;
+    final pixels = Uint8List(w * h * 3);
+    var i = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final v = (y ~/ period).isEven ? 30 : 220;
+        pixels[i++] = v;
+        pixels[i++] = v;
+        pixels[i++] = v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(2.0);
+    final encoded = encodeLossyVardctL0(pixels,
+        width: w,
+        height: h,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableRectangularTransforms: true));
+
+    final image = JxlDecoder.decode(encoded);
+    expect(image.width, w);
+    expect(image.height, h);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_lossy_rectgroup');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(encoded);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+      expect(ref.width, w);
+      expect(ref.height, h);
+
+      var sumSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < w * h; j++) {
+          final d = ours[j] - theirs[j];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      final rmse = math.sqrt(sumSq / n);
+      // Not in the "DCT 16x32 and larger" large-DCT deviation bucket
+      // either (measured ~0.44 at this exact config) -- see the previous
+      // test's comment.
+      expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
   test('finer quantization improves RMSE', () {
     if (!_haveDjxl) return;
     final pixels = _synthetic(64, 64, 9);

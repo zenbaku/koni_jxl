@@ -93,30 +93,46 @@ void main() {
   // only special-cases 8x8 for a fused SIMD path), but that genericity was
   // previously only exercised by the *decoder*. One parameterized group
   // covers all four (32, 64, 128, 256) rather than hand-copying a test per
-  // size, matching `_decideTransformLayout`'s own generic cascade.
-  for (final typeIndex in [5, 18, 21, 24]) {
+  // size, matching `_decideTransformLayout`'s own generic cascade. Tranche
+  // B's first pair (16x8/8x16, types 6/7) reuses the same loop with
+  // independent height/width — the first genuinely rectangular case here,
+  // exercising the LLF-inversion sub-test below at a non-square
+  // `dctSelectHeight != dctSelectWidth` grid for the first time.
+  for (final typeIndex in [5, 18, 21, 24, 6, 7]) {
     final tt = TransformType.byType(typeIndex);
-    final n = tt.pixelHeight;
+    final ph = tt.pixelHeight, pw = tt.pixelWidth;
 
-    test('forward DCT${n}x$n followed by inverse DCT${n}x$n is the identity',
-        () {
+    test(
+        'forward DCT${ph}x$pw followed by inverse DCT${ph}x$pw is the '
+        'identity', () {
       final rng = math.Random(4);
-      final src = List.generate(n, (_) => Float32List(n));
-      for (var y = 0; y < n; y++) {
-        for (var x = 0; x < n; x++) {
+      final src = List.generate(ph, (_) => Float32List(pw));
+      for (var y = 0; y < ph; y++) {
+        for (var x = 0; x < pw; x++) {
           src[y][x] = rng.nextDouble() * 2 - 1;
         }
       }
-      final coeffs = List.generate(n, (_) => Float32List(n));
-      final scratch0 = List.generate(n, (_) => Float32List(n));
-      final scratch1 = List.generate(n, (_) => Float32List(n));
-      forwardDCT2D(src, coeffs, 0, 0, 0, 0, n, n, scratch0, scratch1);
+      final coeffs = List.generate(ph, (_) => Float32List(pw));
+      // Scratch must be sized to the larger dimension in both axes, not
+      // (ph, pw) — dct.dart's transposeMatrixInto writes an intermediate
+      // shaped (pw, ph) partway through, which overflows an (ph, pw)-sized
+      // buffer for a genuinely rectangular type (found by this test
+      // failing with a RangeError before this fix; mirrors production's
+      // own oversized scratchA/scratchB and dct_test.dart's 256x256
+      // scratch convention).
+      final scratchSize = math.max(ph, pw);
+      final scratch0 =
+          List.generate(scratchSize, (_) => Float32List(scratchSize));
+      final scratch1 =
+          List.generate(scratchSize, (_) => Float32List(scratchSize));
+      forwardDCT2D(src, coeffs, 0, 0, 0, 0, ph, pw, scratch0, scratch1);
 
-      final recon = List.generate(n, (_) => Float32List(n));
-      inverseDCT2D(coeffs, recon, 0, 0, 0, 0, n, n, scratch0, scratch1, false);
+      final recon = List.generate(ph, (_) => Float32List(pw));
+      inverseDCT2D(
+          coeffs, recon, 0, 0, 0, 0, ph, pw, scratch0, scratch1, false);
 
-      for (var y = 0; y < n; y++) {
-        for (var x = 0; x < n; x++) {
+      for (var y = 0; y < ph; y++) {
+        for (var x = 0; x < pw; x++) {
           expect(recon[y][x], closeTo(src[y][x], 1e-3),
               reason: 'pixel ($y, $x)');
         }
@@ -124,7 +140,7 @@ void main() {
     });
 
     test(
-        'DCT${n}x$n LLF inversion recovers the DC plane through the '
+        'DCT${ph}x$pw LLF inversion recovers the DC plane through the '
         'decoder\'s own _finalizeLLF construction', () {
       // The encoder's DC/LLF inversion (quantizeCandidate) must be the exact
       // algebraic inverse of the decoder's _finalizeLLF
@@ -146,11 +162,13 @@ void main() {
 
       // Mirrors _finalizeLLF exactly: forward DCT over the dctSelect grid,
       // then scale by tt.llfScale -- this is what a real decoder would see
-      // as the block's LLF corner.
-      final scratch0 = List.generate(
-          tt.dctSelectHeight, (_) => Float32List(tt.dctSelectWidth));
-      final scratch1 = List.generate(
-          tt.dctSelectHeight, (_) => Float32List(tt.dctSelectWidth));
+      // as the block's LLF corner. Scratch sized to the larger dimension in
+      // both axes -- see the identity test above for why.
+      final llfScratchSize = math.max(tt.dctSelectHeight, tt.dctSelectWidth);
+      final scratch0 =
+          List.generate(llfScratchSize, (_) => Float32List(llfScratchSize));
+      final scratch1 =
+          List.generate(llfScratchSize, (_) => Float32List(llfScratchSize));
       final llfCorner = List.generate(
           tt.dctSelectHeight, (_) => Float32List(tt.dctSelectWidth));
       forwardDCT2D(dcPlane, llfCorner, 0, 0, 0, 0, tt.dctSelectHeight,

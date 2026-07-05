@@ -44,6 +44,7 @@ class VardctL0Config {
     this.transformRdLambdaOverride,
     this.maxTransformSize = 16,
     this.transformRdLambdaOverrideBeyond16,
+    this.enableRectangularTransforms = false,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
     this.enableRdoq = true,
@@ -166,6 +167,38 @@ class VardctL0Config {
   /// below `maxTransformSize: 32`.
   final double? transformRdLambdaOverrideBeyond16;
 
+  /// Whether to also try DCT 16x8 / DCT 8x16 (Tranche B's first pair —
+  /// the first *rectangular* transform types this encoder emits) at the
+  /// bootstrap-leaf level, before the 8x8-vs-16x16 decision. Orthogonal to
+  /// [maxTransformSize]: that knob is a square-tier size scale, this is a
+  /// separate shape axis, so `maxTransformSize: 16` (the default) doesn't
+  /// implicitly mean "no rectangular" and vice versa — conflating them
+  /// would make the int knob ambiguous for existing callers. Defaults to
+  /// **off** for the same reason [maxTransformSize] stays at 16:
+  /// existence is a completeness goal (ROADMAP.md, 2026-07-05), the
+  /// default is a separate, real-content-ROI question not yet evaluated
+  /// for this pair. Uses the existing level-1 `_kTransformRdLambda` (no
+  /// dedicated constant yet — add one only if calibration shows a need to
+  /// diverge, same precedent [transformRdLambdaOverrideBeyond16] followed).
+  ///
+  /// **The never-worse guarantee this gets from the shared candidate list
+  /// is "vs. plain 8x8/bootstrap," not "vs. square-only" (this flag
+  /// false).** Enabling this changes what the 8x8-vs-16x16 level itself
+  /// sees: with it on, that level runs on top of whatever the rectangular
+  /// pre-pass already decided, not on the pristine bootstrap, so "16x16
+  /// applied to pure bootstrap" (what a square-only run would produce) is
+  /// never itself a candidate in this run's list. In rare cases this flag
+  /// can therefore produce a file a byte or two *larger* than leaving it
+  /// off would have, while still always beating plain 8x8 (confirmed
+  /// empirically: a 32x32/period-4/distance-0.5 sweep found exactly this
+  /// -- 730B with rectangular vs. 729B square-only, both beating the
+  /// 761B bootstrap). This is expected for a greedy opt-in feature
+  /// layered on an existing greedy decision, not a bug -- don't "fix" it
+  /// by also assembling a standalone square-only candidate just to
+  /// restore a stricter guarantee; not worth the complexity on a feature
+  /// that's off by default.
+  final bool enableRectangularTransforms;
+
   /// Whether to replace the default 3-bucket adaptive-quantization
   /// heuristic (`hfMult` chosen from a threshold on relative AC energy)
   /// with a real per-block rate-distortion search over the same
@@ -247,17 +280,32 @@ final _tt128 =
     TransformType.byType(21); // DCT 128x128: orderID 9, parameterIndex 13
 final _tt256 =
     TransformType.byType(24); // DCT 256x256: orderID 11, parameterIndex 15
+final _tt16x8 =
+    TransformType.byType(6); // DCT 16x8: orderID 4, parameterIndex 6, flip
+final _tt8x16 =
+    TransformType.byType(7); // DCT 8x16: orderID 4, parameterIndex 6, no flip
 
 /// Transform types this encoder can currently emit, largest reused
 /// mechanically wherever code is already N-way (context/rawWeight lookup,
 /// quant-weight/order tables); genuinely new work (layout-decision merge
 /// levels, flip/orientation handling) is called out separately in
 /// ROADMAP.md as each size/tranche lands. All of Tranche A (square DCT
-/// sizes) is listed here regardless of [VardctL0Config.maxTransformSize] —
-/// preparing a type's context/quant-weight tables is cheap and does not by
-/// itself make the layout decision ever place it; that's gated purely by
-/// [_cascadeSizes] in `_decideTransformLayout`.
-final _activeTransformTypes = [_tt8, _tt16, _tt32, _tt64, _tt128, _tt256];
+/// sizes) plus Tranche B's first pair (16x8/8x16) is listed here regardless
+/// of [VardctL0Config.maxTransformSize]/[VardctL0Config.
+/// enableRectangularTransforms] — preparing a type's context/quant-weight
+/// tables is cheap and does not by itself make the layout decision ever
+/// place it; that's gated purely by [_cascadeSizes]/the rectangular attempt
+/// in `_decideTransformLayout`.
+final _activeTransformTypes = [
+  _tt8,
+  _tt16,
+  _tt32,
+  _tt64,
+  _tt128,
+  _tt256,
+  _tt16x8,
+  _tt8x16,
+];
 
 /// The square sizes beyond the always-on 8x8/16x16 level, in ascending
 /// order — `_decideTransformLayout`'s generic cascade stops at the first
@@ -465,7 +513,8 @@ Uint8List encodeLossyVardctL0(
         groupsY,
         config.transformRdLambdaOverride,
         config.maxTransformSize,
-        config.transformRdLambdaOverrideBeyond16);
+        config.transformRdLambdaOverrideBeyond16,
+        config.enableRectangularTransforms);
 
     Uint8List assemble(List<_PlacedBlock> blocks, List<Int32List> dcInt) =>
         _finishEncode(
@@ -510,10 +559,14 @@ Uint8List encodeLossyVardctL0(
     }
 
     if (const bool.fromEnvironment('jxl.encdebug')) {
+      final tally = <String, int>{};
+      for (final block in candidates[chosenLevel].$1) {
+        tally[block.tt.name] = (tally[block.tt.name] ?? 0) + 1;
+      }
       // ignore: avoid_print
       print('vardct variable-transform candidates: off=${bodyOff.length}B '
           'chosen=level$chosenLevel (${chosen.length}B) of '
-          '${candidates.length} candidates');
+          '${candidates.length} candidates, tally=$tally');
     }
     return chosen;
   }
@@ -938,13 +991,13 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     int groupsY,
     double? lambdaOverride,
     int maxTransformSize,
-    double? lambdaOverrideBeyond16) {
+    double? lambdaOverrideBeyond16,
+    bool enableRectangularTransforms) {
   final ctx8 = ctxByType[_tt8.type]!;
-  final ctx16 = ctxByType[_tt16.type]!;
   // 1. Bootstrap: quantize the whole image as all-8x8, committing into
   // dcIntBootstrap — this becomes (unmodified) the "off" candidate's DC
-  // plane, so nothing below may overwrite it; the "on" (mixed-layout)
-  // candidate gets its own clone (dcIntFinal, below) instead.
+  // plane, so nothing below may overwrite it; every merge level gets its
+  // own clone (`tryMergeLevel`'s `dcIntNext`) instead.
   final blockAt = List<_PlacedBlock?>.filled(bh * bw, null);
   final bootstrapBlocks = <_PlacedBlock>[
     for (var by = 0; by < bh; by++)
@@ -984,125 +1037,57 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
         ctx8, hfctx, block.acInt, predictedOut[block]!, clusterMap, lengths);
   }
 
-  // dcIntFinal starts as a clone of the bootstrap's DC plane; only cells
-  // covered by a region that swaps to 16x16 (below) ever get overwritten.
-  final dcIntFinal = [
-    for (final ch in dcIntBootstrap) Int32List.fromList(ch),
-  ];
-
-  // 3/4. Per-region decision, in the same raster-scan-with-skip order the
-  // decoder's placement reconstructs from the flat block list. Every
-  // non-merged cell gets an independent `.copy()` (not the bootstrap
-  // instance) so the "off" candidate (bootstrapBlocks) and "on" candidate
-  // (result, below) never alias the same mutable `_PlacedBlock` — the
-  // caller runs RD-hfMult/RDOQ separately on each candidate, and those
-  // passes mutate hfMult/acInt in place (see `_PlacedBlock.copy`'s doc
-  // comment).
-  final result = <_PlacedBlock>[];
-  final covered = List<bool>.filled(bh * bw, false);
-  for (var by = 0; by < bh; by++) {
-    for (var bx = 0; bx < bw; bx++) {
-      if (covered[by * bw + bx]) continue;
-      final canPair = by.isEven &&
-          bx.isEven &&
-          by + 1 < bh &&
-          bx + 1 < bw &&
-          !covered[(by + 1) * bw + bx] &&
-          !covered[by * bw + bx + 1] &&
-          !covered[(by + 1) * bw + bx + 1];
-      _PlacedBlock? merged;
-      if (canPair) {
-        final i00 = by * bw + bx, i01 = by * bw + bx + 1;
-        final i10 = (by + 1) * bw + bx, i11 = (by + 1) * bw + bx + 1;
-        final cost8 = blockAt[i00]!.distortion +
-            lambda * rate8[i00] +
-            blockAt[i01]!.distortion +
-            lambda * rate8[i01] +
-            blockAt[i10]!.distortion +
-            lambda * rate8[i10] +
-            blockAt[i11]!.distortion +
-            lambda * rate8[i11];
-
-        final candidate16 = _PlacedBlock(by, bx, _tt16);
-        final coeffBuf16 =
-            candidate16.computeCoeffBuf(planes, cfl, scratchA, scratchB);
-        final (mult16, quant16) = candidate16.chooseCandidate(
-            coeffBuf16, refStep, sd, ctx16.rawWeight, scaleFactor);
-        final rate16 = _blockRate(ctx16, hfctx, quant16.ac,
-            predictedOut[blockAt[i00]!]!, clusterMap, lengths);
-        final cost16 = quant16.distortion + lambda * rate16;
-
-        if (cost16 < cost8) {
-          candidate16.commit(quant16, mult16, dcIntFinal, bw);
-          merged = candidate16;
-        }
-      }
-      if (merged != null) {
-        covered[(by + 1) * bw + bx] = true;
-        covered[by * bw + bx + 1] = true;
-        covered[(by + 1) * bw + bx + 1] = true;
-        result.add(merged);
-      } else {
-        result.add(blockAt[by * bw + bx]!.copy());
-      }
-    }
-  }
-  // Level-1 is always a candidate slot, but only actually appended when it
-  // changed something — no region swapped to 16x16 means `result`/
-  // `dcIntFinal` are content-identical to `bootstrapBlocks`/
-  // `dcIntBootstrap` (every kept cell is an exact `.copy()`, and
-  // `dcIntFinal` is an untouched clone), so reporting it as a separate
-  // candidate would just make the caller assemble an identical body twice
-  // at ~2x cost for zero size difference — exactly the case for manga's
-  // dominant content types. `result.length == bh * bw` iff zero swaps
-  // happened (each swap removes 3 entries from the flat list).
-  final candidates = <(List<_PlacedBlock>, List<Int32List>)>[
-    (bootstrapBlocks, dcIntBootstrap),
-    if (result.length != bh * bw) (result, dcIntFinal),
-  ];
-
-  // 5. Generic cascade for every size beyond 16 up to [maxTransformSize]
-  // (Tranche A: 32, then 64, then 128, then 256), structurally identical
-  // to 3/4 one level up each time: for every aligned candidate region
-  // (several already-decided blocks from the *previous* cascade level),
-  // compare their real summed cost against a freshly quantized candidate
-  // of the next size up, reusing the same frozen bootstrap code-length
-  // table — sound for the same reason step 3/4's 16x16 decision already
-  // establishes (transform-type choice never shifts which cluster a
-  // token routes to, only what value lands there). `layoutBlockAt`
-  // extends `blockAt`'s one-cell-per-block bootstrap lookup to the
-  // current layout's mixed footprints; a smaller block can never
-  // straddle a larger aligned region (every footprint starts on a
-  // multiple of its own size, and each cascade size is a multiple of the
-  // previous one), so every region's distinct blocks are cleanly
-  // enumerable via their underlying 8x8-cell positions. A level that
-  // merges nothing is skipped as a *candidate* but the cascade still
-  // tries the next size up on the unchanged layout — see this function's
-  // doc comment for why "no 32x32 merge anywhere" doesn't provably rule
-  // out a 64x64 merge helping regardless.
-  var layout = result;
-  var dcInt = dcIntFinal;
-  final lambdaBeyond16 =
-      (lambdaOverrideBeyond16 ?? _kTransformRdLambdaBeyond16) *
-          refStep *
-          refStep;
-  for (final tt in _cascadeSizes) {
-    if (tt.pixelWidth > maxTransformSize) break;
-    final ctx = ctxByType[tt.type]!;
-    final stride = tt.dctSelectHeight;
+  // 3/4/5. Per-region decision, in the same raster-scan-with-skip order the
+  // decoder's placement reconstructs from the flat block list. One shared
+  // closure handles every level — the rectangular pre-pass (Tranche B),
+  // level 1's 8x8-vs-16x16 decision, and every [_cascadeSizes] entry beyond
+  // it: for every candidate region aligned to a target type's own
+  // dctSelectHeight x dctSelectWidth footprint, compare the real summed
+  // cost of whatever distinct blocks the *previous* layout already placed
+  // there against a freshly quantized candidate of that type, keeping
+  // whichever is smaller. `layoutBlockAt` extends `blockAt`'s
+  // one-cell-per-block bootstrap lookup to the current layout's mixed
+  // footprints, using each block's own independent height/width (not
+  // assumed square, unlike the code this replaced).
+  //
+  // The containment guard below is required once non-nesting shapes coexist
+  // (DCT 16x8 and DCT 8x16 share no containment relationship — each spans
+  // cells the other doesn't): without it, a region's `seen` set could
+  // collect a block that only partially overlaps the candidate's footprint,
+  // and committing over it would silently orphan whatever cells that block
+  // also owned outside the region — a corrupt block list (some cells
+  // covered by nothing), not just a suboptimal choice. For every *square*
+  // level (level 1, and every [_cascadeSizes] entry — the only cases before
+  // Tranche B) this is a structural no-op: each square size is a multiple
+  // of the previous one and every region is square-aligned, so containment
+  // always holds automatically — Tranche A behavior is provably unaffected.
+  //
+  // Every non-merged cell gets an independent `.copy()` (not the previous
+  // layout's own instance) so candidates never alias the same mutable
+  // `_PlacedBlock` — the caller runs RD-hfMult/RDOQ separately on each
+  // candidate, and those passes mutate hfMult/acInt in place (see
+  // `_PlacedBlock.copy`'s doc comment).
+  (List<_PlacedBlock>, List<Int32List>, bool) tryMergeLevel(
+      List<_PlacedBlock> layoutIn,
+      List<Int32List> dcIntIn,
+      TransformType targetType,
+      double lambdaForLevel) {
+    final strideY = targetType.dctSelectHeight;
+    final strideX = targetType.dctSelectWidth;
+    final ctx = ctxByType[targetType.type]!;
     final layoutBlockAt = List<_PlacedBlock?>.filled(bh * bw, null);
-    for (final block in layout) {
-      final n = block.tt.dctSelectHeight;
-      for (var dy = 0; dy < n; dy++) {
-        for (var dx = 0; dx < n; dx++) {
+    for (final block in layoutIn) {
+      final blockH = block.tt.dctSelectHeight, blockW = block.tt.dctSelectWidth;
+      for (var dy = 0; dy < blockH; dy++) {
+        for (var dx = 0; dx < blockW; dx++) {
           layoutBlockAt[(block.by + dy) * bw + (block.bx + dx)] = block;
         }
       }
     }
     // An 8x8 block reuses the precomputed `rate8` array; any larger block
-    // (16x16 up to the previous cascade size) gets its real rate computed
-    // on demand against its own bootstrap-origin `predicted` value — cheap,
-    // and only once per distinct block thanks to `seen` below.
+    // gets its real rate computed on demand against its own bootstrap-origin
+    // `predicted` value — cheap, and only once per distinct block thanks to
+    // `seen` below.
     double blockRateIn(_PlacedBlock block) {
       if (block.tt == _tt8) return rate8[block.by * bw + block.bx];
       return _blockRate(
@@ -1114,49 +1099,65 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
           lengths);
     }
 
-    final dcIntNext = [for (final ch in dcInt) Int32List.fromList(ch)];
+    final dcIntNext = [for (final ch in dcIntIn) Int32List.fromList(ch)];
     final next = <_PlacedBlock>[];
     final covered = List<bool>.filled(bh * bw, false);
     var anyMerge = false;
     for (var by = 0; by < bh; by++) {
       for (var bx = 0; bx < bw; bx++) {
         if (covered[by * bw + bx]) continue;
-        final canPair = by % stride == 0 &&
-            bx % stride == 0 &&
-            by + stride - 1 < bh &&
-            bx + stride - 1 < bw;
+        final canPair = by % strideY == 0 &&
+            bx % strideX == 0 &&
+            by + strideY - 1 < bh &&
+            bx + strideX - 1 < bw;
         _PlacedBlock? merged;
         if (canPair) {
           final seen = <_PlacedBlock>{};
           var costIn = 0.0;
-          for (var dy = 0; dy < stride; dy++) {
-            for (var dx = 0; dx < stride; dx++) {
+          var mergeable = true;
+          outer:
+          for (var dy = 0; dy < strideY; dy++) {
+            for (var dx = 0; dx < strideX; dx++) {
               final block = layoutBlockAt[(by + dy) * bw + (bx + dx)]!;
+              if (block.by < by ||
+                  block.bx < bx ||
+                  block.by + block.tt.dctSelectHeight > by + strideY ||
+                  block.bx + block.tt.dctSelectWidth > bx + strideX) {
+                mergeable = false;
+                break outer;
+              }
               if (seen.add(block)) {
                 costIn +=
-                    block.distortion + lambdaBeyond16 * blockRateIn(block);
+                    block.distortion + lambdaForLevel * blockRateIn(block);
               }
             }
           }
 
-          final candidate = _PlacedBlock(by, bx, tt);
-          final coeffBuf =
-              candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
-          final (mult, quant) = candidate.chooseCandidate(
-              coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
-          final rate = _blockRate(ctx, hfctx, quant.ac,
-              predictedOut[blockAt[by * bw + bx]!]!, clusterMap, lengths);
-          final cost = quant.distortion + lambdaBeyond16 * rate;
+          if (mergeable) {
+            final candidate = _PlacedBlock(by, bx, targetType);
+            final coeffBuf =
+                candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
+            final (mult, quant) = candidate.chooseCandidate(
+                coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
+            final rate = _blockRate(ctx, hfctx, quant.ac,
+                predictedOut[blockAt[by * bw + bx]!]!, clusterMap, lengths);
+            final cost = quant.distortion + lambdaForLevel * rate;
 
-          if (cost < costIn) {
-            candidate.commit(quant, mult, dcIntNext, bw);
-            merged = candidate;
+            if (cost < costIn) {
+              assert(
+                  candidate.by % targetType.dctSelectHeight == 0 &&
+                      candidate.bx % targetType.dctSelectWidth == 0,
+                  'merge candidate not aligned to its own dctSelect '
+                  'footprint');
+              candidate.commit(quant, mult, dcIntNext, bw);
+              merged = candidate;
+            }
           }
         }
         if (merged != null) {
           anyMerge = true;
-          for (var dy = 0; dy < stride; dy++) {
-            for (var dx = 0; dx < stride; dx++) {
+          for (var dy = 0; dy < strideY; dy++) {
+            for (var dx = 0; dx < strideX; dx++) {
               covered[(by + dy) * bw + (bx + dx)] = true;
             }
           }
@@ -1173,9 +1174,71 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
         }
       }
     }
-    if (!anyMerge) continue; // try the next size up on the unchanged layout
+    return (next, dcIntNext, anyMerge);
+  }
+
+  final candidates = <(List<_PlacedBlock>, List<Int32List>)>[
+    (bootstrapBlocks, dcIntBootstrap),
+  ];
+  var layout = bootstrapBlocks;
+  var dcInt = dcIntBootstrap;
+
+  // 3. Rectangular pre-pass (Tranche B's first pair): wide (8x16) then tall
+  // (16x8), each its own real-assembled candidate, tried directly on the
+  // bootstrap before the square 16x16 decision below. Every 16x8/8x16
+  // footprint nests cleanly inside exactly one 2x2 16x16-pixel region (each
+  // spans one axis fully and the other partially, always within a single
+  // 16x16-region's bounds), so running rectangular first and feeding the
+  // result into the (generalized) 16x16 level next never presents that
+  // level with a partial overlap — the reverse order would. off by default
+  // ([VardctL0Config.enableRectangularTransforms]); see that field's doc
+  // comment for why (existence-vs-default, same split as
+  // [VardctL0Config.maxTransformSize]).
+  if (enableRectangularTransforms) {
+    for (final tt in [_tt8x16, _tt16x8]) {
+      final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, tt, lambda);
+      if (changed) {
+        layout = next;
+        dcInt = dcNext;
+        candidates.add((layout, dcInt));
+      }
+    }
+  }
+
+  // 4. The always-on 8x8-vs-16x16 decision, now routed through the same
+  // shared closure as every other level — required, not just uniform: once
+  // the rectangular pre-pass can run first, this level must see whatever
+  // mixed layout it left behind via `layoutBlockAt`, which a hand-written
+  // bootstrap-only version (this replaced) could not do.
+  {
+    final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, _tt16, lambda);
+    if (changed) {
+      layout = next;
+      dcInt = dcNext;
+      candidates.add((layout, dcInt));
+    }
+  }
+
+  // 5. Generic cascade for every size beyond 16 up to [maxTransformSize]
+  // (Tranche A: 32, then 64, then 128, then 256), structurally identical —
+  // reusing the same frozen bootstrap code-length table — sound for the
+  // same reason step 4's 16x16 decision already establishes (transform-type
+  // choice never shifts which cluster a token routes to, only what value
+  // lands there). A level that merges nothing is skipped as a *candidate*
+  // but the cascade still tries the next size up on the unchanged layout —
+  // see this function's doc comment for why "no 32x32 merge anywhere"
+  // doesn't provably rule out a 64x64 merge helping regardless.
+  final lambdaBeyond16 =
+      (lambdaOverrideBeyond16 ?? _kTransformRdLambdaBeyond16) *
+          refStep *
+          refStep;
+  for (final tt in _cascadeSizes) {
+    if (tt.pixelWidth > maxTransformSize) break;
+    final (next, dcNext, changed) =
+        tryMergeLevel(layout, dcInt, tt, lambdaBeyond16);
+    if (!changed) continue; // try the next size up on the unchanged layout
     layout = next;
-    dcInt = dcIntNext;
+    dcInt = dcNext;
     candidates.add((layout, dcInt));
   }
   return candidates;
@@ -1230,17 +1293,17 @@ class _PlacedBlock {
       _ChromaFromLumaFit cfl,
       List<Float32List> scratchA,
       List<Float32List> scratchB) {
-    final n = tt.pixelHeight; // == pixelWidth for every square type so far
+    final ph = tt.pixelHeight, pw = tt.pixelWidth;
     final coeffBuf = [
-      for (var c = 0; c < 3; c++) List.generate(n, (_) => Float32List(n))
+      for (var c = 0; c < 3; c++) List.generate(ph, (_) => Float32List(pw))
     ];
     // scratchA/scratchB are shared, max-sized buffers (see
     // _maxTransformPixelSize's doc comment) — forwardDCT2D only ever
-    // touches the [0, n) x [0, n) sub-region a call passes explicitly, so
+    // touches the [0, ph) x [0, pw) sub-region a call passes explicitly, so
     // one pair covers every active transform type without a size dispatch.
     for (var c = 0; c < 3; c++) {
-      forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, n, n, scratchA,
-          scratchB);
+      forwardDCT2D(planes[c], coeffBuf[c], by * 8, bx * 8, 0, 0, ph, pw,
+          scratchA, scratchB);
     }
 
     final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
@@ -1252,9 +1315,9 @@ class _PlacedBlock {
     // block's own 64x64-pixel region slope.
     final regionIdx = cfl.regionIndexOf(by, bx);
     final kXAc = cfl.kXRegion[regionIdx], kBAc = cfl.kBRegion[regionIdx];
-    for (var y = 0; y < n; y++) {
+    for (var y = 0; y < ph; y++) {
       final isLlfRow = y < llfH;
-      for (var x = 0; x < n; x++) {
+      for (var x = 0; x < pw; x++) {
         final yv = coeffBuf[1][y][x];
         final isLlf = isLlfRow && x < llfW;
         final kX = isLlf ? cfl.kXGlobal : kXAc;
@@ -1280,7 +1343,7 @@ class _PlacedBlock {
       List<double> sd,
       List<List<Float32List>> rawWeight,
       List<double> scaleFactor) {
-    final n = tt.pixelHeight;
+    final ph = tt.pixelHeight, pw = tt.pixelWidth;
     final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
     final numBlocks = llfH * llfW;
 
@@ -1303,8 +1366,20 @@ class _PlacedBlock {
       dc = List<double>.filled(3 * numBlocks, 0);
       final unscaled = List.generate(llfH, (_) => Float32List(llfW));
       final dcGrid = List.generate(llfH, (_) => Float32List(llfW));
-      final llfScratchA = List.generate(llfH, (_) => Float32List(llfW));
-      final llfScratchB = List.generate(llfH, (_) => Float32List(llfW));
+      // Scratch must be sized to the larger dimension in both axes, not
+      // (llfH, llfW) — dct.dart's transposeMatrixInto writes an
+      // intermediate shaped (llfW, llfH) partway through, which overflows
+      // an (llfH, llfW)-sized buffer whenever the grid is genuinely
+      // rectangular (llfH != llfW, first possible for Tranche B's 16x8/
+      // 8x16 — every square type has llfH == llfW, so this was latent
+      // until now; found by a real end-to-end encode crashing, not by the
+      // isolated identity test in vardct_forward_test.dart, which supplies
+      // its own oversized scratch and never exercises this allocation).
+      final llfScratchSize = llfH > llfW ? llfH : llfW;
+      final llfScratchA =
+          List.generate(llfScratchSize, (_) => Float32List(llfScratchSize));
+      final llfScratchB =
+          List.generate(llfScratchSize, (_) => Float32List(llfScratchSize));
       for (var c = 0; c < 3; c++) {
         for (var y = 0; y < llfH; y++) {
           final srcRow = coeffBuf[c][y];
@@ -1324,20 +1399,20 @@ class _PlacedBlock {
       }
     }
 
-    final ac = [for (var c = 0; c < 3; c++) Int32List(n * n)];
+    final ac = [for (var c = 0; c < 3; c++) Int32List(ph * pw)];
     var distortion = 0.0;
     for (var c = 0; c < 3; c++) {
       final acc = ac[c];
       final rw = rawWeight[c];
       final sfc = scaleFactor[c] / mult;
-      for (var y = 0; y < n; y++) {
-        for (var x = 0; x < n; x++) {
+      for (var y = 0; y < ph; y++) {
+        for (var x = 0; x < pw; x++) {
           if (y < llfH && x < llfW) continue;
           final w = rw[y][x];
           final step = sfc / w;
           final trueVal = coeffBuf[c][y][x];
           final qval = (trueVal / step).round();
-          acc[y * n + x] = qval;
+          acc[y * pw + x] = qval;
           final err = trueVal - qval * step;
           distortion += (w * err) * (w * err);
         }
@@ -1420,14 +1495,14 @@ class _PlacedBlock {
           List<double> sd,
           List<List<Float32List>> rawWeight,
           List<double> scaleFactor) {
-    final n = tt.pixelHeight;
+    final ph = tt.pixelHeight, pw = tt.pixelWidth;
     final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
 
     var acEnergy = 0.0;
     final y1 = coeffBuf[1];
-    for (var y = 0; y < n; y++) {
+    for (var y = 0; y < ph; y++) {
       final row = y1[y];
-      for (var x = 0; x < n; x++) {
+      for (var x = 0; x < pw; x++) {
         if (y < llfH && x < llfW) continue;
         acEnergy += row[x] * row[x];
       }
@@ -1987,12 +2062,15 @@ class _GroupTokens {
   var countNonZero = 0;
   var lastNonZeroK = -1;
   final vals = List<int>.filled(ucoeffLen, 0);
+  final flip = ctx.tt.flip;
   for (var k = 0; k < ucoeffLen; k++) {
     final o = ctx.order[k + numBlocks];
     final oy = o >> 16, ox = o & 0xFFFF;
-    // flip == true for every square DCT this encoder emits: the scan's
-    // (y, x) is transposed relative to the coefficient grid.
-    final v = acData[ox * n + oy];
+    // flip == true (every square DCT, plus the "tall" member of every
+    // rectangular pair) transposes the scan's (y, x) relative to the
+    // coefficient grid; flip == false (the "wide" member) reads directly.
+    // Mirrors the decoder's posY2/posX2 swap in hf_coefficients.dart.
+    final v = flip ? acData[ox * n + oy] : acData[oy * n + ox];
     vals[k] = v;
     if (v != 0) {
       countNonZero++;
@@ -2515,6 +2593,7 @@ void _rdoqBlockChannel(
   final numBlocks = ctx.numBlocks;
   final orderSize = ctx.orderSize;
   final n = ctx.tt.pixelWidth;
+  final flip = ctx.tt.flip;
   final acData = block.acInt[c];
   final (vals, countNonZero, lastNonZeroK) = _scanChannelValues(ctx, acData);
   if (countNonZero == 0) return;
@@ -2566,8 +2645,10 @@ void _rdoqBlockChannel(
     final qval = vals[k];
     final o = ctx.order[k + numBlocks];
     final oy = o >> 16, ox = o & 0xFFFF;
-    final trueVal = coeffBufC[ox][oy];
-    final w = rawWeightC[ox][oy];
+    // Same flip mirror as _scanChannelValues.
+    final posY = flip ? ox : oy, posX = flip ? oy : ox;
+    final trueVal = coeffBufC[posY][posX];
+    final w = rawWeightC[posY][posX];
     final step = sfc / w;
     final oldErr = trueVal - qval * step;
     final distortionDelta =
@@ -2601,7 +2682,7 @@ void _rdoqBlockChannel(
 
     final totalCost = distortionDelta + lambda * (rateDelta + nonZeroDelta);
     if (totalCost < 0) {
-      toZero.add(ox * n + oy);
+      toZero.add(posY * n + posX);
       curCountNonZero--;
       if (k == curLastK) {
         curLastK = idx > 0 ? nonZeroPositions[idx - 1] : -1;
