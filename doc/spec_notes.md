@@ -2738,6 +2738,118 @@ cascade," not the more invasive joint-search alternative. No config
 default changed; the never-worse guarantee is structurally unaffected
 (it never depended on how accurate the greedy per-level estimate is).
 
+### Lossy (VarDCT) encoder — round 17: real-manga ROI evaluation for `enableRectangularTransforms`/`enableBespokeTransforms`/`maxTransformSize:32`
+
+The first half of ROADMAP.md's "next phase" (after round 14 shipped all 27
+transform types): find out whether the still-off-by-default transform
+features actually help real manga content, before considering a joint
+RD search over the full type space. Round 7's DCT32x32 evaluation had
+already shown synthetic-corpus wins (-7.6% to -16.7%) collapsing to
+-0.0% to -0.6% on real pages — but that comparison was a one-off,
+undocumented process (confirmed via search: no CBZ-reading tool, script,
+or commit exists anywhere in the repo), and `enableRectangularTransforms`/
+`enableBespokeTransforms` had *never* been checked against real content
+at all, only synthetic/corpus content.
+
+**Built a repeatable harness**: `tool/bench_manga_roi.dart`. Key
+simplification found while scoping this: `manga_samples/*.cbz` are zip
+archives of `.jxl` files directly (not JPEG/PNG) — `doc/BENCHMARKS.md`
+already established these decode within 1/255 max pixel diff vs `djxl`
+across all 34 pages, so the tool trusts this package's own `JxlDecoder`
+for source pixels (same pattern as `tool/reencode_lossless.dart`),
+needing only `unzip -p` to pull page bytes out of the archive — no new
+dependency, no intermediate files, no PNG/JPEG decode capability needed.
+Swept 6 knob combinations (`baseline`, `+rect`, `+bespoke`,
+`+rect+bespoke`, `+32`, `+32+rect+bespoke`) × 2 distances (1.0, 4.0) × 6
+pages/chapter spread evenly across both `manga_samples/` chapters (12
+pages, 144 encodes total) — deliberately not sweeping `maxTransformSize`
+64/128/256, since round 16 found a real, un-root-caused RMSE-gate
+violation at 256+rect+bespoke on synthetic content and there was no
+reason to risk hitting it before the smaller combos below even
+established whether rect/bespoke help at all. Every row also compares
+each combo's RMSE against that page's own *baseline* RMSE (not a fixed
+absolute threshold — absolute RMSE is expected to grow with distance
+regardless of combo, e.g. `gray_screentone` already reaches RMSE 6.05 at
+distance 4.0 in the corpus table) so a genuine combo-induced regression
+would be caught rather than either a false alarm or a missed real one.
+
+**Results** (grand total across both chapters, both distances, all 12
+pages — full per-page/per-chapter breakdown in the tool's own output):
+
+```
+baseline             10057372  (base)
++rect                10029111  -0.28%
++bespoke             10034779  -0.22%
++rect+bespoke         9995928  -0.61%
++32                  10004324  -0.53%
++32+rect+bespoke      9971114  -0.86%
+```
+
+`+32` alone landed at -0.53% here, closely reproducing round 7's already-
+shipped-off finding (-0.0% to -0.6%) on an independent, larger page
+sample — a useful cross-check that this new harness measures the same
+thing round 7's ad hoc process did. No RMSE regression was flagged on
+any of the 144 rows.
+
+**Real finding, not previously known**: `+bespoke` alone is not
+uniformly safe the way the aggregate number suggests. One specific real
+page (Naruto page 017, the chapter's shortest/sparsest page) got
+genuinely *worse* with bespoke transforms alone: +4.01% at distance 1.0,
++5.39% at distance 4.0 — both far outside the "byte or two, rare"
+regression `enableRectangularTransforms`'s own doc comment already
+predicted for *itself* (a candidate-pool interaction with the 16x16
+upgrade level, not a bug). This is the first real-content confirmation
+that the same caveat applies to bespoke transforms too, and at a much
+larger magnitude than "rare, byte or two." Combining `+bespoke` with
+`+rect` masked this specific regression (page 017 returned to a real
+improvement, -0.11%/-0.58%) — the wider candidate pool routed around it
+— but this was only checked on 12 pages, not proven in general.
+
+**Content-type split**: `One-Piece-Digital-Colored-Comics` (flat colors)
+benefits more than `Naruto` (B&W screentone), consistent with round 7's
+reasoning that larger/alternate transforms help flat regions more than
+fine halftone texture — `+32+rect+bespoke` reached -2.64% on the former
+at distance 4.0 vs. -0.86% (tied with plain `+rect+bespoke`, `+32`
+apparently never getting selected once rect+bespoke's own candidates
+were available — see the tool's per-page byte counts, identical between
+the two combos on every Naruto/distance-4.0 page) on the latter.
+
+**Encode-time cost, measured for the first time for these combos**
+(average across all 144 rows, this session's machine):
+
+```
+baseline               1.00x
++32                     1.42x   (matches round 7's ~40% figure)
++rect                   2.22x
++bespoke                4.32x
++rect+bespoke           5.10x
++32+rect+bespoke        6.10x
+```
+
+**Decision: all defaults stay off.** The best combo
+(`+32+rect+bespoke`, -0.86% aggregate) costs 6.1x baseline encode time
+for well under 1% real size reduction — the same "small real win, real
+cost, not worth flipping" conclusion round 7 already reached for 32x32
+alone, now confirmed to extend to the combined feature set too, at an
+even steeper time cost. `+rect`/`+bespoke` individually are cheaper but
+smaller wins (2.22x/-0.28%, 4.32x/-0.22%), and `+bespoke` alone carries
+the real per-page regression risk above. None of this clears the bar
+round 6's `enableVariableTransforms` fix cleared (0% to -3.1% real win,
+a foundational always-on level, not a marginal addition).
+
+**What this sets up for the joint-search question** (ROADMAP.md's other
+half of "next phase"): the ceiling visible from bottom-up cascading
+these types is under 1% on real manga content, for several-x encode
+time. Either a genuine joint search over the full 27-type space finds
+meaningfully more than this fixed bottom-up cascade does (worth scoping
+now that this question has a real baseline to beat), or the remaining
+gap to `cjxl -e7` (still 0.37-0.54x per `doc/BENCHMARKS.md`) mostly
+isn't a transform-selection problem at all and needs a different lever
+(e.g. a real per-block quantization RD search, `enableRdHfMult`'s
+still-unresolved distance-scaling gap, or something else entirely) —
+this round's numbers make that a much better-informed next decision than
+guessing would have been.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

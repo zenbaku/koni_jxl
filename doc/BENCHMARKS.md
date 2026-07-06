@@ -279,3 +279,31 @@ a claim to verify:
   halftone/line-art texture — a synthetic proxy built to *exercise* a
   feature isn't the same as one that *represents* typical content, and
   this is the concrete number that distinction cost.
+- **`enableRectangularTransforms`/`enableBespokeTransforms` real-manga ROI
+  (round 17, `tool/bench_manga_roi.dart`, reproducible against these
+  specific CBZ files though not by anyone else — 12 pages spread across
+  both chapters, 2 distances, 144 encodes total, zero RMSE regressions):**
+
+  ```
+  combo                 grand-total-bytes   vs. baseline   avg encode-time
+  baseline                     10057372         (base)          1.00x
+  +rect                        10029111         -0.28%          2.22x
+  +bespoke                     10034779         -0.22%          4.32x
+  +rect+bespoke                 9995928         -0.61%          5.10x
+  +32                          10004324         -0.53%          1.42x
+  +32+rect+bespoke              9971114         -0.86%          6.10x
+  ```
+
+  `+32` alone reproduces the DCT32x32 finding above almost exactly
+  (-0.53% vs. -0.0% to -0.6%) on an independent, larger page sample — a
+  cross-check that this repeatable harness measures the same thing that
+  earlier one-off process did. The best combo found (-0.86%, 6.1x encode
+  time) doesn't clear the bar either, for the same reason: real but small
+  relative to the encode-time cost. One real, previously-unmeasured risk
+  surfaced: `+bespoke` alone made one specific real page (the shortest,
+  sparsest page in the B&W chapter) **worse** by +4-5%, not just neutral
+  — see `doc/spec_notes.md`'s round 17 entry for the full write-up,
+  including why this doesn't invalidate the feature (combining it with
+  `+rect` routed around that specific case) but does mean its per-feature
+  "never worse" guarantee is weaker than `enableVariableTransforms`'s or
+  RDOQ's whole-image safety net. All defaults remain **off**.

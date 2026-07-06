@@ -852,26 +852,43 @@ output for where the gap actually is.
   `maxTransformSize` beyond 16 are ever considered for default-on, but not
   blocking anything currently shipped (all default off).
 
-- **Next phase, now that all 27 transform types exist: real-manga ROI
-  evaluation, and (separately, lower priority) a genuine joint search
-  over transform type/size.** Every tranche/size beyond the round-6
-  baseline (8x8/16x16) still defaults off or at its round-6 baseline
-  (`maxTransformSize: 16`, `enableRectangularTransforms: false`,
-  `enableBespokeTransforms: false`) because each round deliberately
-  scoped "does it exist and work" apart from "should it be on by default
-  for manga" (see `maxTransformSize`'s own doc comment for the DCT32x32
-  case study of why these are separate questions). With the full set now
-  built and the existing cascade's own rate estimates sharpened (round
-  16), the next phase is evaluating real `manga_samples/` pages across
-  the whole space — which combinations of tranche/size actually help
-  manga content, not just synthetic benchmarks — and only then
-  reconsidering any defaults. Separately, the cascade is still a fixed
-  bottom-up order (8x8 vs. 16x16 vs. rectangular vs. bespoke, then a
-  square-size cascade beyond that), never a genuine joint search over the
-  full 27-type space per region — a materially bigger change (real
-  encode-time cost, not just an accuracy improvement) that's worth
-  scoping only once the ROI question above narrows which types are
-  actually worth searching over.
+- ✅ **Real-manga ROI evaluation for `enableRectangularTransforms`/
+  `enableBespokeTransforms`/`maxTransformSize:32`, round 17.** Built a
+  repeatable harness (`tool/bench_manga_roi.dart` — CBZ pages are `.jxl`
+  files directly, decoded via this package's own already-validated
+  decoder, no new dependency) and swept 6 knob combinations × 2 distances
+  across 12 real pages from both `manga_samples/` chapters (144 encodes,
+  zero RMSE regressions). Result: real but small wins everywhere — best
+  combo (`+32+rect+bespoke`) reached -0.86% aggregate (up to -2.64% on
+  the flat-color chapter at distance 4.0) for **6.1x** baseline encode
+  time; `+32` alone reproduced round 7's already-shipped-off finding
+  almost exactly (-0.53% vs. round 7's -0.0% to -0.6%), a useful
+  cross-check of the new harness. A real, previously-unknown risk
+  surfaced: `+bespoke` alone made one specific real page (a sparse
+  page) **worse** by +4-5%, not just neutral — confirming
+  `enableRectangularTransforms`'s own documented "vs. plain 8x8, not vs.
+  whatever else is active" caveat also applies to bespoke, at a larger
+  magnitude than "rare, byte or two." Combining bespoke with rect masked
+  this specific case but that's confirmed on 12 pages, not proven in
+  general. **Decision: all defaults stay off** — none of this clears the
+  bar round 6's `enableVariableTransforms` fix cleared (0% to -3.1% real
+  win, foundational not marginal, cheap not 2-6x). See
+  doc/spec_notes.md's round 17 entry for the full numbers and the
+  encode-time table.
+- 🔲 **Remaining: a genuine joint search over transform type/size.** The
+  cascade is still a fixed bottom-up order (8x8 vs. 16x16 vs. rectangular
+  vs. bespoke, then a square-size cascade beyond that), never a genuine
+  joint search over the full 27-type space per region — a materially
+  bigger change (real encode-time cost, not just an accuracy improvement)
+  than anything shipped so far. Round 17 gives this a real baseline to
+  beat: under 1% real-manga improvement from bottom-up cascading, at
+  several-x encode time. Worth scoping now that this baseline exists —
+  but also worth weighing against the possibility (also flagged in round
+  17) that the remaining gap to `cjxl -e7` isn't primarily a
+  transform-selection problem at all (e.g. `enableRdHfMult`'s own
+  still-unresolved distance-scaling gap, or a real per-block quantization
+  RD search, might be a bigger lever than searching transform type/size
+  harder).
 
 ---
 
