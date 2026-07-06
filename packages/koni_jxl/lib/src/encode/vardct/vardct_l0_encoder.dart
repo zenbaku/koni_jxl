@@ -1173,9 +1173,13 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 /// candidate and keeps whichever is actually smaller, the same
 /// real-assembly safety net `_chooseAcClustering`/RDOQ already use
 /// elsewhere in this file, applied one level up (per-image instead of
-/// per-block-channel) — this decision's own cost estimate is only ever a
-/// bootstrap-frozen approximation (see point 3 below), so unlike RDOQ it
-/// cannot promise never-worse on its own; the outer safety net is what
+/// per-block-channel) — this decision's own cost estimate still uses a
+/// bootstrap-frozen *code-length table* (re-deriving it live at every
+/// level would mean re-running `_chooseAcClustering`'s own multi-
+/// candidate real-assembly search that many more times, not a cheap
+/// refresh — see point 3 below for the one piece that *is* kept live:
+/// each block's predicted non-zero count), so unlike RDOQ it cannot
+/// promise never-worse on its own; the outer safety net is what
 /// makes the combination never-worse regardless of how many cascade
 /// levels are enabled. Because the bootstrap candidate is always first in
 /// the list and every later candidate must have beaten its own
@@ -1214,21 +1218,27 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 ///    which candidate wins, only the values landing in it do.
 /// 3. For every 2x2-aligned candidate region, compare the real bootstrap
 ///    cost of its 4 already-committed 8x8 blocks (`sum(distortion + lambda
-///    * _blockRate(...))`, using each block's own frozen bootstrap
-///    `predicted` non-zero-count value) against a freshly quantized 16x16
-///    candidate's own cost (same formula) — keeping whichever is smaller.
-///    The 16x16 candidate reuses the region's top-left 8x8 block's own
-///    frozen `predicted` value: `HfCoefficients.getPredictedNonZeroes`
-///    depends only on the (already-decided) grid state to the region's
-///    west/north, not on this region's own footprint size, so this is
-///    *exact* whenever no earlier (west/north) region has itself been
-///    swapped to 16x16 yet, and an accepted approximation otherwise —
-///    identical in kind (not degree) to the approximation
-///    `_chooseHfMultRd`'s doc comment already documents and ships with.
+///    * _blockRate(...))`, using each block's own *live* `predicted`
+///    non-zero-count value — see `predictedForPosition`/`updateLiveGrid`
+///    below) against a freshly quantized 16x16 candidate's own cost (same
+///    formula) — keeping whichever is smaller. The 16x16 candidate's own
+///    `predicted` value comes from the same live grid, read at the
+///    region's own origin: `HfCoefficients.getPredictedNonZeroes` depends
+///    only on the single cell immediately west and immediately north, not
+///    on this region's own footprint size, so as long as `liveGrid` is
+///    kept current at every position a *later* lookup might read as a
+///    neighbor (which `updateLiveGrid` does, incrementally, every time a
+///    region's winner is decided — not by re-deriving the whole grid),
+///    this is exact, not an approximation — unlike the code-length table
+///    below, which stays frozen because refreshing *it* means re-running
+///    `_chooseAcClustering`'s multi-candidate real-assembly search, not a
+///    cheap incremental update.
 /// 4. A region that swaps to 16x16 gets a fresh `commit()` (overwriting
 ///    the bootstrap's 8x8 DC values at those 4 cells with the
-///    LLF-inverted 16x16-consistent ones); a region that stays 8x8 needs
-///    no further work — its bootstrap commit already stands.
+///    LLF-inverted 16x16-consistent ones) and its own `updateLiveGrid`
+///    call; a region that stays 8x8 needs no further work — its bootstrap
+///    commit (and the live grid entry `_computeGroupTokens` already wrote
+///    for it while seeding the grid, step 2) already stand.
 /// 5. For each size in [_cascadeSizes] up to [VardctL0Config.maxTransformSize]
 ///    (32, then 64, then 128, then 256), repeat steps 3/4 one level up:
 ///    merge the *previous* cascade level's layout (mixed 8x8/16x16/.../
@@ -1237,12 +1247,17 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 ///    smaller blocks it would replace, using the same frozen bootstrap
 ///    code-length table every level shares (transform-type choice never
 ///    shifts which cluster a token routes to, only what value lands
-///    there, regardless of which two sizes are being compared). A level
-///    that merges nothing is skipped (not appended as a candidate) but
-///    the cascade still tries the *next* size up on the unchanged layout
-///    — a size skipping over an intermediate one is architecturally rare
-///    but not provably impossible, and this project's own methodology is
-///    to verify by real assembly rather than assume monotonicity.
+///    there, regardless of which two sizes are being compared) but the
+///    same *live*, continuously-updated prediction grid every level
+///    shares too (so a 32x32 decision, for instance, sees the *real* fill
+///    pattern left behind by whichever 16x16/rectangular/bespoke merges
+///    already happened at its own west/north neighbors, not the original
+///    all-8x8 bootstrap's). A level that merges nothing is skipped (not
+///    appended as a candidate) but the cascade still tries the *next*
+///    size up on the unchanged layout — a size skipping over an
+///    intermediate one is architecturally rare but not provably
+///    impossible, and this project's own methodology is to verify by real
+///    assembly rather than assume monotonicity.
 List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     List<List<Float32List>> planes,
     _ChromaFromLumaFit cfl,
@@ -1268,7 +1283,6 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   // dcIntBootstrap — this becomes (unmodified) the "off" candidate's DC
   // plane, so nothing below may overwrite it; every merge level gets its
   // own clone (`tryMergeLevel`'s `dcIntNext`) instead.
-  final blockAt = List<_PlacedBlock?>.filled(bh * bw, null);
   final bootstrapBlocks = <_PlacedBlock>[
     for (var by = 0; by < bh; by++)
       for (var bx = 0; bx < bw; bx++) _PlacedBlock(by, bx, _tt8),
@@ -1276,7 +1290,6 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   for (final block in bootstrapBlocks) {
     block.computeAndQuantize(planes, cfl, refStep, sd, ctx8.rawWeight,
         scaleFactor, dcIntBootstrap, bw, scratchA, scratchB);
-    blockAt[block.by * bw + block.bx] = block;
   }
   final bootstrapByGroup =
       List<List<_PlacedBlock>>.generate(groupsX * groupsY, (_) => []);
@@ -1285,26 +1298,75 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     bootstrapByGroup[g].add(block);
   }
 
-  // 2. Bootstrap AC tokens/clustering -> frozen rate table.
-  final predictedOut = <_PlacedBlock, Int32List>{};
+  // 2. Bootstrap AC tokens/clustering -> frozen rate table (`clusterMap`/
+  // `lengths`; see this function's own doc comment for why re-deriving
+  // these fresh at every cascade level is neither necessary — the
+  // context a token routes to never depends on which candidate wins,
+  // only the value landing there does — nor cheap enough to be worth it
+  // regardless: `_chooseAcClustering` real-assembles several candidate
+  // cluster budgets against the *entire* image's tokens to pick the
+  // smallest, so it is not a statistics pass, it is several real encode
+  // passes). `liveGrid` (one non-zero-count grid per group, in the exact
+  // layout `HfCoefficients.getPredictedNonZeroes` expects) is seeded here
+  // too, via `_computeGroupTokens`'s `grid` parameter — unlike
+  // `clusterMap`/`lengths`, this piece of the rate estimate genuinely
+  // does go stale level over level (a block's predicted non-zero count
+  // depends on its *immediate* west/north neighbors' real fill, which
+  // changes the moment either neighbor is replaced by a differently-
+  // shaped merge) and is cheap to keep live: `tryMergeLevel` below reads
+  // and updates it incrementally, in the same raster-scan-with-skip
+  // order placement already requires, at O(1) per lookup/update — no
+  // re-running `_computeGroupTokens`/`_chooseAcClustering` needed.
+  final liveGrid =
+      List.generate(groupsX * groupsY, (_) => Int32List(3 * 32 * 32));
   final bootstrapTokens = <_GroupTokens>[
     for (var gy = 0; gy < groupsY; gy++)
       for (var gx = 0; gx < groupsX; gx++)
         _computeGroupTokens(gy * 32, gx * 32,
             bootstrapByGroup[gy * groupsX + gx], hfctx, ctxByType,
-            predictedOut: predictedOut),
+            grid: liveGrid[gy * groupsX + gx]),
   ];
   final bootstrap = _chooseAcClustering(bootstrapTokens);
   final lengths = bootstrap.codes.tokenBitLengths();
   final clusterMap = bootstrap.clusterMap;
   final lambda = (lambdaOverride ?? _kTransformRdLambda) * refStep * refStep;
 
-  // Each bootstrap block's own real rate against the frozen table,
-  // precomputed once (every 8x8 cell belongs to exactly one 2x2 region).
-  final rate8 = Float64List(bh * bw);
-  for (final block in bootstrapBlocks) {
-    rate8[block.by * bw + block.bx] = _blockRate(
-        ctx8, hfctx, block.acInt, predictedOut[block]!, clusterMap, lengths);
+  // Per-channel predicted non-zero count for whatever block currently (as
+  // of the most recent `updateLiveGrid` call touching its west/north
+  // neighbors) occupies position (by, bx) — `HfCoefficients
+  // .getPredictedNonZeroes` itself only ever looks at the single cell
+  // immediately west and immediately north (see that function), so
+  // `liveGrid` only needs to be current there, not globally recomputed.
+  Int32List predictedForPosition(int by, int bx) {
+    final groupX = bx ~/ 32, groupY = by ~/ 32;
+    final grid = liveGrid[groupY * groupsX + groupX];
+    final localY = by - groupY * 32, localX = bx - groupX * 32;
+    return Int32List.fromList([
+      for (var c = 0; c < 3; c++)
+        HfCoefficients.getPredictedNonZeroes(grid, c, localY, localX),
+    ]);
+  }
+
+  // Records a just-decided block's own real fill (its per-channel
+  // non-zero count, `dctSelectHeight x dctSelectWidth`-block-averaged the
+  // same way `_computeGroupTokens` does) into `liveGrid`, so any later
+  // position whose predicted count reads this block as its west or north
+  // neighbor sees the real value, not a stale bootstrap-derived one.
+  void updateLiveGrid(_PlacedBlock block) {
+    final groupX = block.bx ~/ 32, groupY = block.by ~/ 32;
+    final grid = liveGrid[groupY * groupsX + groupX];
+    final localY = block.by - groupY * 32, localX = block.bx - groupX * 32;
+    final ctx = ctxByType[block.tt.type]!;
+    final numBlocks = ctx.numBlocks;
+    for (var c = 0; c < 3; c++) {
+      final (_, countNonZero, _) = _scanChannelValues(ctx, block.acInt[c]);
+      final fill = (countNonZero + numBlocks - 1) ~/ numBlocks;
+      for (var iy = 0; iy < block.tt.dctSelectHeight; iy++) {
+        for (var ix = 0; ix < block.tt.dctSelectWidth; ix++) {
+          grid[c * 1024 + (localY + iy) * 32 + (localX + ix)] = fill;
+        }
+      }
+    }
   }
 
   // 3/4/5. Per-region decision, in the same raster-scan-with-skip order the
@@ -1315,10 +1377,10 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   // dctSelectHeight x dctSelectWidth footprint, compare the real summed
   // cost of whatever distinct blocks the *previous* layout already placed
   // there against a freshly quantized candidate of that type, keeping
-  // whichever is smaller. `layoutBlockAt` extends `blockAt`'s
-  // one-cell-per-block bootstrap lookup to the current layout's mixed
-  // footprints, using each block's own independent height/width (not
-  // assumed square, unlike the code this replaced).
+  // whichever is smaller. `layoutBlockAt` is a one-cell-per-block lookup
+  // into the *current* layout's mixed footprints, using each block's own
+  // independent height/width (not assumed square, unlike the code this
+  // replaced).
   //
   // The containment guard below is required once non-nesting shapes coexist
   // (DCT 16x8 and DCT 8x16 share no containment relationship — each spans
@@ -1354,19 +1416,13 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
         }
       }
     }
-    // An 8x8 block reuses the precomputed `rate8` array; any larger block
-    // gets its real rate computed on demand against its own bootstrap-origin
-    // `predicted` value — cheap, and only once per distinct block thanks to
-    // `seen` below.
+    // Every block's real rate computed on demand against its own current
+    // (live-grid) `predicted` value — cheap (a handful of array reads plus
+    // one already-quantized block's own token pass, not an image-wide
+    // pass), and only once per distinct block thanks to `seen` below.
     double blockRateIn(_PlacedBlock block) {
-      if (block.tt == _tt8) return rate8[block.by * bw + block.bx];
-      return _blockRate(
-          ctxByType[block.tt.type]!,
-          hfctx,
-          block.acInt,
-          predictedOut[blockAt[block.by * bw + block.bx]!]!,
-          clusterMap,
-          lengths);
+      return _blockRate(ctxByType[block.tt.type]!, hfctx, block.acInt,
+          predictedForPosition(block.by, block.bx), clusterMap, lengths);
     }
 
     final dcIntNext = [for (final ch in dcIntIn) Int32List.fromList(ch)];
@@ -1410,7 +1466,7 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
             final (mult, quant) = candidate.chooseCandidate(
                 coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
             final rate = _blockRate(ctx, hfctx, quant.ac,
-                predictedOut[blockAt[by * bw + bx]!]!, clusterMap, lengths);
+                predictedForPosition(by, bx), clusterMap, lengths);
             final cost = quant.distortion + lambdaForLevel * rate;
 
             if (cost < costIn) {
@@ -1420,6 +1476,7 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
                   'merge candidate not aligned to its own dctSelect '
                   'footprint');
               candidate.commit(quant, mult, dcIntNext, bw);
+              updateLiveGrid(candidate);
               merged = candidate;
             }
           }
@@ -2969,18 +3026,24 @@ int _blockChannelTokens(
 /// is preserved by construction. The non-zero prediction grid is local to
 /// the group (in 8x8-cell units relative to the group's own origin,
 /// [groupOriginY]/[groupOriginX]), mirroring a fresh `HfCoefficients` per
-/// (pass, group) in the decoder. When [predictedOut] is given, records
-/// each (block, channel)'s `predicted` value there — used by the RD-hfMult
-/// search (`_chooseHfMultRd`) to freeze a bootstrap pass's prediction
-/// context for scoring later candidates, without re-deriving it live.
+/// (pass, group) in the decoder — [grid], if given, is written into
+/// directly instead of a fresh one being allocated, so a caller that needs
+/// this group's *final* fill state afterward (`_decideTransformLayout`'s
+/// live prediction grid, seeded from the bootstrap pass this same call
+/// already computes) gets it with no separate pass. When [predictedOut]
+/// is given, records each (block, channel)'s `predicted` value there —
+/// used by the RD-hfMult search (`_chooseHfMultRd`) to freeze a bootstrap
+/// pass's prediction context for scoring later candidates, without
+/// re-deriving it live.
 _GroupTokens _computeGroupTokens(
     int groupOriginY,
     int groupOriginX,
     List<_PlacedBlock> blocksInGroup,
     HfBlockContext hfctx,
     Map<int, _TransformCtx> ctxByType,
-    {Map<_PlacedBlock, Int32List>? predictedOut}) {
-  final nonZeroesGrid = Int32List(3 * 32 * 32);
+    {Map<_PlacedBlock, Int32List>? predictedOut,
+    Int32List? grid}) {
+  final nonZeroesGrid = grid ?? Int32List(3 * 32 * 32);
   final tokens = _GroupTokens();
   for (final block in blocksInGroup) {
     final ctx = ctxByType[block.tt.type]!;

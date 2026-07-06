@@ -809,23 +809,69 @@ output for where the gap actually is.
   transform-type-completeness effort's own cleanup backlog. See
   doc/spec_notes.md for the full write-up.
 
+- ✅ **Round 16: a live prediction grid sharpens the transform-size
+  cascade — the "sharper cascade" scope of "a real rate-distortion search
+  over transform size."** Scoped before implementing (see doc/
+  spec_notes.md): a literal "refresh at every level" would mean re-
+  running `_chooseAcClustering` 5+ more times per candidate, and that
+  function is not a statistics pass — it real-assembles the entire
+  image's tokens through several candidate cluster budgets just to
+  measure the smallest, an expensive thing to multiply. The other frozen
+  input, each block's "predicted non-zero count," is cheap to keep live
+  instead (an O(1) west/north-neighbor dependency, not image-wide), so
+  that's what got fixed: a live per-group prediction grid, seeded by
+  `_computeGroupTokens` while it builds the bootstrap's own tokens (no
+  duplicate pass) and updated incrementally by `tryMergeLevel` as each
+  region's winner is decided, replacing the old scheme that always read a
+  position's predicted value from the *original all-8x8 bootstrap* block
+  there regardless of what any west/north neighbor had since become —
+  even within one level's own raster scan, not just across levels.
+  Verified via a git-worktree A/B at the pre-round commit: at a config
+  that actually exercises multiple cascade levels (`maxTransformSize:
+  256`, rectangular + bespoke both on), a real, sometimes substantial
+  improvement (up to ~4%, -727B on a small corpus file) at 3 of 4 tested
+  distances; smaller but still nonzero at the default (single-level)
+  config. Confirmed correct via djxl (RMSE 0.41-0.47, well within gate).
+  Full suite green (385 tests, unchanged — this changes which candidate a
+  greedy decision favors, not the never-worse outer safety net);
+  `flutter test` green; no measurable timing regression. See
+  doc/spec_notes.md for the full write-up.
+
+- 🔲 **Follow-up, found not fixed: elevated RMSE at one specific non-
+  default config.** `screentone_256_d0_e7.pgm`, `maxTransformSize: 256`
+  + `enableRectangularTransforms: true` + `enableBespokeTransforms: true`,
+  distance=1.0, decodes through djxl with RMSE 3.24 — above this
+  project's usual `< 2.0` gate. Confirmed (via a git-worktree check
+  against the pre-round-16 commit) to be byte-for-byte pre-existing, not
+  introduced by round 16 or the customParamsByIndex cleanup — a real
+  latent gap in this specific combination of flags/content/distance, not
+  currently caught by the standard test suite's own synthetic "genuinely
+  wins" content. Worth root-causing (likely somewhere in the interaction
+  between a large cascade and RDOQ/hfMult's own heuristics) before
+  `enableRectangularTransforms`/`enableBespokeTransforms`/
+  `maxTransformSize` beyond 16 are ever considered for default-on, but not
+  blocking anything currently shipped (all default off).
+
 - **Next phase, now that all 27 transform types exist: real-manga ROI
-  evaluation and a real rate-distortion search over transform size.**
-  Every tranche/size beyond the round-6 baseline (8x8/16x16) still
-  defaults off or at its round-6 baseline (`maxTransformSize: 16`,
-  `enableRectangularTransforms: false`, `enableBespokeTransforms: false`)
-  because each round deliberately scoped "does it exist and work" apart
-  from "should it be on by default for manga" (see `maxTransformSize`'s
-  own doc comment for the DCT32x32 case study of why these are separate
-  questions). With the full set now built, the next phase is evaluating
-  real `manga_samples/` pages across the whole space — which combinations
-  of tranche/size actually help manga content, not just synthetic
-  benchmarks — and only then reconsidering any defaults. Separately, every
-  round so far has picked between a fixed cascade of candidate sizes/types
-  per region (bootstrap 8x8 vs. 16x16 vs. rectangular vs. bespoke, etc.),
-  never a genuine joint rate-distortion search over the full 27-type
-  space per region — worth scoping once the ROI question above narrows
-  which types are worth searching over at all.
+  evaluation, and (separately, lower priority) a genuine joint search
+  over transform type/size.** Every tranche/size beyond the round-6
+  baseline (8x8/16x16) still defaults off or at its round-6 baseline
+  (`maxTransformSize: 16`, `enableRectangularTransforms: false`,
+  `enableBespokeTransforms: false`) because each round deliberately
+  scoped "does it exist and work" apart from "should it be on by default
+  for manga" (see `maxTransformSize`'s own doc comment for the DCT32x32
+  case study of why these are separate questions). With the full set now
+  built and the existing cascade's own rate estimates sharpened (round
+  16), the next phase is evaluating real `manga_samples/` pages across
+  the whole space — which combinations of tranche/size actually help
+  manga content, not just synthetic benchmarks — and only then
+  reconsidering any defaults. Separately, the cascade is still a fixed
+  bottom-up order (8x8 vs. 16x16 vs. rectangular vs. bespoke, then a
+  square-size cascade beyond that), never a genuine joint search over the
+  full 27-type space per region — a materially bigger change (real
+  encode-time cost, not just an accuracy improvement) that's worth
+  scoping only once the ROI question above narrows which types are
+  actually worth searching over.
 
 ---
 

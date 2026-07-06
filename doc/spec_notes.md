@@ -2638,6 +2638,106 @@ changed; no round-trip behavior changed for any config that already
 passed its own tests. This closes the last item from the transform-type-
 completeness effort's own cleanup backlog.
 
+### Lossy (VarDCT) encoder — round 16: a live prediction grid sharpens the transform-size cascade
+
+The first item of the "next phase" (ROADMAP.md): "a real rate-distortion
+search over transform size itself." Investigated the scope before
+touching code, since the phrase could mean several different things with
+very different cost/risk profiles — a sharper version of the existing
+bottom-up cascade (8x8 -> 16x16 -> 32 -> ... with better rate estimates),
+a genuine joint per-region search over many/most of the 27 types (a much
+bigger change, closer to what other codecs call RDO block partitioning),
+or something to defer until the real-manga ROI evaluation narrows which
+types are even worth searching over. Chose the first, sharper-cascade
+option.
+
+**What was actually approximate, precisely**: `_decideTransformLayout`'s
+per-region cost estimate (`distortion + lambda * _blockRate(...)`) has
+two frozen inputs — the Huffman code-length table (`clusterMap`/
+`lengths`, from `_chooseAcClustering`) and each block's own "predicted
+non-zero count" (an entropy-context input, from `HfCoefficients
+.getPredictedNonZeroes`, itself dependent on the immediate west/north
+neighbors' real fill state). Investigating the actual cost of refreshing
+each found they are NOT equally expensive: `_chooseAcClustering` is not
+a statistics pass — it tries several candidate cluster-count budgets and,
+for each, real-assembles the *entire* image's token stream through
+`EntropyCodes.build` + a full `BitWriter` pass just to measure which
+budget is smallest. Re-running it at every cascade level would mean 5+
+more of these expensive full-image passes per assembled candidate, on
+top of the multi-candidate real-assembly step the cascade already pays
+for — a real, possibly large, encode-time cost. The predicted-non-zero-
+count piece is a different story: `getPredictedNonZeroes` only ever
+reads the single cell immediately west and immediately north of a
+position — an O(1) dependency, cheap to keep live incrementally, no
+image-wide re-pass needed.
+
+**The fix**: kept `clusterMap`/`lengths` frozen from the bootstrap
+(unchanged — the existing soundness argument for that piece, that
+transform-type choice never shifts which cluster a token routes to, only
+what value lands there, still holds regardless of how many levels
+refresh their code lengths). Added a live, per-group `Int32List(3*32*32)`
+prediction grid (`liveGrid`) that `_computeGroupTokens` seeds directly
+while building the bootstrap's own tokens (a new optional `grid`
+parameter — no duplicate logic, the same pass already computes exactly
+this state) and that `tryMergeLevel` reads and updates incrementally, in
+the same raster-scan-with-skip order placement already requires: read
+the current live value before scoring a region's candidates
+(`predictedForPosition`), write the real winner's own fill value after
+deciding (`updateLiveGrid`). This replaces the old scheme, which always
+read a position's predicted value from the *original all-8x8 bootstrap*
+block there (via a `blockAt`/`predictedOut` indirection removed
+entirely) regardless of what any west/north neighbor had since become at
+an earlier level or even an earlier region within the *same* level's own
+raster scan. Also dropped the `rate8` precomputed-array fast path for
+still-8x8 blocks, since its whole premise (an untouched 8x8 block's rate
+never changes across levels) no longer holds once its neighbors' live
+state can change it — every block's rate is now computed fresh via
+`_blockRate`, a per-block (not per-image) cost.
+
+**Verified real, not assumed**: a git-worktree A/B at the pre-round-15
+commit (e364d23) isolates this round's combined effect (this fix plus
+round 15's own cleanup) on a small corpus file
+(`screentone_256_d0_e7.pgm`) at a config that actually exercises multiple
+cascade levels/pre-passes (`maxTransformSize: 256`,
+`enableRectangularTransforms: true`, `enableBespokeTransforms: true`):
+-309B / 0B / -643B / -727B at distances 0.5/1.0/2.0/4.0 respectively — a
+real, sometimes substantial (up to ~4% on this file) improvement, not
+noise. At the *default* config (a single always-on 16x16 level, no
+cascade beyond it, rectangular/bespoke off), the effect is much smaller
+(0 to -184B across the same 4 distances on `gray_screentone_d0_e7.pgm`)
+but still nonzero — even a single level's own raster scan has multiple
+sequential regions whose real fill can affect each other, which the old
+scheme's `blockAt`-based lookup never captured either. Confirmed correct
+via djxl at the multi-level config: RMSE 0.41-0.47 at 3 of the 4
+distances, well within the `< 2.0` gate. Full suite green (385 tests,
+unchanged — this only changes which candidate a greedy decision favors,
+not the never-worse outer real-assembly safety net); `flutter test`
+green; timing consistent with every prior measurement in this session
+(~17s for the default config on `gray_screentone`, no measurable
+regression from dropping the `rate8` fast path).
+
+**A pre-existing, unrelated finding surfaced along the way, not
+introduced by this round**: at the multi-level config, distance=1.0,
+`screentone_256_d0_e7.pgm` decodes through djxl with RMSE 3.24 — above
+this project's usual `< 2.0` gate. Confirmed via the same e364d23
+worktree that this is byte-for-byte identical (same 15778B, same 3.24
+RMSE) with or without this round's changes — a real, pending gap in this
+*specific* non-default combination (large `maxTransformSize` +
+rectangular + bespoke all enabled, on this specific screentone content,
+at this specific distance), not something this round caused or should
+paper over by silently adjusting a threshold. Flagged in ROADMAP.md as a
+follow-up, not fixed here (out of this round's scope, and the standard
+"genuinely wins" test suite's own synthetic content doesn't happen to
+trigger it, so it's not blocking anything currently shipped).
+
+**Shipped**: `_decideTransformLayout`'s per-region rate estimate now uses
+a live, continuously-updated prediction grid instead of one frozen from
+the all-8x8 bootstrap, while keeping the (expensive-to-refresh) Huffman
+code-length table frozen as before — a scoped, measured "sharper
+cascade," not the more invasive joint-search alternative. No config
+default changed; the never-worse guarantee is structurally unaffected
+(it never depended on how accurate the greedy per-level estimate is).
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
