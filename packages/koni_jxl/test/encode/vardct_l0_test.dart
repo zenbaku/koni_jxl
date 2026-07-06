@@ -1525,14 +1525,17 @@ void main() {
   // canvas with a 4x4-quadrant checkerboard of amplitude 12 (period 4,
   // +-12 around a mid-gray base -- deliberately gentler than DCT4x4's own
   // +-85 checkerboard, which stays a DCT4x4 win at this amplitude) makes
-  // Hornuss or DCT2x2 win outright over plain 8x8 and DCT4x4 across the
-  // whole standard distance range, though which of the two wins varies by
-  // distance (both are real, greedy-order-dependent wins, not one type
-  // dominating everywhere -- expected, since `tryMergeLevel` runs
-  // Hornuss/DCT2x2/DCT4x4 as three independent greedy passes, not a joint
-  // 4-way choice per cell; see the bespoke pre-pass's own doc comment):
-  // confirmed via the encdebug tally as {Hornuss: 16} at distance=0.5, then
-  // {DCT 2x2: 16} at 1.0/2.0/4.0.
+  // some bespoke type win outright over plain 8x8 across the whole
+  // standard distance range, though which one wins varies by distance —
+  // a real, content-dependent effect, not one type dominating everywhere.
+  // Re-confirmed via the encdebug tally after round 18's joint-argmin
+  // rewrite of `decideLevel0` (`_decideTransformLayout`'s doc comment):
+  // {Hornuss: 16} at distance=0.5, {DCT 4x4: 16} at 1.0/2.0/4.0 — the
+  // true per-cell argmin picks DCT4x4 at the three higher distances here,
+  // not DCT2x2 as an earlier (order-dependent, pre-round-18) measurement
+  // of this same content found; this test only asserts bespoke-beats-
+  // plain, not which specific type wins, so the assertion itself didn't
+  // need to change.
   for (final distance in [0.5, 1.0, 2.0, 4.0]) {
     test(
         'Hornuss/DCT2x2 (Tranche C, opt-in) genuinely win on a gentle '
@@ -2385,6 +2388,227 @@ void main() {
 
       if (!_haveDjxl) return;
       final dir = Directory.systemTemp.createTempSync('koni_lossy_afv_mix');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        expect(ref.width, width);
+        expect(ref.height, height);
+
+        var dSumSq = 0.0;
+        var dn = 0;
+        for (var c = 0; c < 3; c++) {
+          final ours = channelAsInts(image.channels[c], 255);
+          final theirs = ref.intPlanes![c];
+          for (var j = 0; j < width * height; j++) {
+            final d = ours[j] - theirs[j];
+            dSumSq += d * d;
+            dn++;
+          }
+        }
+        final rmse = math.sqrt(dSumSq / dn);
+        expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    });
+  }
+
+  // Round 18: `decideLevel0` replaced the old sequential bespoke pre-pass
+  // (9 separate whole-image `tryMergeLevel` passes, each only comparing
+  // against whatever the *previous* type's pass had already committed
+  // nearby) with a true per-cell N-way argmin — see
+  // `_decideTransformLayout`'s doc comment and doc/spec_notes.md's round
+  // 18 entry. The defect the old design had: a cell's *rate* estimate
+  // depends on its west/north neighbors' live-grid fill, which each
+  // separate whole-image pass mutated as it went — so the same type at
+  // the same cell could score differently purely because of list order,
+  // not because of anything about the cell itself.
+  //
+  // This test places two ADJACENT cells, each engineered to favor a
+  // *different* bespoke type — AFV0 (near the start of `decideLevel0`'s
+  // internal type list) and AFV2 (near the end), reusing the exact
+  // winning patterns the standalone AFV0/AFV2 tests above already
+  // established — then checks the SAME total byte count results whether
+  // AFV0 is on the west side and AFV2 on the east, or vice versa (an
+  // exact-symmetry check, not just "both eventually get picked somehow":
+  // confirmed empirically via the encdebug tally, `{AFV0: 1, AFV2: 1}`
+  // either way, 92B both times). Under the old order-dependent design
+  // this exact equality wasn't guaranteed (whichever type happened to be
+  // tried first for a cell could commit before the true best type got a
+  // fair, unbiased comparison); under the true joint argmin it holds by
+  // construction, since each cell is scored once, against the same kind
+  // of snapshot regardless of which side it's on.
+  test(
+      'decideLevel0 picks the true per-cell best regardless of which '
+      'position favors which bespoke type (order/position invariance)', () {
+    const width = 16, height = 8;
+    Uint8List build({required bool afv0Left}) {
+      final pixels = Uint8List(width * height * 3);
+      var i = 0;
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final lx = x % 8, ly = y % 8;
+          final isAfv0Cell = x < 8;
+          final wantAfv0Corner = isAfv0Cell == afv0Left;
+          final corner = wantAfv0Corner
+              ? (lx < 4 && ly < 4) // AFV0's winning corner
+              : (lx >= 4 && ly >= 4); // AFV2's winning corner
+          final v = (corner ? 200 : (128 + (lx - ly) * 5)).clamp(0, 255);
+          pixels[i++] = v;
+          pixels[i++] = v;
+          pixels[i++] = v;
+        }
+      }
+      return pixels;
+    }
+
+    final normal = build(afv0Left: true); // AFV0 west, AFV2 east
+    final mirrored = build(afv0Left: false); // AFV2 west, AFV0 east
+    final base = VardctL0Config.fromDistance(1.0);
+    final config = VardctL0Config(
+        quantLF: base.quantLF,
+        acScale: base.acScale,
+        enableVariableTransforms: true,
+        enableBespokeTransforms: true);
+    final encNormal = encodeLossyVardctL0(normal,
+        width: width, height: height, config: config);
+    final encMirrored = encodeLossyVardctL0(mirrored,
+        width: width, height: height, config: config);
+    expect(encNormal.length, encMirrored.length,
+        reason: 'AFV0/AFV2 (${encNormal.length}B west/east) vs. AFV2/AFV0 '
+            '(${encMirrored.length}B west/east) should encode to the exact '
+            'same size — each cell\'s own best type shouldn\'t depend on '
+            'which side of the image it happens to sit on');
+
+    final withoutBespoke = encodeLossyVardctL0(normal,
+        width: width,
+        height: height,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            enableVariableTransforms: true,
+            enableBespokeTransforms: false));
+    expect(encNormal.length, lessThan(withoutBespoke.length),
+        reason: 'both cells choosing their own genuine best bespoke type '
+            '(${encNormal.length}B) should beat plain 8x8 '
+            '(${withoutBespoke.length}B)');
+
+    if (!_haveDjxl) return;
+    for (final encoded in [encNormal, encMirrored]) {
+      final dir = Directory.systemTemp.createTempSync('koni_lossy_l0_argmin');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        final image = JxlDecoder.decode(encoded);
+        var sumSq = 0.0;
+        var n = 0;
+        for (var c = 0; c < 3; c++) {
+          final ours = channelAsInts(image.channels[c], 255);
+          final theirs = ref.intPlanes![c];
+          for (var j = 0; j < width * height; j++) {
+            final d = ours[j] - theirs[j];
+            sumSq += d * d;
+            n++;
+          }
+        }
+        expect(math.sqrt(sumSq / n), lessThan(2.0));
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }
+  });
+
+  // Round 18: the exact knob combination round 17's real per-page
+  // regression involved (`enableBespokeTransforms` alone regressed one
+  // real manga page by +4-5%; combining it with `enableRectangularTransforms`
+  // masked that specific case under the *old* design) was previously
+  // untested outside the standalone `tool/bench_manga_roi.dart` harness —
+  // extends the existing "all nine bespoke types" mixed-layout content
+  // (round 14) with `enableRectangularTransforms: true` alongside
+  // `enableBespokeTransforms: true`, so both Level 0 (bespoke) and Level 1
+  // (16x8/8x16 pairs, whole 16x16) get real, simultaneous exercise across
+  // a mixed real layout, not just each flag in isolation.
+  for (final distance in [0.5, 1.0, 2.0, 4.0]) {
+    test(
+        'bespoke + rectangular transforms combined round-trip correctly '
+        'in the same mixed layout at distance=$distance', () {
+      const width = 128, height = 64;
+      final rng = math.Random(42);
+      final pixels = Uint8List(width * height * 3);
+      var i = 0;
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final col = x ~/ 32, row = y ~/ 32;
+          int v;
+          if (row == 0 && col == 0) {
+            v = 128 + ((x ~/ 4 + y ~/ 4).isEven ? 12 : -12);
+          } else if (row == 0 && col == 1) {
+            v = (128 + rng.nextInt(11) - 5).clamp(0, 255);
+          } else if (row == 0 && col == 2) {
+            final qy = y ~/ 4, qx = x ~/ 4;
+            v = (qy + qx).isEven ? 40 : 210;
+          } else if (row == 0 && col == 3) {
+            final rowBase = (y % 8) < 4 ? 170 : 130;
+            v = (rowBase + 6 * (x % 8) - 24).clamp(0, 255);
+          } else if (row == 1 && col == 0) {
+            final colBase = (x % 8) < 4 ? 170 : 130;
+            v = (colBase + 6 * (y % 8) - 24).clamp(0, 255);
+          } else if (row == 1 && col == 1) {
+            final lx = x % 8, ly = y % 8;
+            v = (lx < 4 && ly < 4) ? 200 : (128 + (lx - ly) * 5);
+          } else if (row == 1 && col == 2) {
+            final lx = x % 8, ly = y % 8;
+            v = (lx >= 4 && ly < 4) ? 200 : (128 + (lx - ly) * 10);
+          } else {
+            v = (y * 200 / height).round().clamp(0, 255);
+          }
+          pixels[i++] = v;
+          pixels[i++] = v;
+          pixels[i++] = v;
+        }
+      }
+      final base = VardctL0Config.fromDistance(distance);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: width,
+          height: height,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: true,
+              enableRectangularTransforms: true));
+
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, width);
+      expect(image.height, height);
+
+      var sumSq = 0.0;
+      var n = 0;
+      final decoded = image.toRgba8();
+      for (var p = 0; p < width * height; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      expect(math.sqrt(sumSq / n), lessThan(30.0),
+          reason: 'decode-vs-original RMSE should stay bounded with both '
+              'flags on together, not just each in isolation');
+
+      if (!_haveDjxl) return;
+      final dir =
+          Directory.systemTemp.createTempSync('koni_lossy_rect_bespoke_mix');
       try {
         final jxlPath = '${dir.path}/t.jxl';
         final outPath = '${dir.path}/t.ppm';

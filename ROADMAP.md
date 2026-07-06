@@ -875,20 +875,45 @@ output for where the gap actually is.
   win, foundational not marginal, cheap not 2-6x). See
   doc/spec_notes.md's round 17 entry for the full numbers and the
   encode-time table.
-- 🔲 **Remaining: a genuine joint search over transform type/size.** The
-  cascade is still a fixed bottom-up order (8x8 vs. 16x16 vs. rectangular
-  vs. bespoke, then a square-size cascade beyond that), never a genuine
-  joint search over the full 27-type space per region — a materially
-  bigger change (real encode-time cost, not just an accuracy improvement)
-  than anything shipped so far. Round 17 gives this a real baseline to
-  beat: under 1% real-manga improvement from bottom-up cascading, at
-  several-x encode time. Worth scoping now that this baseline exists —
-  but also worth weighing against the possibility (also flagged in round
-  17) that the remaining gap to `cjxl -e7` isn't primarily a
-  transform-selection problem at all (e.g. `enableRdHfMult`'s own
-  still-unresolved distance-scaling gap, or a real per-block quantization
-  RD search, might be a bigger lever than searching transform type/size
-  harder).
+- ✅ **Level 0/1 made genuinely joint (not greedy), round 18 — real bugs
+  fixed, real-manga ROI got *worse*, not better.** Replaced the 8x8-tier
+  bespoke choice (`decideLevel0`) and the 16x16-tier whole/pair/stay-split
+  choice (`decideLevel1`) with true per-region N-way argmins, fixing a
+  real ordering artifact (a cell's rate estimate depended on which nearby
+  cells other bespoke types' own separate whole-image passes had already
+  committed) and — caught before shipping, via this project's own
+  "verify by real assembly" discipline — a self-introduced estimate-vs-
+  real-bytes safety-net gap. Encode time dropped substantially where
+  touched (`+bespoke`: 4.32x → 2.45x baseline). **But** re-running
+  `tool/bench_manga_roi.dart`'s full sweep found every combo's real-manga
+  compression win *shrank* relative to round 17 (best combo: -0.86% →
+  -0.51%), and the specific Naruto page-017 regression round 17 flagged
+  is numerically unchanged *and* no longer recovered by combining with
+  `enableRectangularTransforms` (round 17: -0.11%/-0.58% recovery; round
+  18: no recovery, identical to `+bespoke` alone) — round 17's recovery
+  turned out to be an accident of the old code's processing order (rect
+  happened to claim some cells before bespoke's own pass could regress
+  them), not a designed safeguard, and it doesn't survive a more
+  principled Level-0-then-Level-1 separation of concerns. This round's
+  own pre-stated success criterion (shrink the page-017 regression,
+  improve aggregate wins) was **not met** — a real, disclosed negative
+  result, not a hidden one. See doc/spec_notes.md's round 18 entry for
+  the full numbers and root-cause analysis.
+- 🔲 **Remaining: a genuinely *unified* joint search, not sequential
+  joint levels.** Round 18's finding reframes this: Level 0 and Level 1
+  are each individually a true argmin now, but running them as sequential
+  layers (Level 0 commits, *then* Level 1 decides on top) is not the same
+  as a genuinely joint decision across both — recovering round 17's
+  serendipitous rect/bespoke interaction would need evaluating {4
+  independent leaf choices} vs. {16x16 whole} vs. {16x8/8x16 pairs} all
+  simultaneously per region, not Level 0 first then Level 1 layered on —
+  a materially bigger change than round 18's scope, before ever
+  extending further to 32/64/128/256. Also still worth weighing against
+  the possibility (flagged in round 17) that the remaining gap to
+  `cjxl -e7` isn't primarily a transform-selection problem at all (e.g.
+  `enableRdHfMult`'s own still-unresolved distance-scaling gap, or a real
+  per-block quantization RD search, might be a bigger lever than
+  searching transform type/size harder).
 
 ---
 

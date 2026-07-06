@@ -2850,6 +2850,137 @@ still-unresolved distance-scaling gap, or something else entirely) —
 this round's numbers make that a much better-informed next decision than
 guessing would have been.
 
+### Lossy (VarDCT) encoder — round 18: a genuine joint decision for Levels 0/1 — real bugs fixed, real-manga ROI got *worse*, not better
+
+The first concrete step on round 17's "joint search" question: replace
+the 8x8-tier bespoke choice and the 16x16-tier whole/pair/stay-split
+choice with true per-region N-way argmins, instead of the fixed
+sequential chain of pairwise `tryMergeLevel` swaps every prior round
+used. Two research agents plus a design-validation agent (reading the
+actual code, not inferring) confirmed the precise defect the encoder's
+own comment already named (`enableBespokeTransforms`'s doc comment,
+pre-this-round: *"greedy, not a joint 10-way choice... only which greedy
+opportunity gets found first"*): each bespoke type's own whole-image
+`tryMergeLevel` pass mutates the shared live prediction grid as it goes,
+so a `(cell, type)` pair's *rate* estimate depends on which unrelated
+nearby cells other, earlier-run types already committed — an ordering
+artifact, not a fact about the cell.
+
+**Shipped**: `decideLevel0` (a true 10-way argmin per 8x8 cell, one
+raster sweep, replacing the 9-separate-whole-image-pass bespoke
+pre-pass) and `decideLevel1` (a true argmin per 16x16 region among stay-
+split, whole-16x16, and the 16x8/8x16 half-strip pairs, replacing both
+the old rectangular pre-pass and the always-on 16x16 decision). A pair
+candidate's second sub-block has a real intra-region dependency on the
+first's own committed fill (its west/north neighbor read lands inside
+the first sub-block's footprint) — scored via a speculative "poke,
+score, restore" step (`writeLiveGridCells`/`snapshotGridCells`/
+`restoreGridCells`) so every candidate in a region compares against the
+same starting state. `_tt8x32`/`_tt32x8` (the only 4:1-line case, no
+matching square tier) were relocated to run *after* Level 0/1 instead of
+before — required, not cosmetic: Level 0's simplified per-cell sweep
+assumes every cell starts as an independent 1x1 block, which no longer
+holds once a 4-cell-line block has already claimed part of the grid.
+
+**A real bug found and fixed before it shipped, via the project's own
+"verify by real assembly" discipline**: the first working version of
+this round exposed only Level 1's own final result as a real-assembled
+candidate (reasoning: Level 1's own argmin already includes "stay split"
+— i.e. Level 0's result — as one of its compared options, so it seemed
+redundant to expose both). Content engineered so every cell's true
+argmin was a bespoke type hit this directly: Level 1's *estimate*
+preferred merging into 16x16 over staying split, but the real assembled
+bytes disagreed sharply (211B for the 16x16 merge vs. 167B for staying
+split) — without Level 0's own result as its own real-assembled
+candidate, that better layout was never tried for real at all. Fixed by
+exposing *both* Level 0's own result and Level 1's own result as
+separate candidates whenever each differs from what came before (2
+candidates in the common case, down from the old design's up to ~14,
+still a first-order win on its own). This also fixed two now-failing
+"genuinely wins" regression tests (DCT4x8/DCT8x4) that had gone from a
+strict win to an exact tie once the estimate-vs-real gap was introduced
+— confirming the fix, not just the symptom, was addressed.
+
+**New tests**: an order/position-invariance test (two adjacent cells
+each favoring a different bespoke type — AFV0, AFV2 — checked for exact
+byte-count symmetry regardless of which side of the image each sits on;
+92B either way, confirmed via the encdebug tally showing `{AFV0: 1,
+AFV2: 1}` both times) and a combined-bespoke+rectangular mixed-layout
+test (the exact flag combination round 17's real regression involved,
+previously untested outside `tool/bench_manga_roi.dart`). 390 tests up
+from 385, all green; `dart analyze` clean; `flutter test` green.
+
+**The honest result, from re-running `tool/bench_manga_roi.dart`'s full
+144-encode sweep and comparing directly against round 17's committed
+numbers: real-manga compression ROI got *worse*, not better, and this
+round's own pre-stated success criterion — shrink or eliminate the
+Naruto page-017 regression, improve the aggregate wins — was not met.**
+
+```
+combo               round 17    round 18    encode-time (r17 -> r18)
+baseline               (base)      (base)      1.00x  ->  1.00x
++rect                  -0.28%      -0.20%      2.22x  ->  2.03x
++bespoke               -0.22%      -0.20%      4.32x  ->  2.45x
++rect+bespoke          -0.61%      -0.29%      5.10x  ->  3.50x
++32                    -0.53%      -0.53%      1.42x  ->  1.43x
++32+rect+bespoke       -0.86%      -0.51%      6.10x  ->  4.49x
+```
+
+`baseline` and `+32` are bit-for-bit unaffected (neither touches Level
+0's bespoke logic or Level 1's rect-pair logic) — a useful internal
+consistency check that this round's rewrite is scoped exactly where
+intended. Every combo that *does* touch the new code got real,
+measurable encode-time wins (bespoke alone: 4.32x -> 2.45x — the
+"collapse ~14 candidates to ~2" design goal, delivered) but a real,
+measurable *compression* regression relative to round 17.
+
+**Root cause, confirmed on the exact flagged page**: Naruto page 017's
+`+bespoke`-alone regression is numerically identical between rounds
+(+4.04%/+5.39% — round 17's own old sequential-pass architecture and
+round 18's true joint argmin produce the *same* per-cell bespoke choices
+here, meaning round 17's specific regression was never actually caused
+by the ordering artifact round 18 fixes). What *changed*: round 17's
+`+rect+bespoke` recovered from this regression on this exact page
+(-0.11%/-0.58%, "the wider candidate pool routed around it"); round 18's
+`+rect+bespoke` does not (+4.04%/+5.39%, identical to `+bespoke` alone —
+confirmed by the tool's own output: byte-for-byte the same encoded
+size). The mechanism: round 17's old code ran the rectangular pre-pass
+*before* the bespoke pre-pass, both operating at the same bootstrap
+tier via `tryMergeLevel` — so on this page, rectangular apparently won
+at some cells *first*, before bespoke's own pass ever got a chance to
+regress them (once a cell is claimed by a 2-cell rectangular block,
+`tryMergeLevel`'s containment guard makes it structurally unreachable to
+a later 1x1-footprint bespoke pass). This was never a designed
+safeguard — it's an accident of processing order that happened to help
+on this specific page. Round 18's architecture deliberately separates
+Level 0 (bespoke competes only against other 1-cell footprints) from
+Level 1 (rectangular pairs compete only as a *region-level* alternative
+to whatever Level 0 already committed) — a more principled separation of
+concerns, but one that structurally can't reproduce the old accidental
+"rect preempts a bad bespoke choice before it happens" effect, because
+by the time Level 1 ever sees a region, Level 0 has already committed.
+
+**Conclusion**: the two bugs this round found and fixed are real and
+worth keeping (verified by new regression tests, not just asserted) —
+the order/position artifact among bespoke types, and the estimate-vs-
+real safety-net gap this round's own first draft introduced and then
+caught. But this round did not advance, and on the one real page round
+17 flagged, measurably set back, the actual goal (closing the gap to
+`cjxl -e7` via better transform selection). This is a real, useful
+negative result, not a hidden one: it means a fixed bottom-up sequence
+of *individually* joint levels (Level 0 joint, then Level 1 joint, run
+one after the other) is not the same thing as a *genuinely* joint
+decision across both — recovering round 17's serendipitous interaction
+would need Level 0 and Level 1 unified into one simultaneous decision
+(evaluate {4 independent leaf choices} vs. {16x16 whole} vs. {16x8/8x16
+pairs} all at once per region, not Level 0 first then Level 1 on top),
+which is a materially larger change than this round's scope. Both
+`enableRectangularTransforms`/`enableBespokeTransforms` remain **off**
+by default — nothing here changes that either way, and if anything this
+round's numbers make the case for flipping them weaker, not stronger.
+See ROADMAP.md's updated "remaining" bullet for how this reframes the
+next step.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

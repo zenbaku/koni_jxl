@@ -302,8 +302,42 @@ a claim to verify:
   relative to the encode-time cost. One real, previously-unmeasured risk
   surfaced: `+bespoke` alone made one specific real page (the shortest,
   sparsest page in the B&W chapter) **worse** by +4-5%, not just neutral
-  — see `doc/spec_notes.md`'s round 17 entry for the full write-up,
-  including why this doesn't invalidate the feature (combining it with
-  `+rect` routed around that specific case) but does mean its per-feature
-  "never worse" guarantee is weaker than `enableVariableTransforms`'s or
-  RDOQ's whole-image safety net. All defaults remain **off**.
+  — see `doc/spec_notes.md`'s round 17 entry for the full write-up. At
+  the time, combining `+bespoke` with `+rect` appeared to route around
+  this specific case (-0.11%/-0.58%, a real recovery) — **round 18
+  (below) found this recovery was an accident of the old code's
+  processing order, not a durable property of the feature.** All
+  defaults remain **off**.
+
+- **Round 18: made the same knobs' underlying decision genuinely joint
+  (not a greedy sequential chain) — real bugs fixed, real-manga ROI got
+  *worse*, not better** (`doc/spec_notes.md`'s round 18 entry has the
+  full root-cause analysis):
+
+  ```
+  combo               round 17    round 18    encode-time (r17 -> r18)
+  baseline               (base)      (base)      1.00x  ->  1.00x
+  +rect                  -0.28%      -0.20%      2.22x  ->  2.03x
+  +bespoke               -0.22%      -0.20%      4.32x  ->  2.45x
+  +rect+bespoke          -0.61%      -0.29%      5.10x  ->  3.50x
+  +32                    -0.53%      -0.53%      1.42x  ->  1.43x
+  +32+rect+bespoke       -0.86%      -0.51%      6.10x  ->  4.49x
+  ```
+
+  `baseline`/`+32` are bit-for-bit unchanged (neither touches the
+  rewritten code) — every combo that *does* touch it got real encode-time
+  wins (as designed: collapsing up to ~14 real-assembled candidates down
+  to ~2) but a real compression regression. The Naruto page-017 case is
+  numerically identical to round 17 for `+bespoke` alone (+4.04%/+5.39%,
+  confirming the regression itself was never caused by the ordering
+  artifact round 18 fixes) but `+rect+bespoke` no longer recovers it
+  (identical bytes to `+bespoke` alone, both distances) — the old code's
+  recovery depended on its rectangular pre-pass running *before* bespoke
+  and claiming some cells first (making them structurally unreachable to
+  a later bespoke pass), an accident of processing order that a more
+  principled Level-0-then-Level-1 separation of concerns can't reproduce.
+  This round's own pre-stated success criterion (shrink the page-017
+  regression, improve the aggregate wins) was not met. All defaults
+  remain **off** — this doesn't change either way, though it does temper
+  expectations for what a bottom-up *sequence* of joint levels can
+  recover vs. a genuinely unified one (see ROADMAP.md).

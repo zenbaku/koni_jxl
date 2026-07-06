@@ -188,43 +188,76 @@ class VardctL0Config {
   /// would make the int knob ambiguous for existing callers. Defaults to
   /// **off** for the same reason [maxTransformSize] stays at 16:
   /// existence is a completeness goal (ROADMAP.md, 2026-07-05), the
-  /// default is a separate, real-content-ROI question not yet evaluated
-  /// for this pair. Uses the existing level-1 `_kTransformRdLambda` (no
-  /// dedicated constant yet — add one only if calibration shows a need to
-  /// diverge, same precedent [transformRdLambdaOverrideBeyond16] followed).
+  /// default is a separate, real-content-ROI question evaluated (and
+  /// found real-but-small at real encode-time cost) in round 17, see
+  /// doc/spec_notes.md.
   ///
-  /// **The never-worse guarantee this gets from the shared candidate list
-  /// is "vs. plain 8x8/bootstrap," not "vs. square-only" (this flag
-  /// false).** Enabling this changes what the 8x8-vs-16x16 level itself
-  /// sees: with it on, that level runs on top of whatever the rectangular
-  /// pre-pass already decided, not on the pristine bootstrap, so "16x16
-  /// applied to pure bootstrap" (what a square-only run would produce) is
-  /// never itself a candidate in this run's list. In rare cases this flag
-  /// can therefore produce a file a byte or two *larger* than leaving it
-  /// off would have, while still always beating plain 8x8 (confirmed
-  /// empirically: a 32x32/period-4/distance-0.5 sweep found exactly this
-  /// -- 730B with rectangular vs. 729B square-only, both beating the
-  /// 761B bootstrap). This is expected for a greedy opt-in feature
-  /// layered on an existing greedy decision, not a bug -- don't "fix" it
-  /// by also assembling a standalone square-only candidate just to
-  /// restore a stricter guarantee; not worth the complexity on a feature
-  /// that's off by default.
+  /// The 16x8/8x16 half-strip pair (Tranche B's first pair) is decided
+  /// jointly with the whole-16x16 merge and the stay-split option — a
+  /// true per-region argmin (`_decideTransformLayout`'s `decideLevel1`),
+  /// not the pairwise greedy chain an earlier version of this comment
+  /// described. `_tt8x32`/`_tt32x8` (the only 4:1-line case in the
+  /// format, no matching square tier to pair against) still go through
+  /// the older sequential `tryMergeLevel` chain, run after Level 1 —
+  /// existence-vs-default is unaffected, but their own never-worse
+  /// guarantee is still only "vs. whatever Level 0/1 left behind," not a
+  /// joint choice with the levels below `maxTransformSize` 32.
   final bool enableRectangularTransforms;
 
   /// Whether to also try Tranche C's "bespoke" transform types (types with
   /// no shared plain-DCT machinery — all 9 are now implemented: DCT4x4,
   /// Hornuss, DCT2x2, DCT4x8, DCT8x4, and AFV0-3, completing Tranche C) at
-  /// the bootstrap-leaf level, as alternative encodings of the *same* 8x8 footprint plain
-  /// DCT8x8 already occupies — not a merge into a larger footprint like
-  /// every Tranche A/B type. Reuses `tryMergeLevel` unchanged: called with
-  /// a `dctSelectHeight==dctSelectWidth==1` target, it already degenerates
-  /// into exactly this "replace one already-placed 8x8-footprint block if
-  /// the real assembled cost is lower" decision, so no separate mechanism
-  /// was needed (see doc/spec_notes.md for why an earlier draft's separate
-  /// chooser design was dropped). Defaults to **off** for the same reason
-  /// [enableRectangularTransforms] does: existence is a completeness goal
-  /// (ROADMAP.md), the default is a separate, real-content-ROI question not
-  /// yet evaluated.
+  /// the leaf 8x8 footprint, as alternative encodings of the *same*
+  /// footprint plain DCT8x8 already occupies — not a merge into a larger
+  /// footprint like every Tranche A/B type. Decided via a true per-cell
+  /// N-way argmin (`_decideTransformLayout`'s `decideLevel0`): every
+  /// candidate at a cell is scored against the same snapshot of its
+  /// west/north neighbors' state, and the true minimum is committed —
+  /// not the sequential chain of pairwise `tryMergeLevel` swaps an
+  /// earlier version of this comment described, where each type's own
+  /// whole-image pass only ever compared against whatever the *previous*
+  /// type's pass had already committed nearby (a real ordering artifact:
+  /// the same type at the same cell could score differently purely
+  /// because of list order — confirmed as the mechanism behind a real
+  /// per-page regression measured in round 17, see doc/spec_notes.md's
+  /// round 17/18 entries).
+  ///
+  /// **Both `decideLevel0`'s own result and the subsequent
+  /// `decideLevel1`'s own result are exposed as separate real-assembled
+  /// candidates** (`_decideTransformLayout`'s `candidates` list) whenever
+  /// each differs from what came before — not just the final layout.
+  /// This isn't redundant bookkeeping: a per-region *estimate* choosing
+  /// to merge into 16x16 over staying split doesn't guarantee the real
+  /// assembled bytes agree (the same "estimates can't resolve near-ties,
+  /// verify by real assembly" gap this project has hit before, e.g.
+  /// round 7's 32x32 case) — round 18's own testing hit a concrete
+  /// instance of exactly this: content where every cell's true argmin was
+  /// a bespoke type, but Level 1's *estimate* preferred merging into
+  /// 16x16 anyway, which assembled to real *more* bytes than staying
+  /// split (211B vs. 167B). Without Level 0's own result as its own
+  /// candidate, that better layout would never have been tried for real
+  /// at all.
+  ///
+  /// **This does not eliminate the separate, still-present caveat
+  /// [enableRectangularTransforms]'s own doc comment describes** (a leaf
+  /// choice changing what the region-level merge decision's *estimate*
+  /// sees, via the live prediction grid's west/north dependency on
+  /// already-decided neighbors) — round 17 measured that caveat's real
+  /// magnitude for bespoke specifically (up to +4-5% worse on one real
+  /// page, comparing this flag alone against it off — both runs otherwise
+  /// identical, `enableVariableTransforms: true` in both). That's a
+  /// property of comparing two *independent* encodes whose leaf layout
+  /// differs from the start, not the within-one-encode estimate-vs-real
+  /// gap the two paragraphs above describe and fix — round 18's rewrite
+  /// removes the sequential-order artifact and adds Level 0's own
+  /// candidate, but hasn't yet been re-measured against round 17's
+  /// specific real-page case (see ROADMAP.md/doc/spec_notes.md for
+  /// whichever round did that check last).
+  ///
+  /// Defaults to **off** for the same reason [enableRectangularTransforms]
+  /// does: existence is a completeness goal (ROADMAP.md), the default is
+  /// a separate, real-content-ROI question evaluated in round 17
+  /// (doc/spec_notes.md).
   final bool enableBespokeTransforms;
 
   /// Whether to replace the default 3-bucket adaptive-quantization
@@ -1216,29 +1249,46 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 ///    derived context ([_TransformCtx.blockCtx]) is a pure function of
 ///    *that* region's chosen type — so no candidate's context depends on
 ///    which candidate wins, only the values landing in it do.
-/// 3. For every 2x2-aligned candidate region, compare the real bootstrap
-///    cost of its 4 already-committed 8x8 blocks (`sum(distortion + lambda
-///    * _blockRate(...))`, using each block's own *live* `predicted`
-///    non-zero-count value — see `predictedForPosition`/`updateLiveGrid`
-///    below) against a freshly quantized 16x16 candidate's own cost (same
-///    formula) — keeping whichever is smaller. The 16x16 candidate's own
-///    `predicted` value comes from the same live grid, read at the
-///    region's own origin: `HfCoefficients.getPredictedNonZeroes` depends
-///    only on the single cell immediately west and immediately north, not
-///    on this region's own footprint size, so as long as `liveGrid` is
-///    kept current at every position a *later* lookup might read as a
-///    neighbor (which `updateLiveGrid` does, incrementally, every time a
-///    region's winner is decided — not by re-deriving the whole grid),
-///    this is exact, not an approximation — unlike the code-length table
-///    below, which stays frozen because refreshing *it* means re-running
-///    `_chooseAcClustering`'s multi-candidate real-assembly search, not a
-///    cheap incremental update.
-/// 4. A region that swaps to 16x16 gets a fresh `commit()` (overwriting
-///    the bootstrap's 8x8 DC values at those 4 cells with the
-///    LLF-inverted 16x16-consistent ones) and its own `updateLiveGrid`
-///    call; a region that stays 8x8 needs no further work — its bootstrap
-///    commit (and the live grid entry `_computeGroupTokens` already wrote
-///    for it while seeding the grid, step 2) already stand.
+/// 3. **Level 0** (`decideLevel0`): for every 8x8 cell, a true N-way argmin
+///    among plain DCT8x8 and (when [VardctL0Config.enableBespokeTransforms])
+///    all 9 bespoke alternative encodings of the same footprint — every
+///    candidate at a cell is scored via `_blockRate(...)` against the
+///    *same* snapshot of its live `predicted` non-zero-count value (see
+///    `predictedForPosition`/`updateLiveGrid` below), and the true minimum
+///    is committed immediately, in one single raster sweep. This replaced
+///    an earlier design (round 17 and before) that tried each bespoke type
+///    as its own separate whole-image `tryMergeLevel` pass, sequentially —
+///    which only ever compared a type against whatever the *previous*
+///    type's own pass had already committed nearby, a real ordering
+///    artifact (the same type at the same cell could score differently
+///    purely because of list order) confirmed as the mechanism behind a
+///    real per-page regression (see doc/spec_notes.md's round 17/18
+///    entries). When bespoke is off, this returns the bootstrap unchanged
+///    rather than paying for a redundant re-quantization pass.
+/// 4. **Level 1** (`decideLevel1`): for every 2x2-cell (16x16px) region, a
+///    true argmin among *stay split* (Level 0's own 4 per-cell results,
+///    summed the same `distortion + lambda * _blockRate(...)` way),
+///    *whole* DCT16x16 (scored the same way step 3's bootstrap-vs-16x16
+///    comparison used to be, before this was generalized), and (when
+///    [VardctL0Config.enableRectangularTransforms]) the DCT16x8/DCT8x16
+///    half-strip pairs. A pair candidate's second sub-block has a real
+///    intra-region dependency on the first's own committed fill (its
+///    west/north neighbor read lands inside the first sub-block's
+///    footprint) — scored via a speculative "poke, score, restore" step
+///    (`writeLiveGridCells`/`snapshotGridCells`/`restoreGridCells`) so
+///    every candidate in a region is compared against the exact same
+///    starting state, and only the true winner's effect on the live grid
+///    is made permanent. **Both Level 0's own result and Level 1's own
+///    result are exposed as separate entries in the returned candidate
+///    list whenever each differs from what came before** — not folded
+///    into a single combined candidate. This isn't redundant: a region's
+///    *estimate* preferring to merge into 16x16 over staying split doesn't
+///    guarantee the real assembled bytes agree (found concretely while
+///    building this: content where every cell's true argmin was a bespoke
+///    type, but Level 1's estimate preferred 16x16 anyway, which assembled
+///    to *more* real bytes than staying split — 211B vs. 167B). Without
+///    Level 0's own result as its own candidate, that better layout would
+///    never have been tried for real at all.
 /// 5. For each size in [_cascadeSizes] up to [VardctL0Config.maxTransformSize]
 ///    (32, then 64, then 128, then 256), repeat steps 3/4 one level up:
 ///    merge the *previous* cascade level's layout (mixed 8x8/16x16/.../
@@ -1257,7 +1307,20 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 ///    size up on the unchanged layout — a size skipping over an
 ///    intermediate one is architecturally rare but not provably
 ///    impossible, and this project's own methodology is to verify by real
-///    assembly rather than assume monotonicity.
+///    assembly rather than assume monotonicity. Unlike Levels 0/1, this
+///    cascade is still the sequential pairwise-swap chain steps 3/4 used
+///    to be (each `tryMergeLevel` call comparing only against whatever the
+///    immediately-prior level committed) — not yet rebuilt as a joint
+///    per-region argmin; see doc/spec_notes.md's round 18 write-up for the
+///    scope decision to stop at Level 1 for now.
+typedef _Scored = ({
+  _PlacedBlock block,
+  ({List<double> dc, List<Int32List> ac, double distortion}) quant,
+  int mult,
+  double rate,
+  double cost
+});
+
 List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     List<List<Float32List>> planes,
     _ChromaFromLumaFit cfl,
@@ -1347,23 +1410,64 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     ]);
   }
 
-  // Records a just-decided block's own real fill (its per-channel
-  // non-zero count, `dctSelectHeight x dctSelectWidth`-block-averaged the
-  // same way `_computeGroupTokens` does) into `liveGrid`, so any later
-  // position whose predicted count reads this block as its west or north
-  // neighbor sees the real value, not a stale bootstrap-derived one.
-  void updateLiveGrid(_PlacedBlock block) {
-    final groupX = block.bx ~/ 32, groupY = block.by ~/ 32;
+  // Records a real fill (per-channel non-zero count, `dctSelectHeight x
+  // dctSelectWidth`-block-averaged the same way `_computeGroupTokens`
+  // does) into `liveGrid`, so any later position whose predicted count
+  // reads this footprint as its west or north neighbor sees the real
+  // value, not a stale bootstrap-derived one. Takes the placement/AC data
+  // directly (not a `_PlacedBlock`) so [decideLevel1] can also use it to
+  // *speculatively* preview an as-yet-uncommitted candidate's effect on a
+  // same-region neighbor's rate estimate (paired with [snapshotGridCells]/
+  // [restoreGridCells]), without needing a fully committed block to do so.
+  void writeLiveGridCells(
+      TransformType tt, int by, int bx, List<Int32List> ac) {
+    final groupX = bx ~/ 32, groupY = by ~/ 32;
     final grid = liveGrid[groupY * groupsX + groupX];
-    final localY = block.by - groupY * 32, localX = block.bx - groupX * 32;
-    final ctx = ctxByType[block.tt.type]!;
+    final localY = by - groupY * 32, localX = bx - groupX * 32;
+    final ctx = ctxByType[tt.type]!;
     final numBlocks = ctx.numBlocks;
     for (var c = 0; c < 3; c++) {
-      final (_, countNonZero, _) = _scanChannelValues(ctx, block.acInt[c]);
+      final (_, countNonZero, _) = _scanChannelValues(ctx, ac[c]);
       final fill = (countNonZero + numBlocks - 1) ~/ numBlocks;
-      for (var iy = 0; iy < block.tt.dctSelectHeight; iy++) {
-        for (var ix = 0; ix < block.tt.dctSelectWidth; ix++) {
+      for (var iy = 0; iy < tt.dctSelectHeight; iy++) {
+        for (var ix = 0; ix < tt.dctSelectWidth; ix++) {
           grid[c * 1024 + (localY + iy) * 32 + (localX + ix)] = fill;
+        }
+      }
+    }
+  }
+
+  void updateLiveGrid(_PlacedBlock block) {
+    writeLiveGridCells(block.tt, block.by, block.bx, block.acInt);
+  }
+
+  // Saves/restores exactly the cells [writeLiveGridCells] would touch for
+  // a `(tt, by, bx)` footprint — used by [decideLevel1] to undo a
+  // speculative poke once a pair candidate's second sub-block has been
+  // scored against it, so a region's own candidates are always compared
+  // against the same starting state regardless of scoring order, and only
+  // the true winner's effect on the live grid is made permanent.
+  List<int> snapshotGridCells(TransformType tt, int by, int bx) {
+    final groupX = bx ~/ 32, groupY = by ~/ 32;
+    final grid = liveGrid[groupY * groupsX + groupX];
+    final localY = by - groupY * 32, localX = bx - groupX * 32;
+    return [
+      for (var c = 0; c < 3; c++)
+        for (var iy = 0; iy < tt.dctSelectHeight; iy++)
+          for (var ix = 0; ix < tt.dctSelectWidth; ix++)
+            grid[c * 1024 + (localY + iy) * 32 + (localX + ix)],
+    ];
+  }
+
+  void restoreGridCells(TransformType tt, int by, int bx, List<int> snapshot) {
+    final groupX = bx ~/ 32, groupY = by ~/ 32;
+    final grid = liveGrid[groupY * groupsX + groupX];
+    final localY = by - groupY * 32, localX = bx - groupX * 32;
+    var i = 0;
+    for (var c = 0; c < 3; c++) {
+      for (var iy = 0; iy < tt.dctSelectHeight; iy++) {
+        for (var ix = 0; ix < tt.dctSelectWidth; ix++) {
+          grid[c * 1024 + (localY + iy) * 32 + (localX + ix)] = snapshot[i++];
         }
       }
     }
@@ -1405,22 +1509,15 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   // Extracted from `tryMergeLevel`'s own inline body so `decideLevel0`/
   // `decideLevel1` below can score arbitrary candidates the same way,
   // without a merge decision's `costIn`/`layoutBlockAt` bookkeeping.
-  ({
-    _PlacedBlock block,
-    ({List<double> dc, List<Int32List> ac, double distortion}) quant,
-    int mult,
-    double rate,
-    double cost
-  }) scoreFreshCandidate(
+  _Scored scoreFreshCandidate(
       int by, int bx, TransformType tt, double lambdaForLevel) {
     final ctx = ctxByType[tt.type]!;
     final candidate = _PlacedBlock(by, bx, tt);
-    final coeffBuf =
-        candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
+    final coeffBuf = candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
     final (mult, quant) = candidate.chooseCandidate(
         coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
-    final rate = _blockRate(
-        ctx, hfctx, quant.ac, predictedForPosition(by, bx), clusterMap, lengths);
+    final rate = _blockRate(ctx, hfctx, quant.ac, predictedForPosition(by, bx),
+        clusterMap, lengths);
     final cost = quant.distortion + lambdaForLevel * rate;
     return (block: candidate, quant: quant, mult: mult, rate: rate, cost: cost);
   }
@@ -1485,7 +1582,8 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
           }
 
           if (mergeable) {
-            final scored = scoreFreshCandidate(by, bx, targetType, lambdaForLevel);
+            final scored =
+                scoreFreshCandidate(by, bx, targetType, lambdaForLevel);
             if (scored.cost < costIn) {
               assert(
                   scored.block.by % targetType.dctSelectHeight == 0 &&
@@ -1521,65 +1619,32 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
     return (next, dcIntNext, anyMerge);
   }
 
-  final candidates = <(List<_PlacedBlock>, List<Int32List>)>[
-    (bootstrapBlocks, dcIntBootstrap),
-  ];
-  var layout = bootstrapBlocks;
-  var dcInt = dcIntBootstrap;
-
-  // 3. Rectangular pre-pass at the bootstrap tier: the "2:1 pair" (wide
-  // 8x16, tall 16x8) then the "4:1 line" pair (wide 8x32, tall 32x8, the
-  // only 4:1 case in the whole format — no 16x8-square exists to pair
-  // further, so this merges four 8x8-or-smaller blocks in a line instead
-  // of two), each its own real-assembled candidate, tried directly on the
-  // bootstrap before the square 16x16 decision below. Every 16x8/8x16
-  // footprint nests cleanly inside exactly one 2x2 16x16-pixel region (each
-  // spans one axis fully and the other partially, always within a single
-  // 16x16-region's bounds), so running rectangular first and feeding the
-  // result into the (generalized) 16x16 level next never presents that
-  // level with a partial overlap — the reverse order would. 32x8/8x32
-  // does *not* nest inside a 16x16 region (it's 4 cells wide/tall, wider
-  // than 16x16's 2-cell span) — safe regardless, since `tryMergeLevel`'s
-  // containment guard rejects the 16x16 level ever trying to absorb part
-  // of an already-placed 32x8/8x32 block. Off by default
-  // ([VardctL0Config.enableRectangularTransforms]); see that field's doc
-  // comment for why (existence-vs-default, same split as
-  // [VardctL0Config.maxTransformSize]).
-  if (enableRectangularTransforms) {
-    for (final tt in [_tt8x16, _tt16x8, _tt8x32, _tt32x8]) {
-      final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, tt, lambda);
-      if (changed) {
-        layout = next;
-        dcInt = dcNext;
-        candidates.add((layout, dcInt));
-      }
+  // Level 0: a true N-way argmin per 8x8 cell among DCT8x8 and (when
+  // enabled) all 9 bespoke alternative encodings of the same footprint —
+  // replaces the old sequential bespoke pre-pass, which only ever
+  // compared "this bespoke type" against whatever the *previous* bespoke
+  // type's own whole-image pass had already committed nearby (an
+  // ordering artifact: a cell's *rate* estimate depends on its west/north
+  // neighbors' live-grid fill, which each separate pass mutates as it
+  // goes — so the same type at the same cell could score differently
+  // purely because of list order, not because of anything about the cell
+  // itself; see doc/spec_notes.md's round 18 write-up, which traces this
+  // to round 17's real per-page regression from `enableBespokeTransforms`
+  // alone). One single raster sweep instead: every candidate at a cell is
+  // scored against the exact same snapshot (whatever's already finalized
+  // to its west/north), and the true minimum is committed once,
+  // immediately updating the live grid before the next cell's turn — this
+  // removes the ordering artifact by construction, not just reorganizes
+  // it. When bespoke is off there is only one candidate everywhere
+  // (DCT8x8), so this returns the bootstrap unchanged rather than paying
+  // for a redundant re-quantization pass.
+  (List<_PlacedBlock>, List<Int32List>) decideLevel0(
+      bool enableBespokeTransforms) {
+    if (!enableBespokeTransforms) {
+      return (bootstrapBlocks, dcIntBootstrap);
     }
-  }
-
-  // 3.5. Bespoke pre-pass (Tranche C) at the bootstrap tier: try each
-  // bespoke type (Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0-3) as an
-  // *alternative* encoding of the same 8x8 footprint plain DCT8x8 already
-  // occupies — not a merge into a larger footprint like every Tranche A/B
-  // type above. `tryMergeLevel` degenerates cleanly to exactly this
-  // "replace one already-placed 1x1-footprint block if the real assembled
-  // cost is lower" decision when `targetType.dctSelectHeight ==
-  // dctSelectWidth == 1` (true of all nine): `strideY = strideX = 1`, the
-  // containment loop runs exactly once, `canPair` is always true — no
-  // separate mechanism was needed (an earlier design draft proposed one;
-  // dropped after design review found this reuse, see doc/spec_notes.md).
-  // Order relative to the rectangular pre-pass above doesn't affect
-  // correctness: every bespoke type's footprint is geometrically identical
-  // to plain 8x8 (same 1x1 `dctSelect` cell), so the containment guard
-  // treats it the same as any other already-placed 1x1 block regardless of
-  // which pre-pass ran first — likewise, calling these nine in sequence
-  // just means each later call compares against whatever the *previous*
-  // bespoke call already placed (greedy, not a joint 10-way choice among
-  // {8x8, hornuss, dct2, dct4, dct4x8, dct8x4, afv0-3} per cell) — only
-  // which greedy opportunity gets found first, same caveat already
-  // documented for the rectangular list's own internal ordering. Off by
-  // default ([VardctL0Config.enableBespokeTransforms]).
-  if (enableBespokeTransforms) {
-    for (final bespokeType in [
+    final types = [
+      _tt8,
       _ttHornuss,
       _ttDct2x2,
       _tt4x4,
@@ -1589,28 +1654,232 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
       _ttAfv1,
       _ttAfv2,
       _ttAfv3,
-    ]) {
-      final (next, dcNext, changed) =
-          tryMergeLevel(layout, dcInt, bespokeType, lambda);
+    ];
+    final dcIntNext = [for (final ch in dcIntBootstrap) Int32List.fromList(ch)];
+    final result = <_PlacedBlock>[];
+    for (var by = 0; by < bh; by++) {
+      for (var bx = 0; bx < bw; bx++) {
+        var best = scoreFreshCandidate(by, bx, types[0], lambda);
+        for (var i = 1; i < types.length; i++) {
+          final scored = scoreFreshCandidate(by, bx, types[i], lambda);
+          if (scored.cost < best.cost) best = scored;
+        }
+        best.block.commit(best.quant, best.mult, dcIntNext, bw);
+        updateLiveGrid(best.block);
+        result.add(best.block);
+      }
+    }
+    return (result, dcIntNext);
+  }
+
+  // Level 1: a true argmin per 2x2-cell (16x16px) region among "stay
+  // split" (Level 0's own 4 per-cell decisions), the whole DCT16x16, and
+  // (when enabled) the DCT16x8/DCT8x16 half-strip pairs — replaces the
+  // old sequential rectangular pre-pass (which tried 16x8 then 8x16 as
+  // two separate whole-image passes, each only comparing against
+  // whatever the *other* orientation's pass had already committed) and
+  // the old always-on 16x16 decision (a separate, later, single-candidate
+  // comparison against whatever the rectangular pre-pass left behind).
+  // Assumes its input is exactly one 1x1-footprint block per cell — true
+  // of [decideLevel0]'s output, not true in general, so this simplified
+  // direct-lookup form (no `layoutBlockAt`-style containment scanning)
+  // must not be reused for a hypothetical Level 2+ built on Level 1's own
+  // *mixed* output.
+  //
+  // A pair candidate's second sub-block has a real intra-region live-grid
+  // dependency on the first sub-block's own fill (its west/north neighbor
+  // read lands inside the first sub-block's footprint — e.g. the 16x8
+  // pair's right block reads its west neighbor, which is the left
+  // block's own origin cell). Scored via a speculative
+  // "poke, score, restore" step (`writeLiveGridCells`/`snapshotGridCells`/
+  // `restoreGridCells`) so every candidate in a region — split, whole, and
+  // both pair orientations — is compared against the exact same starting
+  // state, and only the true winner's effect on the live grid is made
+  // permanent (a real `commit()`+`updateLiveGrid()`, reproducing the
+  // scored state, not re-deriving it).
+  // Note on list ordering (the decoder's raster-scan-with-skip placement,
+  // `HfMetadata._placeBlock`, reconstructs every block's position purely
+  // from flat-list order — there is no explicit coordinate in the
+  // bitstream): a region's decision can place a block whose origin is in
+  // the region's *second* row (stay-split's bottom two cells; the 8x16
+  // pair's bottom half), which must not reach [result] until the sweep
+  // has finished every region in the *first* row of this same row-pair —
+  // otherwise a later region at, say, `(by, bx+2)` would have its own
+  // first-row block appended after an earlier region's second-row block,
+  // desyncing the decoder's placement. Handled by processing one row-pair
+  // at a time, bucketing each decision's blocks into `topRow`/`bottomRow`
+  // by which row their own origin falls in, and appending `topRow` then
+  // `bottomRow` only once the whole row-pair is decided.
+  (List<_PlacedBlock>, List<Int32List>, bool) decideLevel1(
+      List<_PlacedBlock> layout0,
+      List<Int32List> dcInt0,
+      bool enableRectangularTransforms) {
+    final dcIntNext = [for (final ch in dcInt0) Int32List.fromList(ch)];
+    final result = <_PlacedBlock>[];
+    var anyMerged = false;
+
+    double splitBlockRate(_PlacedBlock b) => _blockRate(ctxByType[b.tt.type]!,
+        hfctx, b.acInt, predictedForPosition(b.by, b.bx), clusterMap, lengths);
+
+    for (var by = 0; by < bh; by += 2) {
+      if (by + 1 >= bh) {
+        // Stray final row (odd `bh`) — no 2x2 region possible here.
+        for (var bx = 0; bx < bw; bx++) {
+          result.add(layout0[by * bw + bx].copy());
+        }
+        continue;
+      }
+      final topRow = <_PlacedBlock>[];
+      final bottomRow = <_PlacedBlock>[];
+      var bx = 0;
+      while (bx < bw) {
+        if (bx + 1 >= bw) {
+          // Stray final column (odd `bw`) — no 2x2 region possible here.
+          topRow.add(layout0[by * bw + bx].copy());
+          bottomRow.add(layout0[(by + 1) * bw + bx].copy());
+          bx += 1;
+          continue;
+        }
+
+        final c00 = layout0[by * bw + bx];
+        final c01 = layout0[by * bw + bx + 1];
+        final c10 = layout0[(by + 1) * bw + bx];
+        final c11 = layout0[(by + 1) * bw + bx + 1];
+        final splitCost = c00.distortion +
+            lambda * splitBlockRate(c00) +
+            c01.distortion +
+            lambda * splitBlockRate(c01) +
+            c10.distortion +
+            lambda * splitBlockRate(c10) +
+            c11.distortion +
+            lambda * splitBlockRate(c11);
+
+        final whole = scoreFreshCandidate(by, bx, _tt16, lambda);
+        var bestCost = splitCost;
+        // null = stay split. Otherwise the winning candidate's own
+        // sub-blocks, each already tagged with which row bucket it
+        // belongs to via its own `.by`.
+        List<_Scored>? bestPair;
+        if (whole.cost < bestCost) {
+          bestCost = whole.cost;
+          bestPair = [whole];
+        }
+
+        if (enableRectangularTransforms) {
+          // 16x8 (tall) pair: left (by,bx), right (by,bx+1) — side by
+          // side, each spanning both rows, both origins in the top row.
+          final left = scoreFreshCandidate(by, bx, _tt16x8, lambda);
+          final leftSnapshot = snapshotGridCells(_tt16x8, by, bx);
+          writeLiveGridCells(_tt16x8, by, bx, left.quant.ac);
+          final right = scoreFreshCandidate(by, bx + 1, _tt16x8, lambda);
+          restoreGridCells(_tt16x8, by, bx, leftSnapshot);
+          final pairCostV = left.cost + right.cost;
+          if (pairCostV < bestCost) {
+            bestCost = pairCostV;
+            bestPair = [left, right];
+          }
+
+          // 8x16 (wide) pair: top (by,bx), bottom (by+1,bx) — stacked,
+          // each spanning both columns; top's origin is the top row,
+          // bottom's origin is the bottom row.
+          final top = scoreFreshCandidate(by, bx, _tt8x16, lambda);
+          final topSnapshot = snapshotGridCells(_tt8x16, by, bx);
+          writeLiveGridCells(_tt8x16, by, bx, top.quant.ac);
+          final bottom = scoreFreshCandidate(by + 1, bx, _tt8x16, lambda);
+          restoreGridCells(_tt8x16, by, bx, topSnapshot);
+          final pairCostH = top.cost + bottom.cost;
+          if (pairCostH < bestCost) {
+            bestCost = pairCostH;
+            bestPair = [top, bottom];
+          }
+        }
+
+        if (bestPair == null) {
+          topRow
+            ..add(c00.copy())
+            ..add(c01.copy());
+          bottomRow
+            ..add(c10.copy())
+            ..add(c11.copy());
+        } else {
+          anyMerged = true;
+          for (final scored in bestPair) {
+            scored.block.commit(scored.quant, scored.mult, dcIntNext, bw);
+            updateLiveGrid(scored.block);
+            (scored.block.by == by ? topRow : bottomRow).add(scored.block);
+          }
+        }
+        bx += 2;
+      }
+      result.addAll(topRow);
+      result.addAll(bottomRow);
+    }
+    return (result, dcIntNext, anyMerged);
+  }
+
+  final candidates = <(List<_PlacedBlock>, List<Int32List>)>[
+    (bootstrapBlocks, dcIntBootstrap),
+  ];
+  var layout = bootstrapBlocks;
+  var dcInt = dcIntBootstrap;
+
+  // 3. Level 0: true N-way per-cell argmin (DCT8x8 vs. all 9 bespoke
+  // alternatives, when [enableBespokeTransforms]) — see [decideLevel0]'s
+  // own doc comment. Added as its own `candidates` entry whenever it
+  // differs from the bootstrap: Level 1's *estimate* always folds Level
+  // 0's own result in as its "stay split" option using the identical cost
+  // formula, so Level 1's chosen layout is never worse than Level 0 alone
+  // *under that estimate* — but the estimate and real assembled bytes can
+  // still disagree (the same "estimates can't resolve near-ties, verify
+  // by real assembly" gap this project has hit before, e.g. round 7's
+  // 32x32 case) — confirmed concretely during this round's own testing:
+  // content engineered so a bespoke type wins every cell, where Level 1's
+  // estimate preferred merging into 16x16 (a lower *estimated* cost) but
+  // the real assembled bytes favored staying split by a wide margin (167B
+  // vs. 211B). Without Level 0's own result as a separate candidate here,
+  // that better layout would never be tried for real at all — only the
+  // bootstrap and Level 1's (real-bytes-worse) choice.
+  final (layout0, dcInt0) = decideLevel0(enableBespokeTransforms);
+  if (layout0.any((b) => b.tt.type != _tt8.type)) {
+    candidates.add((layout0, dcInt0));
+  }
+
+  // 4. Level 1: true argmin per 16x16 region among stay-split, whole
+  // 16x16, and (when [enableRectangularTransforms]) the 16x8/8x16
+  // half-strip pairs — see [decideLevel1]'s own doc comment. Added as its
+  // own `candidates` entry whenever it differs from Level 0's own result,
+  // same reasoning as step 3 above.
+  final (layout1, dcInt1, level1Merged) =
+      decideLevel1(layout0, dcInt0, enableRectangularTransforms);
+  layout = layout1;
+  dcInt = dcInt1;
+  if (level1Merged) {
+    candidates.add((layout1, dcInt1));
+  }
+
+  // 4.5. The "4:1 line" rectangular pair (wide 8x32, tall 32x8 — the only
+  // 4:1 case in the whole format, since no 16x8-square exists to pair
+  // further) tried directly on Level 1's output. Relocated to run *after*
+  // Level 0/1, not before as the old bootstrap-tier pre-pass did: Level
+  // 0's simplified per-cell sweep assumes every cell starts as an
+  // independent 1x1 block, which would no longer hold if 8x32/32x8 had
+  // already merged 4 cells into one block first (it would silently
+  // orphan that block's other cells, a corrupt layout, not just a
+  // suboptimal one). Safe here unmodified: 8x32/32x8 doesn't nest inside
+  // a 16x16 region (it's 4 cells wide/tall, wider than 16x16's 2-cell
+  // span), so `tryMergeLevel`'s existing containment guard handles
+  // comparing it against whatever mix Level 0/1 left behind. Off by
+  // default ([VardctL0Config.enableRectangularTransforms]); see that
+  // field's doc comment for why (existence-vs-default, same split as
+  // [VardctL0Config.maxTransformSize]).
+  if (enableRectangularTransforms) {
+    for (final tt in [_tt8x32, _tt32x8]) {
+      final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, tt, lambda);
       if (changed) {
         layout = next;
         dcInt = dcNext;
         candidates.add((layout, dcInt));
       }
-    }
-  }
-
-  // 4. The always-on 8x8-vs-16x16 decision, now routed through the same
-  // shared closure as every other level — required, not just uniform: once
-  // the rectangular pre-pass can run first, this level must see whatever
-  // mixed layout it left behind via `layoutBlockAt`, which a hand-written
-  // bootstrap-only version (this replaced) could not do.
-  {
-    final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, _tt16, lambda);
-    if (changed) {
-      layout = next;
-      dcInt = dcNext;
-      candidates.add((layout, dcInt));
     }
   }
 
