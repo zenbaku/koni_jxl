@@ -2171,6 +2171,241 @@ void main() {
     });
   }
 
+  // Tranche C, final slice: AFV0-3 -- the most complex bespoke type, and
+  // the last one, completing Tranche C (all 27 transform types now exist).
+  // Unlike every other bespoke type, AFV splits the 8x8 block into 3
+  // DISJOINT regions (a 4x4 "AFV-basis" region using a fixed custom 16x16
+  // matrix, not a DCT at all; a 4x4 transposed-DCT region; a 4x8 plain-DCT
+  // region), with a 3x3 (not 4-point/2-point) linear system combining
+  // their own DC-like terms. The decoder's own "SPEC: watch signs here"
+  // comment (vardct_inverter.dart's _invertAFV) flags region 2's DC
+  // combination (`c00+c10-c01`) specifically -- these tests exercise that
+  // exact code path against djxl, not just against our own decoder (which
+  // would agree even if that sign combination were wrong, the same
+  // "self-consistent but wrong" signature DCT4x4's round already hit once).
+  //
+  // Config found empirically (jxl.encdebug tallies): a "flat corner plus a
+  // gradient" pattern, one config per AFV variant, each placing its own
+  // flat corner at a different position (found by trying all 4 corners,
+  // not assumed by symmetry -- AFV1/2/3's actual winning corner didn't
+  // match the naive flipY/flipX-implies-which-corner-wins guess, so this
+  // was verified empirically per type, not derived). Each wins purely
+  // (16/16 tally) at its own single distance.
+  for (final (name, distance, cornerTest) in [
+    ('AFV0', 1.0, (int lx, int ly) => lx < 4 && ly < 4),
+    ('AFV1', 0.5, (int lx, int ly) => lx >= 4 && ly < 4),
+    ('AFV2', 1.0, (int lx, int ly) => lx >= 4 && ly >= 4),
+    ('AFV3', 1.0, (int lx, int ly) => lx < 4 && ly >= 4),
+  ]) {
+    test(
+        '$name (Tranche C, opt-in) genuinely wins on a flat-corner+gradient '
+        'pattern and round-trips correctly at distance=$distance', () {
+      const size = 32;
+      final pixels = Uint8List(size * size * 3);
+      var i = 0;
+      final gradSlope = name == 'AFV1' ? 10 : 5;
+      for (var y = 0; y < size; y++) {
+        for (var x = 0; x < size; x++) {
+          final lx = x % 8, ly = y % 8;
+          final v = cornerTest(lx, ly)
+              ? 200
+              : (128 + (lx - ly) * gradSlope).clamp(0, 255);
+          pixels[i++] = v;
+          pixels[i++] = v;
+          pixels[i++] = v;
+        }
+      }
+      final base = VardctL0Config.fromDistance(distance);
+      final withBespoke = encodeLossyVardctL0(pixels,
+          width: size,
+          height: size,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: true));
+      final withoutBespoke = encodeLossyVardctL0(pixels,
+          width: size,
+          height: size,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: false));
+      expect(withBespoke.length, lessThan(withoutBespoke.length),
+          reason: '$name (${withBespoke.length}B) should beat plain '
+              '8x8/other bespoke types (${withoutBespoke.length}B) at this '
+              'config');
+
+      double decodeVsOriginal(Uint8List encoded) {
+        final decoded = JxlDecoder.decode(encoded).toRgba8();
+        var sumSq = 0.0;
+        var n = 0;
+        for (var p = 0; p < size * size; p++) {
+          for (var c = 0; c < 3; c++) {
+            final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+            sumSq += d * d;
+            n++;
+          }
+        }
+        return math.sqrt(sumSq / n);
+      }
+
+      final bespokeRmse = decodeVsOriginal(withBespoke);
+      final plainRmse = decodeVsOriginal(withoutBespoke);
+      expect(bespokeRmse, lessThan(plainRmse * 2 + 1),
+          reason: '$name RMSE-vs-original ($bespokeRmse) should be in the '
+              'same ballpark as the alternative ($plainRmse), not blown up '
+              'by a forward-transform or quant-weight/bitstream-mode error');
+
+      final image = JxlDecoder.decode(withBespoke);
+      expect(image.width, size);
+      expect(image.height, size);
+
+      if (!_haveDjxl) return;
+      final dir = Directory.systemTemp.createTempSync('koni_lossy_afv');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(withBespoke);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        expect(ref.width, size);
+        expect(ref.height, size);
+
+        var sumSq = 0.0;
+        var n = 0;
+        for (var c = 0; c < 3; c++) {
+          final ours = channelAsInts(image.channels[c], 255);
+          final theirs = ref.intPlanes![c];
+          for (var j = 0; j < size * size; j++) {
+            final d = ours[j] - theirs[j];
+            sumSq += d * d;
+            n++;
+          }
+        }
+        final rmse = math.sqrt(sumSq / n);
+        expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    });
+  }
+
+  // Tier-interaction mixed-layout test covering ALL NINE bespoke types plus
+  // plain DCT8x8/DCT16x16 -- completes the same class of check every prior
+  // slice in this tranche has run. A 128x64 canvas, eight 32x32 regions:
+  // the six from round 13's own mixed test (amp=12 checkerboard, flat+
+  // noise, high-amplitude checkerboard, and both step+gradient
+  // orientations) plus AFV0-flavored and AFV1-flavored flat-corner content.
+  // Confirmed via the encdebug tally at distance=0.5 to place ALL bespoke
+  // types except DCT4x4 in one bitstream at once (`{Hornuss: 52, DCT 8x8:
+  // 5, AFV0: 1, DCT 4x8: 16, AFV3: 2, AFV1: 17, DCT 8x4: 17, DCT 2x2: 1,
+  // AFV2: 1, DCT 16x16: 4}`) -- DCT4x4 shows up in the other 3 distances
+  // instead, so the tranche's full 9-bespoke-type roster is covered across
+  // the 4 distances even though no single distance places all 9 at once.
+  for (final distance in [0.5, 1.0, 2.0, 4.0]) {
+    test(
+        'all nine bespoke types (Tranche C, opt-in, now complete) '
+        'round-trip correctly in a MIXED layout alongside plain '
+        'DCT8x8/DCT16x16 at distance=$distance', () {
+      const width = 128, height = 64;
+      final rng = math.Random(42);
+      final pixels = Uint8List(width * height * 3);
+      var i = 0;
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final col = x ~/ 32, row = y ~/ 32;
+          int v;
+          if (row == 0 && col == 0) {
+            v = 128 + ((x ~/ 4 + y ~/ 4).isEven ? 12 : -12);
+          } else if (row == 0 && col == 1) {
+            v = (128 + rng.nextInt(11) - 5).clamp(0, 255);
+          } else if (row == 0 && col == 2) {
+            final qy = y ~/ 4, qx = x ~/ 4;
+            v = (qy + qx).isEven ? 40 : 210;
+          } else if (row == 0 && col == 3) {
+            final rowBase = (y % 8) < 4 ? 170 : 130;
+            v = (rowBase + 6 * (x % 8) - 24).clamp(0, 255);
+          } else if (row == 1 && col == 0) {
+            final colBase = (x % 8) < 4 ? 170 : 130;
+            v = (colBase + 6 * (y % 8) - 24).clamp(0, 255);
+          } else if (row == 1 && col == 1) {
+            final lx = x % 8, ly = y % 8;
+            v = (lx < 4 && ly < 4) ? 200 : (128 + (lx - ly) * 5);
+          } else if (row == 1 && col == 2) {
+            final lx = x % 8, ly = y % 8;
+            v = (lx >= 4 && ly < 4) ? 200 : (128 + (lx - ly) * 10);
+          } else {
+            v = (y * 200 / height).round().clamp(0, 255);
+          }
+          pixels[i++] = v;
+          pixels[i++] = v;
+          pixels[i++] = v;
+        }
+      }
+      final base = VardctL0Config.fromDistance(distance);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: width,
+          height: height,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: true,
+              enableBespokeTransforms: true));
+
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, width);
+      expect(image.height, height);
+
+      var sumSq = 0.0;
+      var n = 0;
+      final decoded = image.toRgba8();
+      for (var p = 0; p < width * height; p++) {
+        for (var c = 0; c < 3; c++) {
+          final d = decoded[p * 4 + c] - pixels[p * 3 + c];
+          sumSq += d * d;
+          n++;
+        }
+      }
+      expect(math.sqrt(sumSq / n), lessThan(30.0),
+          reason: 'decode-vs-original RMSE should stay bounded in a mixed '
+              'layout, not just in a uniform-tally case');
+
+      if (!_haveDjxl) return;
+      final dir = Directory.systemTemp.createTempSync('koni_lossy_afv_mix');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        expect(ref.width, width);
+        expect(ref.height, height);
+
+        var dSumSq = 0.0;
+        var dn = 0;
+        for (var c = 0; c < 3; c++) {
+          final ours = channelAsInts(image.channels[c], 255);
+          final theirs = ref.intPlanes![c];
+          for (var j = 0; j < width * height; j++) {
+            final d = ours[j] - theirs[j];
+            dSumSq += d * d;
+            dn++;
+          }
+        }
+        final rmse = math.sqrt(dSumSq / dn);
+        expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    });
+  }
+
   test('finer quantization improves RMSE', () {
     if (!_haveDjxl) return;
     final pixels = _synthetic(64, 64, 9);

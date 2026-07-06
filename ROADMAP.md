@@ -120,16 +120,20 @@ quality lives.
     later session replaced the proxy with a real bootstrap-based
     estimate plus a whole-image real-assembly safety net, closing exactly
     this gap, and `enableVariableTransforms` now defaults to **on**.
-  Full 27-transform-type support (this encoder only added 8x8/16x16 as of
-  round 6; rounds 7/8 completed Tranche A — all square DCT sizes, 8x8
-  through 256x256, 6 of 27 types; rounds 9/10 completed Tranche B — all 12
-  rectangular types, 18 of 27 total; round 11 started Tranche C with
-  DCT4x4, 19 of 27 total; round 12 added Hornuss and DCT2x2, 21 of 27
-  total; round 13 below added DCT4x8 and DCT8x4, 23 of 27 total; 4 remain,
-  all AFV0-3) and a real rate-distortion search over transform size itself
-  (rounds 6-13 choose between fixed candidates per region, not a search)
-  remain open — see round 13's write-up for the phased plan covering the
-  rest.
+  ✅ **Full 27-transform-type support is now COMPLETE** (this encoder only
+  added 8x8/16x16 as of round 6; rounds 7/8 completed Tranche A — all
+  square DCT sizes, 8x8 through 256x256, 6 of 27 types; rounds 9/10
+  completed Tranche B — all 12 rectangular types, 18 of 27 total; round 11
+  started Tranche C with DCT4x4, 19 of 27 total; round 12 added Hornuss and
+  DCT2x2, 21 of 27 total; round 13 added DCT4x8 and DCT8x4, 23 of 27
+  total; round 14 below added AFV0-3, 27 of 27 — Tranche C and the whole
+  effort are done). A real rate-distortion search over transform size
+  itself (rounds 6-14 choose between fixed candidates per region, not a
+  search) remains open, as does a real-manga ROI evaluation for the full
+  set (every non-default tranche/size still defaults off pending that —
+  existence and default-on-ness were always separate questions) — see
+  round 14's write-up for what's next now that completeness itself is
+  done.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -725,6 +729,53 @@ output for where the gap actually is.
   double-check, and its own still-unverified `*64` suspicion). See
   doc/spec_notes.md for the full write-up.
 
+- ✅ **Round 14 / Tranche C final slice: AFV0-3 — Tranche C and full
+  27-transform-type support are now COMPLETE.** The most complex bespoke
+  type: unlike every prior one (a butterfly plus at most one DCT call),
+  AFV splits the 8x8 block into 3 disjoint regions — a 4x4 region via a
+  fixed custom 16x16 basis matrix (`afvBasis`, not a DCT), a 4x4 region
+  via a transposed plain DCT, and a 4x8 region via a plain DCT — combined
+  via a 3x3 (not 4-point/2-point) linear system, since AFV's regions only
+  read 3 of the block's 4 corner coefficients. The decoder's own "SPEC:
+  watch signs here" comment (flagging the region-2 DC combination
+  `coeffs[0][0]+coeffs[1][0]-coeffs[0][1]`) made this the highest latent-
+  bug risk in the tranche — verified with the full rigor that risk
+  warranted: a Python basis-injection 64x64 matrix per flip variant
+  (AFV0-3 independently, not assumed by symmetry), confirmed to 2.2e-15
+  deviation, then 4 permanent Dart identity tests (all passed first try),
+  then dedicated djxl round-trip tests per variant confirming the exact
+  flagged sign combination was never a bug in this port. **A genuine
+  simplification found, not assumed**: `afvBasis` turned out to be
+  exactly orthonormal (confirmed by basis injection), so the forward
+  transform reuses the same table with the two 4x4-position indices'
+  roles swapped in the flat-array lookup — no new generated inverse table
+  needed. Extracted `getAFVQuantWeights` (single-sourced, same precedent
+  as every prior extraction). Checked, not assumed, the suspected shared
+  `*64` bug flagged unverified since round 11: `_setupDctParam`'s afv case
+  reads 6 of 9 param values with `*64` (matching hornuss/dct2's absolute-
+  weight shape) — confirmed correct via djxl round-trips with
+  non-degenerate "flat corner plus gradient" content (each AFV variant's
+  own winning corner found empirically via `jxl.encdebug`, not assumed by
+  flipY/flipX symmetry — AFV1/2/3's actual winning corner didn't match
+  that naive guess). Mixed-layout test now covers every bespoke type
+  except DCT4x4 in one bitstream at once at distance=0.5 (DCT4x4 covered
+  at the other 3 distances instead, so all 9 types are exercised across
+  the range). Default-path A/B found another consistent increment (+103B
+  at distance=2.0, larger than prior ones since AFV's own param set is
+  much bigger — 9 raw values plus 2 nested tables; unchanged at 1.0) —
+  same pre-existing `customParamsByIndex` cost, cumulative 224B at
+  distance=2.0 (still <0.025% of file size), not a new anomaly. Full
+  suite green (385 tests, up from 373); `flutter test` green on both
+  packages. `enableBespokeTransforms` stays off by default (unchanged
+  flag, now gating all 9 Tranche C types). **All 27 of 27 VarDCT
+  transform types now exist and are verified correct** — existence and
+  default-on-ness remain separate: `enableRectangularTransforms`/
+  `enableBespokeTransforms`/`maxTransformSize` beyond 16 all stay off/at-
+  baseline pending a real-manga ROI evaluation across the full set, which
+  hasn't been run yet — that, plus the rate-distortion search over
+  transform size itself, are what's left once completeness is done. See
+  doc/spec_notes.md for the full write-up.
+
 - **Cleanup (not yet scheduled): gate `customParamsByIndex` by reachability.**
   `vardct_l0_encoder.dart`'s `customParamsByIndex` currently includes an
   entry for every `_activeTransformTypes` member whenever any non-default
@@ -733,12 +784,30 @@ output for where the gap actually is.
   `enableBespokeTransforms`/`maxTransformSize`) could actually place it —
   writing a real but unused custom quant-weight table into HfGlobal for
   every such type (found by round 12's more precise default-path A/B,
-  above; round 13 confirmed the pattern continues, +31B more). Restricting
-  it to only the types reachable given the active flags would restore true
-  distance-independent byte-identity on the default path and stop this
-  small cost from compounding as AFV lands. Low priority (121B cumulative
-  on a multi-hundred-KB file so far) but worth doing once Tranche C is
-  complete rather than letting it grow type by type.
+  above; rounds 13/14 confirmed the pattern continues, +31B then +103B
+  more). Restricting it to only the types reachable given the active
+  flags would restore true distance-independent byte-identity on the
+  default path. Low priority (224B cumulative on a multi-hundred-KB file)
+  but worth doing now, since Tranche C (the source of this growth) is
+  complete and the cost has stopped compounding.
+
+- **Next phase, now that all 27 transform types exist: real-manga ROI
+  evaluation and a real rate-distortion search over transform size.**
+  Every tranche/size beyond the round-6 baseline (8x8/16x16) still
+  defaults off or at its round-6 baseline (`maxTransformSize: 16`,
+  `enableRectangularTransforms: false`, `enableBespokeTransforms: false`)
+  because each round deliberately scoped "does it exist and work" apart
+  from "should it be on by default for manga" (see `maxTransformSize`'s
+  own doc comment for the DCT32x32 case study of why these are separate
+  questions). With the full set now built, the next phase is evaluating
+  real `manga_samples/` pages across the whole space — which combinations
+  of tranche/size actually help manga content, not just synthetic
+  benchmarks — and only then reconsidering any defaults. Separately, every
+  round so far has picked between a fixed cascade of candidate sizes/types
+  per region (bootstrap 8x8 vs. 16x16 vs. rectangular vs. bespoke, etc.),
+  never a genuine joint rate-distortion search over the full 27-type
+  space per region — worth scoping once the ROI question above narrows
+  which types are worth searching over at all.
 
 ---
 

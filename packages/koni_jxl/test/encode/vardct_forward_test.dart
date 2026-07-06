@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:koni_jxl/src/color/opsin_inverse.dart';
 import 'package:koni_jxl/src/encode/vardct/xyb_forward.dart';
+import 'package:koni_jxl/src/vardct/afv_basis.dart';
 import 'package:koni_jxl/src/vardct/dct.dart';
 import 'package:koni_jxl/src/vardct/transform_type.dart';
 import 'package:test/test.dart';
@@ -725,6 +726,213 @@ void main() {
         }
       }
     });
+  });
+
+  // Tranche C, final slice (ROADMAP.md/spec_notes.md): AFV0-3 -- the most
+  // complex bespoke type, and the last one, completing Tranche C. Unlike
+  // every other bespoke type, AFV splits the 8x8 block into 3 DISJOINT
+  // regions (not quadrants or strips): a 4x4 "AFV-basis" region (a fixed
+  // custom 16x16 basis matrix, `afvBasis` -- not a DCT at all), a 4x4
+  // "transposed DCT" region, and a 4x8 "plain DCT" region -- their own
+  // local DC-like terms combine via a fixed 3x3 linear system (not a
+  // 4-point/2-point butterfly, since only 3 of the block's 4 "corner"
+  // coefficients are ever read — coeffs[1][1] belongs to the 4x8 region's
+  // own AC data instead). Which corner of the 8x8 block each region
+  // occupies (and whether the AFV-basis region's own output is mirrored)
+  // depends on AFV0/1/2/3's own flipY/flipX. The decoder's own "SPEC:
+  // watch signs here" comment (vardct_inverter.dart) flags this type's
+  // region-2 DC combination (`c00+c10-c01`) as an area of elevated risk --
+  // this test's decodeAfv function is a literal port of that exact
+  // formula, so the basis-injection proof and this permanent identity
+  // test both exercise the specific sign combination flagged, not just
+  // the type in general.
+  //
+  // A key simplification found (not assumed) during the numerical
+  // derivation: basis injection confirmed `afvBasis` (as a 16x16 matrix)
+  // is exactly orthonormal (M @ M.T == M.T @ M == I to float precision),
+  // so the AFV-basis region's forward transform reuses the SAME table the
+  // decoder already has (`afvBasis`) with the two 4x4-position indices'
+  // roles swapped in the flat-array lookup — no new generated inverse
+  // table needed, unlike a truly generic (non-orthogonal) 16x16 matrix
+  // would have required.
+  group('AFV0-3 (Tranche C, bespoke, final slice)', () {
+    // Mirrors vardct_inverter.dart's TransformMethod.afv case (_invertAFV)
+    // exactly, for a single isolated 8x8 block at the origin.
+    List<Float32List> decodeAfv(List<Float32List> cc, int flipY, int flipX) {
+      final fb = List.generate(8, (_) => Float32List(8));
+
+      // Region 1: AFV basis.
+      final s0 = List.generate(4, (_) => Float32List(4));
+      s0[0][0] = (cc[0][0] + cc[1][0] + cc[0][1]) * 4.0;
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
+          s0[iy][ix] = cc[iy * 2][ix * 2];
+        }
+      }
+      final s1 = List.generate(4, (_) => Float32List(4));
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          var sample = 0.0;
+          for (var j = 0; j < 16; j++) {
+            final jy = j >> 2, jx = j & 3;
+            sample += s0[jy][jx] * afvBasis[j * 16 + iy * 4 + ix];
+          }
+          s1[iy][ix] = sample;
+        }
+      }
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          fb[flipY * 4 + iy][flipX * 4 + ix] =
+              s1[flipY == 1 ? 3 - iy : iy][flipX == 1 ? 3 - ix : ix];
+        }
+      }
+
+      // Region 2: transposed 4x4 DCT. "SPEC: watch signs here" in the
+      // production decoder -- this line is a literal copy.
+      s0[0][0] = cc[0][0] + cc[1][0] - cc[0][1];
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = iy == 0 ? 1 : 0; ix < 4; ix++) {
+          s0[iy][ix] = cc[iy * 2][ix * 2 + 1];
+        }
+      }
+      final scratch0 = List.generate(8, (_) => Float32List(8));
+      final scratch1 = List.generate(8, (_) => Float32List(8));
+      inverseDCT2D(s0, s1, 0, 0, 0, 0, 4, 4, scratch0, scratch1, false);
+      final colOff = flipX == 1 ? 0 : 4;
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          fb[flipY * 4 + iy][colOff + ix] = s1[ix][iy]; // transposed write
+        }
+      }
+
+      // Region 3: plain 4x8 DCT.
+      final s0b = List.generate(4, (_) => Float32List(8));
+      s0b[0][0] = cc[0][0] - cc[1][0];
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = iy == 0 ? 1 : 0; ix < 8; ix++) {
+          s0b[iy][ix] = cc[1 + iy * 2][ix];
+        }
+      }
+      final s1b = List.generate(4, (_) => Float32List(8));
+      inverseDCT2D(s0b, s1b, 0, 0, 0, 0, 4, 8, scratch0, scratch1, false);
+      final rowOff = flipY == 1 ? 0 : 4;
+      for (var iy = 0; iy < 4; iy++) {
+        fb[rowOff + iy].setRange(0, 8, s1b[iy]);
+      }
+
+      return fb;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's computeCoeffBuf TransformMethod.afv
+    // branch exactly (the production forward derivation under test).
+    List<Float32List> encodeAfv(
+        List<Float32List> pixels, int flipY, int flipX) {
+      final cc = List.generate(8, (_) => Float32List(8));
+      final scratch0 = List.generate(8, (_) => Float32List(8));
+      final scratch1 = List.generate(8, (_) => Float32List(8));
+
+      // Region 1.
+      final s1 = List.generate(4, (_) => Float32List(4));
+      for (var iy = 0; iy < 4; iy++) {
+        final srcY = flipY == 1 ? 3 - iy : iy;
+        for (var ix = 0; ix < 4; ix++) {
+          final srcX = flipX == 1 ? 3 - ix : ix;
+          s1[iy][ix] = pixels[flipY * 4 + srcY][flipX * 4 + srcX];
+        }
+      }
+      final s1Flat = Float32List(16);
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          s1Flat[iy * 4 + ix] = s1[iy][ix];
+        }
+      }
+      final d = Float32List(3);
+      final region1Coeffs = List.generate(4, (_) => Float32List(4));
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          final k = iy * 4 + ix;
+          var sample = 0.0;
+          for (var j = 0; j < 16; j++) {
+            sample += s1Flat[j] * afvBasis[k * 16 + j];
+          }
+          region1Coeffs[iy][ix] = sample;
+        }
+      }
+      d[0] = region1Coeffs[0][0];
+
+      // Region 2.
+      final region2 = List.generate(4, (_) => Float32List(4));
+      final colOff = flipX == 1 ? 0 : 4;
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          region2[ix][iy] = pixels[flipY * 4 + iy][colOff + ix];
+        }
+      }
+      final region2Coeffs = List.generate(4, (_) => Float32List(4));
+      forwardDCT2D(
+          region2, region2Coeffs, 0, 0, 0, 0, 4, 4, scratch0, scratch1);
+      d[1] = region2Coeffs[0][0];
+
+      // Region 3.
+      final region3 = List.generate(4, (_) => Float32List(8));
+      final rowOff = flipY == 1 ? 0 : 4;
+      for (var iy = 0; iy < 4; iy++) {
+        region3[iy].setRange(0, 8, pixels[rowOff + iy]);
+      }
+      final region3Coeffs = List.generate(4, (_) => Float32List(8));
+      forwardDCT2D(
+          region3, region3Coeffs, 0, 0, 0, 0, 4, 8, scratch0, scratch1);
+      d[2] = region3Coeffs[0][0];
+
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 4; ix++) {
+          if (iy == 0 && ix == 0) continue;
+          cc[iy * 2][ix * 2] = region1Coeffs[iy][ix];
+          cc[iy * 2][ix * 2 + 1] = region2Coeffs[iy][ix];
+        }
+      }
+      for (var iy = 0; iy < 4; iy++) {
+        for (var ix = 0; ix < 8; ix++) {
+          if (iy == 0 && ix == 0) continue;
+          cc[1 + iy * 2][ix] = region3Coeffs[iy][ix];
+        }
+      }
+
+      cc[0][0] = d[0] / 16 + d[1] / 4 + d[2] / 2;
+      cc[1][0] = d[0] / 16 + d[1] / 4 - d[2] / 2;
+      cc[0][1] = d[0] / 8 - d[1] / 2;
+      return cc;
+    }
+
+    for (final (typeIndex, name) in [
+      (14, 'AFV0'),
+      (15, 'AFV1'),
+      (16, 'AFV2'),
+      (17, 'AFV3'),
+    ]) {
+      test(
+          '$name forward derivation followed by the real decoder '
+          'reconstruction is the identity, over random 8x8 blocks', () {
+        final tt = TransformType.byType(typeIndex);
+        final flipY = tt.type == 16 || tt.type == 17 ? 1 : 0;
+        final flipX = tt.type == 15 || tt.type == 17 ? 1 : 0;
+        final rng = math.Random(11 + typeIndex);
+        for (var trial = 0; trial < 50; trial++) {
+          final pixels = List.generate(
+              8,
+              (_) => Float32List.fromList(
+                  List.generate(8, (_) => rng.nextDouble() * 10 - 5)));
+          final cc = encodeAfv(pixels, flipY, flipX);
+          final recon = decodeAfv(cc, flipY, flipX);
+          for (var y = 0; y < 8; y++) {
+            for (var x = 0; x < 8; x++) {
+              expect(recon[y][x], closeTo(pixels[y][x], 1e-3),
+                  reason: 'trial $trial, pixel ($y, $x)');
+            }
+          }
+        }
+      });
+    }
   });
 }
 

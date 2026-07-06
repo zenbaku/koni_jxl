@@ -2429,6 +2429,129 @@ cleanup, whenever it's worth doing (now two increments deep: 36B + 54B +
 `distance=2.0`, still under 0.02% of file size, but growing by a small
 fixed amount with each new type regardless of that type's own default).
 
+### Lossy (VarDCT) encoder — Tranche C, final slice: AFV0-3 (Tranche C complete)
+
+The most complex bespoke type, and the last one — all 27 VarDCT transform
+types now exist. Unlike every prior bespoke type (a butterfly plus at
+most one DCT call), AFV splits the 8x8 block into **3 disjoint regions**:
+a 4x4 region reconstructed via a fixed custom 16x16 basis matrix
+(`afvBasis`, not a DCT at all), a 4x4 region via a transposed plain DCT,
+and a 4x8 region via a plain DCT — and their own local DC-like terms
+combine via a 3x3 (not 4-point or 2-point) linear system, since AFV's 3
+regions only ever read 3 of the block's 4 "corner" coefficients
+(`coeffs[1][1]` belongs to the 4x8 region's own AC data, not a separate
+DC term). Which corner of the 8x8 block each region occupies — and
+whether the AFV-basis region's own output is mirrored — depends on
+AFV0/1/2/3's own `flipY`/`flipX` (computed from `tt.type`, distinct from
+`TransformType.flip`, which is `false` for all of Tranche C).
+
+**The decoder's own "SPEC: watch signs here" comment** (`vardct_inverter.
+dart`'s `_invertAFV`, flagging the region-2 DC combination `coeffs[0][0] +
+coeffs[1][0] - coeffs[0][1]`) made this the highest-risk slice in the
+tranche for a latent decoder bug, the same "self-consistent but wrong"
+shape DCT4x4's own round already found once. Verified the same rigorous
+way regardless: a Python basis-injection 64x64 matrix built from a
+literal port of the real decoder logic (including that exact sign
+combination) for **all 4 flip variants independently**, confirmed to
+2.2e-15 deviation before writing any Dart, then re-derived as 4 permanent
+Dart identity tests (one per AFV0-3) — all passed first try, no test-only
+bugs this time. The real question was whether OUR decoder's
+implementation of that sign combination matches djxl's (agreement with
+our own decoder alone can't rule out a shared bug) — confirmed via
+dedicated djxl round-trip tests per variant, which also passed first
+try: this flagged region was never a bug in this port.
+
+**A genuine simplification found, not assumed**: `afvBasis` (as a 16x16
+matrix, `M[j][k] = afvBasis[j*16+k]`) turned out to be **exactly
+orthonormal** (`M @ M.T == M.T @ M == I` to float precision), confirmed
+by basis injection before relying on it. This meant the forward transform
+for the AFV-basis region needed no new generated inverse table (which a
+truly generic, non-orthogonal 16x16 matrix would have required, mirroring
+the DCT2x2 round's tiered-Gram-matrix precedent but simpler here since
+the diagonal is uniform, not tiered): the decoder's own map is `s1 = M.T @
+s0`, so the forward is `s0 = M @ s1` — literally the same table, the same
+loop shape, just with the two 4x4-position indices' roles swapped in the
+flat-array lookup (`afvBasis[k*16+j]` instead of `afvBasis[j*16+k]`).
+Region 1's target pixels are mirrored (row-reversed if `flipY`, column-
+reversed if `flipX`) before this, inverting the decoder's own output
+mirroring — self-inverse since reversal is an involution. The 3x3 system
+combining the regions' own DC-like terms (`d1` from the AFV-basis region,
+`d2` from the transposed-DCT region, `d3` from the plain-DCT region) has
+a verified closed form (`c00 = d1/16+d2/4+d3/2`, `c10 = d1/16+d2/4-d3/2`,
+`c01 = d1/8-d2/2`), checked against `numpy.linalg.solve` before trusting
+it, matching this project's preference for hand-unrolled formulas over a
+runtime linear solve where one exists.
+
+**Weight table**: extracted `getAFVQuantWeights` (public, single-sourced
+between decoder and encoder like every prior extraction this tranche) —
+the 8x8 table partitions into exactly the same 3 regions as the pixel
+reconstruction (even-row/even-column positions for the AFV-basis region,
+even-row/odd-column for the transposed-DCT region, odd-row/any-column for
+the plain-DCT region), confirming the partition understanding was right
+before writing the forward derivation. `customParams`'s `acScale` scaling
+needed care: the 5 corner overrides plus `bands[0]` (param indices 0-5)
+are absolute weight values (like hornuss/dct2's params, which DO scale)
+while the 3 `quantMult` ratios (indices 6-8) are left unscaled (like a
+dct-shaped table's own `vals[1:]`) — and the nested `dctParam`/
+`params4x4` tables each scale their own `band[0]` the same way any
+dct-shaped table does.
+
+**The suspected `*64` bug, flagged as unverified in rounds 11-13, checked
+here too**: `_setupDctParam`'s `TransformMode.afv` case reads its first 6
+of 9 param values with `*64` (matching hornuss/dct2's absolute-weight
+shape, not dct4/dct4x8's divisor shape) — structurally looked correct by
+the same reasoning already validated twice, but verified anyway via djxl
+round-trips with non-degenerate content ("flat corner plus gradient",
+deliberately not a periodic/symmetric pattern that would zero out the
+region-difference coefficients the way DCT4x8's first sine-wave attempt
+did) across all 4 flip variants: confirmed correct, not a bug.
+
+**Verification, full order**: the Python basis-injection proof (all 4
+flip variants) during planning; 4 permanent Dart identity tests; 4
+"genuinely wins" tests (one config per AFV variant, found via
+`jxl.encdebug` tallies — a "flat corner plus gradient" pattern, each
+variant's own winning corner confirmed empirically rather than assumed
+by `flipY`/`flipX` symmetry, since AFV1/2/3's actual winning corner
+didn't match that naive guess) with djxl round-trip and decode-vs-
+original RMSE bound — these same tests double as the `*64`/sign-
+combination verification, since the content was chosen to carry real
+signal in every region; a mixed-layout test (a 128x64 canvas, eight
+32x32 regions — the six from round 13 plus two AFV-flavored ones) round-
+tripped through djxl at all 4 standard distances, confirmed via the
+encdebug tally at distance=0.5 to place every bespoke type except DCT4x4
+in one bitstream at once (`{Hornuss: 52, DCT 8x8: 5, AFV0: 1, DCT 4x8:
+16, AFV3: 2, AFV1: 17, DCT 8x4: 17, DCT 2x2: 1, AFV2: 1, DCT 16x16: 4}`
+— DCT4x4 appears at the other 3 distances instead, so the full 9-type
+roster is covered across the 4 distances); the default-path A/B (same
+corpus golden as every prior round's check) — at `distance=2.0`, output
+grew another 103B (913228B -> 913331B, larger than prior increments
+since AFV's own custom param set is much bigger: 9 raw values plus 2
+nested dct-shaped tables, vs. 1-6 values for every prior type), the same
+pre-existing `customParamsByIndex` cost, not a new anomaly (cumulative
+drift from the pre-Tranche-C baseline: 36B + 54B + 31B + 103B = 224B at
+`distance=2.0`, still under 0.025% of file size); `distance=1.0` stayed
+exactly unchanged, as expected.
+
+**Shipped**: AFV0-3 all exist, are correct (verified numerically, via
+permanent identity tests, and against djxl including in a 10-type mixed
+layout, at distances specifically chosen to stress the exact sign
+combination the decoder's own comment flagged, and across all 4 flip
+variants independently), and confirmed the decoder's flagged risk area
+was never a bug in this port. `VardctL0Config.enableBespokeTransforms`
+stays off by default (unchanged flag, now gating all 9 Tranche C types).
+Full suite green (385 tests, up from 373); `flutter test` green on both
+packages. **All 27 of 27 VarDCT transform types are now implemented,
+completing the multi-round transform-type-completeness effort** (Tranche
+A: rounds 7-8; Tranche B: rounds 9-10; Tranche C: rounds 11-14). Existence
+and default-on-ness remain separate questions throughout: `enableRectangul
+arTransforms`/`enableBespokeTransforms`/`maxTransformSize` beyond 16 all
+stay off/at-baseline by default pending real-manga ROI evaluation, which
+has not been run for the full set — see ROADMAP.md for that as the next
+phase now that completeness itself is done. The `customParamsByIndex`
+gating cleanup (224B cumulative drift, still negligible) remains
+unscheduled — worth doing now that Tranche C's growth has stopped adding
+to it.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

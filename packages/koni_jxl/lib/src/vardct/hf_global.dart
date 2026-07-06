@@ -404,6 +404,59 @@ List<Float32List> getDct4x8QuantWeights(
   return target;
 }
 
+/// Computes the raw (pre-inversion) AFV0-3 quantization weight matrix for
+/// one channel: the 8x8 table is partitioned into 3 disjoint regions
+/// matching `vardct_inverter.dart`'s `_invertAFV` reconstruction exactly —
+/// the "even row, even column" positions (`weight[2x][2y]`) belong to the
+/// AFV-basis region (6 positions from [dctParam]/[params4x4]-independent
+/// direct overrides in [param], the rest from `_afvFreqs`-indexed band
+/// interpolation seeded by [param]); the "even row, odd column" positions
+/// belong to the transposed-4x4-DCT region ([params4x4], via
+/// [getDCTQuantWeights]); the "odd row, any column" positions belong to
+/// the 4x8-DCT region ([dctParam], via [getDCTQuantWeights]). Public for
+/// the same single-sourcing reason as [getDct4x4QuantWeights].
+List<Float32List> getAFVQuantWeights(
+    List<double> dctParam, List<double> params4x4, List<double> param) {
+  final weights4x8 = getDCTQuantWeights(4, 8, dctParam);
+  final weights4x4 = getDCTQuantWeights(4, 4, params4x4);
+  const low = 0.8517778890324296;
+  const high = 12.97166202570235;
+  final bands = List<double>.filled(4, 0);
+  bands[0] = param[5];
+  if (bands[0] < 0) {
+    throw const JxlInvalidBitstreamException('negative band value');
+  }
+  for (var i = 1; i < 4; i++) {
+    bands[i] = bands[i - 1] * _quantMult(param[i + 5]);
+    if (bands[i] < 0) {
+      throw const JxlInvalidBitstreamException('negative band value');
+    }
+  }
+  final weight = floatMatrix(8, 8);
+  weight[0][0] = 1.0;
+  weight[1][0] = param[0];
+  weight[0][1] = param[1];
+  weight[2][0] = param[2];
+  weight[0][2] = param[3];
+  weight[2][2] = param[4];
+  for (var y = 0; y < 4; y++) {
+    for (var x = 0; x < 4; x++) {
+      if (x < 2 && y < 2) continue;
+      final pos = (_afvFreqs[y * 4 + x] - low) / (high - low);
+      weight[2 * x][2 * y] = _interpolate(pos, bands);
+    }
+    for (var x = 0; x < 8; x++) {
+      if (x == 0 && y == 0) continue;
+      weight[2 * y + 1][x] = weights4x8[y][x];
+    }
+    for (var x = 0; x < 4; x++) {
+      if (x == 0 && y == 0) continue;
+      weight[2 * y][2 * x + 1] = weights4x4[y][x];
+    }
+  }
+  return weight;
+}
+
 /// HfGlobal: the 17 dequantization weight matrices plus the HF preset count.
 final class HfGlobal {
   HfGlobal(BitReader reader, Frame frame) {
@@ -559,6 +612,20 @@ final class HfGlobal {
             3, (_) => List<double>.generate(1, (_) => reader.readF16()));
         return DctParams(_readDCTParams(reader), m, encodingMode);
       case TransformMode.afv:
+        // Indices 0-4 (the 5 corner overrides, e.g. weight[1][0]=param[0])
+        // and 5 (bands[0], the AFV-basis region's own interpolation seed)
+        // are ALL absolute weight-table values used directly -- like
+        // hornuss/dct2's params, which legitimately get *64 -- not
+        // dct4/dct4x8's divisor-on-a-separate-table shape (which does NOT
+        // get *64). Indices 6-8 (quantMult ratios feeding the band chain)
+        // correctly don't get *64, matching a dct-shaped table's own
+        // vals[1:]. Confirmed correct via djxl round-trips at non-default
+        // distances across all 4 AFV variants, with content specifically
+        // chosen (a flat-corner-plus-gradient pattern, not a degenerate
+        // periodic one) so every region -- including the AFV-basis region
+        // this type's own decoder comment ("SPEC: watch signs here")
+        // flags as elevated risk -- carries real, nonzero signal. See
+        // doc/spec_notes.md.
         final m = List.generate(
             3,
             (_) => List<double>.generate(
@@ -573,44 +640,7 @@ final class HfGlobal {
 
   List<Float32List> _getAFVTransformWeights(int index, int c) {
     final p = params[index];
-    final weights4x8 = getDCTQuantWeights(4, 8, p.dctParam![c]);
-    final weights4x4 = getDCTQuantWeights(4, 4, p.params4x4![c]);
-    const low = 0.8517778890324296;
-    const high = 12.97166202570235;
-    final bands = List<double>.filled(4, 0);
-    bands[0] = p.param![c][5];
-    if (bands[0] < 0) {
-      throw const JxlInvalidBitstreamException('negative band value');
-    }
-    for (var i = 1; i < 4; i++) {
-      bands[i] = bands[i - 1] * _quantMult(p.param![c][i + 5]);
-      if (bands[i] < 0) {
-        throw const JxlInvalidBitstreamException('negative band value');
-      }
-    }
-    final weight = floatMatrix(8, 8);
-    weight[0][0] = 1.0;
-    weight[1][0] = p.param![c][0];
-    weight[0][1] = p.param![c][1];
-    weight[2][0] = p.param![c][2];
-    weight[0][2] = p.param![c][3];
-    weight[2][2] = p.param![c][4];
-    for (var y = 0; y < 4; y++) {
-      for (var x = 0; x < 4; x++) {
-        if (x < 2 && y < 2) continue;
-        final pos = (_afvFreqs[y * 4 + x] - low) / (high - low);
-        weight[2 * x][2 * y] = _interpolate(pos, bands);
-      }
-      for (var x = 0; x < 8; x++) {
-        if (x == 0 && y == 0) continue;
-        weight[2 * y + 1][x] = weights4x8[y][x];
-      }
-      for (var x = 0; x < 4; x++) {
-        if (x == 0 && y == 0) continue;
-        weight[2 * y][2 * x + 1] = weights4x4[y][x];
-      }
-    }
-    return weight;
+    return getAFVQuantWeights(p.dctParam![c], p.params4x4![c], p.param![c]);
   }
 
   void _generateWeights(int index) {

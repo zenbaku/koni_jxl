@@ -5,6 +5,7 @@ import '../../entropy/hybrid_uint.dart';
 import '../../frame/frame_flags.dart';
 import '../../io/bit_writer.dart';
 import '../../util/math_helper.dart';
+import '../../vardct/afv_basis.dart' show afvBasis;
 import '../../vardct/dct.dart';
 import '../../vardct/hf_block_context.dart';
 import '../../vardct/hf_coefficients.dart' show HfCoefficients;
@@ -12,6 +13,7 @@ import '../../vardct/hf_global.dart'
     show
         DctParams,
         defaultDctParams,
+        getAFVQuantWeights,
         getDCTQuantWeights,
         getDct2x2QuantWeights,
         getDct4x4QuantWeights,
@@ -210,9 +212,9 @@ class VardctL0Config {
   final bool enableRectangularTransforms;
 
   /// Whether to also try Tranche C's "bespoke" transform types (types with
-  /// no shared plain-DCT machinery — DCT4x4, Hornuss, DCT2x2, DCT4x8, and
-  /// DCT8x4 are implemented; only AFV0-3 remain unimplemented) at the
-  /// bootstrap-leaf level, as alternative encodings of the *same* 8x8 footprint plain
+  /// no shared plain-DCT machinery — all 9 are now implemented: DCT4x4,
+  /// Hornuss, DCT2x2, DCT4x8, DCT8x4, and AFV0-3, completing Tranche C) at
+  /// the bootstrap-leaf level, as alternative encodings of the *same* 8x8 footprint plain
   /// DCT8x8 already occupies — not a merge into a larger footprint like
   /// every Tranche A/B type. Reuses `tryMergeLevel` unchanged: called with
   /// a `dctSelectHeight==dctSelectWidth==1` target, it already degenerates
@@ -340,6 +342,14 @@ final _ttDct4x8 = TransformType.byType(
     12); // DCT4x8 (Tranche C, bespoke): orderID 1, parameterIndex 9, TransformMethod.dct4x8
 final _ttDct8x4 = TransformType.byType(
     13); // DCT8x4 (Tranche C, bespoke): orderID 1, parameterIndex 9, TransformMethod.dct8x4
+final _ttAfv0 = TransformType.byType(
+    14); // AFV0 (Tranche C, bespoke): orderID 1, parameterIndex 10, TransformMethod.afv
+final _ttAfv1 = TransformType.byType(
+    15); // AFV1 (Tranche C, bespoke): orderID 1, parameterIndex 10, TransformMethod.afv
+final _ttAfv2 = TransformType.byType(
+    16); // AFV2 (Tranche C, bespoke): orderID 1, parameterIndex 10, TransformMethod.afv
+final _ttAfv3 = TransformType.byType(
+    17); // AFV3 (Tranche C, bespoke): orderID 1, parameterIndex 10, TransformMethod.afv
 
 /// Transform types this encoder can currently emit, largest reused
 /// mechanically wherever code is already N-way (context/rawWeight lookup,
@@ -376,6 +386,10 @@ final _activeTransformTypes = [
   _ttDct2x2,
   _ttDct4x8,
   _ttDct8x4,
+  _ttAfv0,
+  _ttAfv1,
+  _ttAfv2,
+  _ttAfv3,
 ];
 
 /// The square sizes beyond the always-on 8x8/16x16 level, in ascending
@@ -551,6 +565,40 @@ Uint8List encodeLossyVardctL0(
             ],
         ];
         return DctParams(scaledDctParam, base.param, TransformMode.dct4x8);
+      case TransformMode.afv:
+        // dctParam (the 4x8-DCT region's base table) and params4x4 (the
+        // transposed-4x4-DCT region's base table) each scale the same way
+        // as any dct-shaped table (band[0] only -- see getDCTQuantWeights).
+        // param's first 6 values (the 5 direct corner overrides plus
+        // bands[0], the AFV-basis region's own band-interpolation seed)
+        // are ALL absolute weights used directly -- like hornuss/dct2's
+        // params, not dct4/dct4x8's divisor overrides -- so every one of
+        // them scales for a uniform fineness knob; the last 3 (quantMult
+        // ratios feeding the band chain) stay unscaled, matching a
+        // dct-shaped table's own vals[1:].
+        final scaledDctParam = [
+          for (var c = 0; c < 3; c++)
+            [
+              base.dctParam![c][0] * config.acScale,
+              ...base.dctParam![c].skip(1)
+            ],
+        ];
+        final scaledParams4x4 = [
+          for (var c = 0; c < 3; c++)
+            [
+              base.params4x4![c][0] * config.acScale,
+              ...base.params4x4![c].skip(1)
+            ],
+        ];
+        final scaledParam = [
+          for (var c = 0; c < 3; c++)
+            [
+              for (var i = 0; i < base.param![c].length; i++)
+                i < 6 ? base.param![c][i] * config.acScale : base.param![c][i],
+            ],
+        ];
+        return DctParams(scaledDctParam, scaledParam, TransformMode.afv,
+            params4x4: scaledParams4x4);
       default:
         throw UnsupportedError(
             'transform mode ${base.mode} not yet supported by the lossy encoder');
@@ -573,6 +621,11 @@ Uint8List encodeLossyVardctL0(
         return [
           for (var c = 0; c < 3; c++)
             getDct4x8QuantWeights(p.dctParam![c], p.param![c][0]),
+        ];
+      case TransformMode.afv:
+        return [
+          for (var c = 0; c < 3; c++)
+            getAFVQuantWeights(p.dctParam![c], p.params4x4![c], p.param![c]),
         ];
       case TransformMode.hornuss:
         return [
@@ -1401,13 +1454,13 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   }
 
   // 3.5. Bespoke pre-pass (Tranche C) at the bootstrap tier: try each
-  // bespoke type (Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4) as an
+  // bespoke type (Hornuss, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV0-3) as an
   // *alternative* encoding of the same 8x8 footprint plain DCT8x8 already
   // occupies — not a merge into a larger footprint like every Tranche A/B
   // type above. `tryMergeLevel` degenerates cleanly to exactly this
   // "replace one already-placed 1x1-footprint block if the real assembled
   // cost is lower" decision when `targetType.dctSelectHeight ==
-  // dctSelectWidth == 1` (true of all five): `strideY = strideX = 1`, the
+  // dctSelectWidth == 1` (true of all nine): `strideY = strideX = 1`, the
   // containment loop runs exactly once, `canPair` is always true — no
   // separate mechanism was needed (an earlier design draft proposed one;
   // dropped after design review found this reuse, see doc/spec_notes.md).
@@ -1415,20 +1468,24 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   // correctness: every bespoke type's footprint is geometrically identical
   // to plain 8x8 (same 1x1 `dctSelect` cell), so the containment guard
   // treats it the same as any other already-placed 1x1 block regardless of
-  // which pre-pass ran first — likewise, calling these five in sequence
+  // which pre-pass ran first — likewise, calling these nine in sequence
   // just means each later call compares against whatever the *previous*
-  // bespoke call already placed (greedy, not a joint 6-way choice among
-  // {8x8, hornuss, dct2, dct4, dct4x8, dct8x4} per cell) — only which
-  // greedy opportunity gets found first, same caveat already documented for
-  // the rectangular list's own internal ordering. Off by default
-  // ([VardctL0Config.enableBespokeTransforms]).
+  // bespoke call already placed (greedy, not a joint 10-way choice among
+  // {8x8, hornuss, dct2, dct4, dct4x8, dct8x4, afv0-3} per cell) — only
+  // which greedy opportunity gets found first, same caveat already
+  // documented for the rectangular list's own internal ordering. Off by
+  // default ([VardctL0Config.enableBespokeTransforms]).
   if (enableBespokeTransforms) {
     for (final bespokeType in [
       _ttHornuss,
       _ttDct2x2,
       _tt4x4,
       _ttDct4x8,
-      _ttDct8x4
+      _ttDct8x4,
+      _ttAfv0,
+      _ttAfv1,
+      _ttAfv2,
+      _ttAfv3,
     ]) {
       final (next, dcNext, changed) =
           tryMergeLevel(layout, dcInt, bespokeType, lambda);
@@ -1835,6 +1892,117 @@ class _PlacedBlock {
         }
         coeffBuf[c][0][0] = (lf[0] + lf[1]) / 2;
         coeffBuf[c][1][0] = (lf[0] - lf[1]) / 2;
+      }
+    } else if (tt.transformMethod == TransformMethod.afv) {
+      // Verified as the exact algebraic inverse of the decoder's
+      // TransformMethod.afv case (vardct_inverter.dart's _invertAFV,
+      // including the sign combination its own "SPEC: watch signs here"
+      // comment flags) via a 64x64 basis-injection matrix check (2.2e-15
+      // deviation) for all 4 flip variants (AFV0-3) before being trusted —
+      // see doc/spec_notes.md. The 8x8 block splits into 3 disjoint
+      // regions (matching getAFVQuantWeights' own partition): a 4x4
+      // "AFV-basis" region (fixed custom basis, not a DCT), a 4x4
+      // "transposed DCT" region, and a 4x8 "plain DCT" region — their own
+      // local DC-like terms (d1, d2, d3) combine via a fixed 3x3 linear
+      // system (not the 4-point/2-point butterflies elsewhere in this
+      // tranche, since AFV's 3 regions read only 3 of the block's own
+      // corner coefficients, never coeffs[1][1]) with a verified closed-
+      // form inverse (c00 = d1/16+d2/4+d3/2, c10 = d1/16+d2/4-d3/2,
+      // c01 = d1/8-d2/2).
+      //
+      // Region 1 reuses `afvBasis` directly rather than needing a new
+      // generated inverse table: basis injection confirmed it's exactly
+      // orthonormal (M @ M.T == M.T @ M == I), so the forward map is
+      // `s0 = M @ s1` where the decoder's own map is `s1 = M.T @ s0` —
+      // same loop shape as the decoder, just with the two 4x4-position
+      // indices' roles swapped in the flat-array lookup (`afvBasis[k*16+j]`
+      // instead of `afvBasis[j*16+k]`). Region 1's target pixels are first
+      // mirrored (row-reversed if flipY, column-reversed if flipX) to
+      // invert the decoder's own output mirroring — self-inverse since
+      // reversal is an involution.
+      final s1 = List.generate(4, (_) => Float32List(4));
+      final region2 = List.generate(4, (_) => Float32List(4));
+      final region2Coeffs = List.generate(4, (_) => Float32List(4));
+      final region3 = List.generate(4, (_) => Float32List(8));
+      final region3Coeffs = List.generate(4, (_) => Float32List(8));
+      final flipY = tt.type == 16 || tt.type == 17 ? 1 : 0; // AFV2, AFV3
+      final flipX = tt.type == 15 || tt.type == 17 ? 1 : 0; // AFV1, AFV3
+      final colOff = flipX == 1 ? 0 : 4;
+      final rowOff = flipY == 1 ? 0 : 4;
+      for (var c = 0; c < 3; c++) {
+        // Region 1: mirror the target 4x4 corner, then apply afvBasis with
+        // swapped index roles.
+        for (var iy = 0; iy < 4; iy++) {
+          final srcY = flipY == 1 ? 3 - iy : iy;
+          final row = planes[c][by * 8 + flipY * 4 + srcY];
+          final base = bx * 8 + flipX * 4;
+          for (var ix = 0; ix < 4; ix++) {
+            final srcX = flipX == 1 ? 3 - ix : ix;
+            s1[iy][ix] = row[base + srcX];
+          }
+        }
+        final s1Flat = Float32List(16);
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 4; ix++) {
+            s1Flat[iy * 4 + ix] = s1[iy][ix];
+          }
+        }
+        final quadDC = Float32List(3); // [d1, d2, d3]
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 4; ix++) {
+            final k = iy * 4 + ix;
+            var sample = 0.0;
+            for (var j = 0; j < 16; j++) {
+              sample += s1Flat[j] * afvBasis[k * 16 + j];
+            }
+            if (k == 0) {
+              quadDC[0] = sample;
+            } else {
+              coeffBuf[c][iy * 2][ix * 2] = sample;
+            }
+          }
+        }
+
+        // Region 2: transposed 4x4 DCT.
+        for (var iy = 0; iy < 4; iy++) {
+          final row = planes[c][by * 8 + flipY * 4 + iy];
+          final base = bx * 8 + colOff;
+          for (var ix = 0; ix < 4; ix++) {
+            region2[ix][iy] = row[base + ix]; // transpose while reading
+          }
+        }
+        forwardDCT2D(
+            region2, region2Coeffs, 0, 0, 0, 0, 4, 4, scratchA, scratchB);
+        quadDC[1] = region2Coeffs[0][0];
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 4; ix++) {
+            if (iy == 0 && ix == 0) continue;
+            coeffBuf[c][iy * 2][ix * 2 + 1] = region2Coeffs[iy][ix];
+          }
+        }
+
+        // Region 3: plain 4x8 DCT.
+        for (var iy = 0; iy < 4; iy++) {
+          final row = planes[c][by * 8 + rowOff + iy];
+          final base = bx * 8;
+          for (var ix = 0; ix < 8; ix++) {
+            region3[iy][ix] = row[base + ix];
+          }
+        }
+        forwardDCT2D(
+            region3, region3Coeffs, 0, 0, 0, 0, 4, 8, scratchA, scratchB);
+        quadDC[2] = region3Coeffs[0][0];
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 8; ix++) {
+            if (iy == 0 && ix == 0) continue;
+            coeffBuf[c][1 + iy * 2][ix] = region3Coeffs[iy][ix];
+          }
+        }
+
+        final d1 = quadDC[0], d2 = quadDC[1], d3 = quadDC[2];
+        coeffBuf[c][0][0] = d1 / 16 + d2 / 4 + d3 / 2;
+        coeffBuf[c][1][0] = d1 / 16 + d2 / 4 - d3 / 2;
+        coeffBuf[c][0][1] = d1 / 8 - d2 / 2;
       }
     } else {
       for (var c = 0; c < 3; c++) {
@@ -2543,15 +2711,16 @@ void _writeDctParamTable(BitWriter w, List<List<double>> dctParam) {
 /// HfGlobal + the single HfPass: quant weight tables (the library default
 /// for every one of the 17 parameter slots when [customParamsByIndex] is
 /// null; otherwise a custom table for each entry in [customParamsByIndex],
-/// encoded per that entry's own `DctParams.mode` — this encoder only ever
-/// emits custom params for `TransformMode.dct` (plain DCT types),
-/// `TransformMode.dct4` (DCT4x4), `TransformMode.hornuss` (Hornuss),
-/// `TransformMode.dct2` (DCT2x2), and `TransformMode.dct4x8` (DCT4x8/DCT8x4,
-/// sharing one parameterIndex/mode) slots, with the library default for
-/// every other slot, which costs 0 further bits each), a single HF preset
-/// shared
-/// by every group (cheapest choice; costs 0 bits only when [numGroups] ==
-/// 1), and natural (unpermuted) coefficient order.
+/// encoded per that entry's own `DctParams.mode` — this encoder now emits
+/// custom params for every mode Tranche A/B/C use: `TransformMode.dct`
+/// (plain DCT types), `TransformMode.dct4` (DCT4x4),
+/// `TransformMode.hornuss` (Hornuss), `TransformMode.dct2` (DCT2x2),
+/// `TransformMode.dct4x8` (DCT4x8/DCT8x4, sharing one parameterIndex/mode),
+/// and `TransformMode.afv` (AFV0-3, also sharing one parameterIndex/mode)
+/// slots, with the library default for every other slot, which costs 0
+/// further bits each), a single HF preset shared by every group (cheapest
+/// choice; costs 0 bits only when [numGroups] == 1), and natural
+/// (unpermuted) coefficient order.
 void _writeHfGlobalAndPass(
     BitWriter w, int numGroups, Map<int, DctParams>? customParamsByIndex) {
   w.writeBool(customParamsByIndex == null); // quant_all_default
@@ -2642,6 +2811,27 @@ void _writeHfGlobalAndPass(
             }
           }
           _writeDctParamTable(w, p.dctParam!);
+        case TransformMode.afv:
+          // Matches _setupDctParam's read order: the 9 raw values per
+          // channel first (indices 0-5 divided by 64 before writing, since
+          // they're read with *64 -- see _setupDctParam's afv case for why
+          // that's correct here, unlike dct4's history), then the nested
+          // dctParam table (the 4x8-DCT region), then params4x4 (the
+          // transposed-4x4-DCT region). Confirmed via djxl round-trips at
+          // non-default distances with content carrying real, nonzero
+          // signal in all 3 regions across all 4 flip variants
+          // (vardct_l0_test.dart) — not assumed correct just because the
+          // read side already looked structurally right, especially given
+          // this type's own decoder comment flagging a sign combination
+          // to double-check. See doc/spec_notes.md.
+          w.writeBits(TransformMode.afv, 3);
+          for (final ch in p.param!) {
+            for (var i = 0; i < ch.length; i++) {
+              w.writeF16(i < 6 ? ch[i] / 64.0 : ch[i]);
+            }
+          }
+          _writeDctParamTable(w, p.dctParam!);
+          _writeDctParamTable(w, p.params4x4!);
         default:
           throw UnsupportedError(
               'custom weight write not implemented for mode ${p.mode}');
