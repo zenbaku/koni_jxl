@@ -362,6 +362,11 @@ final _ttAfv3 = TransformType.byType(
 /// tables is cheap and does not by itself make the layout decision ever
 /// place it; that's gated purely by [_cascadeSizes]/[_cascadeRectPairs]/the
 /// bootstrap-tier rectangular pre-pass in `_decideTransformLayout`.
+/// `_finishEncode` restricts what actually gets *written* to HfGlobal's
+/// custom-weight section down further still, to only the types each
+/// specific assembled candidate's own placed blocks use (see its
+/// `customParamsByType` parameter's doc comment) — precise per candidate,
+/// not merely per-flag.
 final _activeTransformTypes = [
   _tt8,
   _tt16,
@@ -707,16 +712,13 @@ Uint8List encodeLossyVardctL0(
   final groupsY = ceilDiv(paddedHeight, 256);
   final numGroups = groupsX * groupsY;
 
-  // Custom per-frequency quant weight tables (if any), used by
-  // `_finishEncode`'s HfGlobal writer — doesn't depend on layout, so
-  // computed once regardless of which candidate(s) get assembled below.
+  // Whether to write custom per-frequency quant weight tables at all
+  // (only ever needed away from the library defaults). Which *types*
+  // actually get a custom table written is decided per assembled
+  // candidate, not here — see `_finishEncode`'s `customParamsByType`
+  // parameter's doc comment for why per-candidate precision (not just
+  // per-flag) is what actually eliminates the dead-bitstream-bytes cost.
   final usesCustomWeights = config.acScale != 1.0;
-  final customParamsByIndex = usesCustomWeights
-      ? {
-          for (final tt in _activeTransformTypes)
-            tt.parameterIndex: customParamsByType[tt.type]!,
-        }
-      : null;
 
   // 4. Decide the block layout: adaptively 8x8 or 16x16 per aligned 16x16
   // pixel region, in the exact raster-scan-with-skip order `HfMetadata`'s
@@ -775,7 +777,7 @@ Uint8List encodeLossyVardctL0(
             scratchA,
             scratchB,
             config,
-            customParamsByIndex,
+            usesCustomWeights ? customParamsByType : null,
             width,
             height);
 
@@ -847,7 +849,7 @@ Uint8List encodeLossyVardctL0(
       scratchA,
       scratchB,
       config,
-      customParamsByIndex,
+      usesCustomWeights ? customParamsByType : null,
       width,
       height);
 }
@@ -859,6 +861,24 @@ Uint8List encodeLossyVardctL0(
 /// `enableVariableTransforms` can run this same pipeline independently on
 /// two candidate layouts — see `_decideTransformLayout`'s doc comment —
 /// and keep whichever assembles smaller).
+///
+/// [customParamsByType] (keyed by `TransformType.type`, or `null` if
+/// `config.acScale == 1.0` and no custom table is ever needed) is the
+/// *full* per-type table regardless of what this specific candidate
+/// actually placed — deliberately not pre-filtered by the caller, so this
+/// function can derive the minimal `customParamsByIndex` HfGlobal actually
+/// needs from [placedBlocks] itself: only the parameterIndex slots this
+/// candidate's own blocks use. This is more precise than filtering by
+/// which *flags* could reach a type (an earlier version of this cleanup
+/// did that, then found it made "does rectangular/bespoke genuinely win"
+/// tests fragile — a flag-reachable-but-not-actually-placed type, e.g. one
+/// of 4 rectangular bootstrap candidates when only 2 end up chosen, still
+/// paid its custom-table cost under that scheme, and unevenly across the
+/// two sides of a comparison). Per-candidate precision has no such
+/// asymmetry: every candidate, in every config, pays for exactly the
+/// custom tables its own placed blocks use and no more — restoring true
+/// byte-optimality, not just distance-independent identity on the
+/// (flag-only) default path. See doc/spec_notes.md.
 Uint8List _finishEncode(
     List<_PlacedBlock> placedBlocks,
     List<Int32List> dcInt,
@@ -877,9 +897,18 @@ Uint8List _finishEncode(
     List<Float32List> scratchA,
     List<Float32List> scratchB,
     VardctL0Config config,
-    Map<int, DctParams>? customParamsByIndex,
+    Map<int, DctParams>? customParamsByType,
     int width,
     int height) {
+  final usedTypeIndices = {for (final block in placedBlocks) block.tt.type};
+  final customParamsByIndex = customParamsByType == null
+      ? null
+      : {
+          for (final tt in _activeTransformTypes)
+            if (usedTypeIndices.contains(tt.type))
+              tt.parameterIndex: customParamsByType[tt.type]!,
+        };
+
   final blocksByGroup = List<List<_PlacedBlock>>.generate(numGroups, (_) => []);
   for (final block in placedBlocks) {
     final g = (block.by ~/ 32) * groupsX + (block.bx ~/ 32);

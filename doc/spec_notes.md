@@ -2552,6 +2552,92 @@ gating cleanup (224B cumulative drift, still negligible) remains
 unscheduled — worth doing now that Tranche C's growth has stopped adding
 to it.
 
+### Lossy (VarDCT) encoder — round 15: the `customParamsByIndex` cleanup, done more precisely than scoped
+
+The cleanup flagged since round 12 turned out to have a better fix than
+originally scoped. The first attempt matched the literal ROADMAP.md
+wording — filter `customParamsByIndex` down to the `_activeTransformTypes`
+subset each config's *flags* make reachable (mirroring
+`_decideTransformLayout`'s own gating structure in a parallel function,
+`_reachableTransformTypes`) — and it broke 11 existing tests. Root cause:
+"reachable given the flags" is coarser than "actually placed in this
+specific candidate." Every `enableRectangularTransforms`/
+`enableBespokeTransforms`-gated pre-pass tries *several* candidate types
+per cell and keeps only the winner (e.g. the bootstrap rectangular
+pre-pass tries all of `_tt8x16`/`_tt16x8`/`_tt8x32`/`_tt32x8`, but a given
+image might only ever end up placing one of the four, or none). Under
+flag-based filtering, every reachable-but-unused type *still* paid its
+own custom-table cost — and critically, that cost fell unevenly across
+the two sides of every existing "does X genuinely win" test (the `with X`
+config has *more* reachable-but-possibly-unused types than the `without
+X` baseline), which is exactly backwards from what a fair comparison
+needs. Previously this asymmetry was invisible because *every* type's
+table was written regardless of flags, so the (identical, large) waste
+canceled out in the size *difference* even though neither side was
+byte-optimal.
+
+**The actual fix**: `_finishEncode` (called once per assembled candidate,
+already receiving that candidate's real `placedBlocks` list) now derives
+`customParamsByIndex` from which types are *actually placed* in that
+specific candidate, not which the config's flags merely permit. This
+needed no parallel gating table to maintain (removing
+`_reachableTransformTypes` entirely, since duplicating
+`_decideTransformLayout`'s own conditional structure elsewhere is exactly
+the kind of drift risk this project avoids everywhere else) — just
+`{for (b in placedBlocks) b.tt.type}.toSet()`, intersected with
+`_activeTransformTypes` for iteration order. Every candidate, in every
+config, now pays for exactly the custom tables its own blocks use and no
+more: genuinely byte-optimal, not merely "no worse than flag-off."
+
+**A pleasant surprise, verified not assumed**: the default-path A/B
+(`enableBespokeTransforms: false`, same corpus golden as every prior
+round's check) now measures *smaller* than even the pre-Tranche-C
+baseline this whole effort started from (912585B vs. the round-11-era
+913107B at distance=2.0, i.e. an *improvement*, not just a restoration) —
+because that "pre-Tranche-C" baseline was itself never byte-optimal: with
+18 active types by then (Tranche A+B both complete), it already suffered
+the identical waste for every cascade size beyond 16 and every
+rectangular type never actually placed on that specific image, just not
+yet measured precisely enough to notice. This fix eliminates the waste
+for *all* three tranches at once, not only Tranche C's own contribution.
+Confirmed correct via djxl (not just "smaller, therefore assumed fine"):
+RMSE ~0.35-0.39 at distances 0.5/2.0/4.0 on the same corpus file, well
+within the `< 2.0` gate.
+
+**One existing test needed re-tuning, for a legitimate reason, not
+papered over**: "DCT 16x8/8x16 genuinely wins on a mix of shapes" (a
+32x32 canvas) went from a clear win to an exact tie once accounting
+became byte-precise — the real AC savings from actually using
+DCT16x8/8x16 on that tiny canvas turn out to be almost exactly offset by
+the one-time cost of their own custom weight table, a margin so thin the
+old (universally wasteful) baseline had been masking it by coincidence.
+Re-swept via `jxl.encdebug` (this project's standard methodology, not
+guessed): the same content at 64x64 gives a solid, unambiguous win
+(43-153B across the 4 standard distances) since more blocks amortize the
+same fixed table cost — this is the correct fix (a more realistic canvas
+size), not a loosened assertion, since the encoder's new byte-accounting
+is more correct, not the thing that needed adjusting.
+
+**Verification**: full suite green (385 tests, count unchanged — only
+the one test's canvas size changed); `flutter test` green on both
+packages; a git-stash A/B timing comparison (default config, same corpus
+golden, 3 trials each side) found no measurable performance difference
+(~17.4-17.5s either side, within this project's own established several-
+percent noise floor) — the added per-candidate work (one small `Set`
+built from `placedBlocks`, already O(numBlocks) work `_finishEncode` was
+already doing per candidate) is negligible next to the multi-second
+real-assembly cost every candidate already pays.
+
+**Shipped**: `customParamsByIndex` is now precise per assembled candidate,
+not merely per-flag. The `_activeTransformTypes`/`rawWeightByType`/
+`ctxByType` tables themselves are still built unconditionally for all 27
+types regardless of config (round 8's own "cheap, don't gate it"
+finding still applies to *that* cost) — only the bitstream-*written*
+custom-weight-table selection is now exact. No config flag's default
+changed; no round-trip behavior changed for any config that already
+passed its own tests. This closes the last item from the transform-type-
+completeness effort's own cleanup backlog.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

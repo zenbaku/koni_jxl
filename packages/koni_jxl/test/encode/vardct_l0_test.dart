@@ -778,11 +778,20 @@ void main() {
     // Canvas size/stripe period/distance found empirically (jxl.encdebug
     // tallies), not guessed, matching this project's established
     // methodology (see the 256x256-fills-a-group test above): swept until
-    // the *chosen*, real-assembled candidate contained all four shapes at
-    // once (tally={DCT 8x16: 3, DCT 16x8: 2, DCT 16x16: 1, DCT 8x8: 2})
-    // and genuinely beat the square-only cascade, not just the plain
-    // bootstrap.
-    const size = 32, period = 10;
+    // the *chosen*, real-assembled candidate contained rectangular shapes
+    // alongside plain 8x8 and genuinely beat the square-only cascade, not
+    // just the plain bootstrap. Re-swept to 64x64 (originally 32x32) after
+    // the `customParamsByIndex` per-candidate-precision cleanup (see
+    // doc/spec_notes.md): a custom weight table is a fixed one-time cost
+    // that a 32x32 canvas's few blocks couldn't amortize, so the genuine
+    // (but always thin) win from actually using DCT16x8/8x16 here got
+    // entirely swamped by their own table's overhead once accounting
+    // became byte-precise instead of approximate — not a regression in
+    // the encoder, a more accurate measurement exposing how thin this
+    // specific test's margin always was. 64x64 gives a solid, clearly
+    // positive margin at this distance (tally={DCT 8x16: 20, DCT 16x8: 8,
+    // DCT 8x8: 8}).
+    const size = 64, period = 10;
     final pixels = Uint8List(size * size * 3);
     final rng = math.Random(7);
     var i = 0;

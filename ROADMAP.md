@@ -776,20 +776,38 @@ output for where the gap actually is.
   transform size itself, are what's left once completeness is done. See
   doc/spec_notes.md for the full write-up.
 
-- **Cleanup (not yet scheduled): gate `customParamsByIndex` by reachability.**
-  `vardct_l0_encoder.dart`'s `customParamsByIndex` currently includes an
-  entry for every `_activeTransformTypes` member whenever any non-default
-  distance is used, regardless of whether that type's own config flag
-  (`enableVariableTransforms`/`enableRectangularTransforms`/
-  `enableBespokeTransforms`/`maxTransformSize`) could actually place it —
-  writing a real but unused custom quant-weight table into HfGlobal for
-  every such type (found by round 12's more precise default-path A/B,
-  above; rounds 13/14 confirmed the pattern continues, +31B then +103B
-  more). Restricting it to only the types reachable given the active
-  flags would restore true distance-independent byte-identity on the
-  default path. Low priority (224B cumulative on a multi-hundred-KB file)
-  but worth doing now, since Tranche C (the source of this growth) is
-  complete and the cost has stopped compounding.
+- ✅ **Round 15: the `customParamsByIndex` cleanup — done more precisely
+  than scoped.** The first attempt matched this entry's own original
+  wording (filter by which types each config's *flags* make reachable,
+  mirroring `_decideTransformLayout`'s gating in a parallel function) and
+  broke 11 existing tests: "reachable given the flags" is coarser than
+  "actually placed in this candidate" (a pre-pass tries several candidate
+  types per cell and keeps one winner), and that gap fell unevenly across
+  the two sides of every existing "does X genuinely win" test. The real
+  fix: `_finishEncode` (already receiving each candidate's real
+  `placedBlocks` list) now derives `customParamsByIndex` from which types
+  are *actually placed* in that specific candidate — no parallel gating
+  table needed (removed `_reachableTransformTypes` entirely, avoiding
+  exactly the drift-from-two-copies risk this project avoids everywhere
+  else). Every candidate, in every config, now pays for exactly the
+  custom tables its own blocks use — genuinely byte-optimal, not just
+  "no worse than flag-off." A pleasant surprise, verified via djxl not
+  assumed: the default-path A/B now measures *smaller* than even the
+  pre-Tranche-C baseline (912585B vs. 913107B at distance=2.0) — that
+  baseline was itself never byte-optimal once Tranche A/B were both
+  complete (18 active types), just not measured precisely enough to
+  notice before this round. One existing test ("DCT 16x8/8x16 genuinely
+  wins," a 32x32 canvas) needed re-tuning to 64x64 for a legitimate
+  reason: byte-precise accounting exposed that its original margin was
+  always paper-thin (a fixed one-time weight-table cost a tiny canvas
+  couldn't amortize), re-swept via `jxl.encdebug` to a size where the
+  real win (43-153B across the 4 standard distances) is unambiguous — the
+  correct fix given the encoder's new accounting is more correct, not a
+  loosened assertion. Full suite green (385 tests, count unchanged);
+  `flutter test` green; a git-stash A/B timing comparison found no
+  measurable performance difference. This closes the last item from the
+  transform-type-completeness effort's own cleanup backlog. See
+  doc/spec_notes.md for the full write-up.
 
 - **Next phase, now that all 27 transform types exist: real-manga ROI
   evaluation and a real rate-distortion search over transform size.**
