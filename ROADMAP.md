@@ -123,11 +123,12 @@ quality lives.
   Full 27-transform-type support (this encoder only added 8x8/16x16 as of
   round 6; rounds 7/8 completed Tranche A — all square DCT sizes, 8x8
   through 256x256, 6 of 27 types; rounds 9/10 completed Tranche B — all 12
-  rectangular types, 18 of 27 total; round 11 below started Tranche C with
-  DCT4x4, 19 of 27 total; 8 remain) and a real rate-distortion search over
-  transform size itself (rounds 6-11 choose between fixed candidates per
-  region, not a search) remain open — see round 11's write-up for the
-  phased plan covering the rest.
+  rectangular types, 18 of 27 total; round 11 started Tranche C with
+  DCT4x4, 19 of 27 total; round 12 below added Hornuss and DCT2x2, 21 of 27
+  total; 6 remain) and a real rate-distortion search over transform size
+  itself (rounds 6-12 choose between fixed candidates per region, not a
+  search) remain open — see round 12's write-up for the phased plan
+  covering the rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -631,6 +632,69 @@ output for where the gap actually is.
   `enableBespokeTransforms` stays off by default. This starts Tranche C
   (19 of 27 types now implemented, 8 to go). See doc/spec_notes.md for the
   full write-up.
+
+- ✅ **Round 12 / Tranche C continued: Hornuss and DCT2x2.** Both forward
+  derivations verified the same way as DCT4x4's — a Python basis-injection
+  64x64 matrix built from the real decoder logic, checked to exact `0.0`
+  deviation before writing any Dart, then re-verified as permanent Dart
+  identity tests (passed first try, confirming the port too). Hornuss
+  reuses DCT4x4's verified single-stage butterfly for cross-quadrant DC
+  combination; DCT2x2 needed the corrected "tiered-scaling-plus-transpose"
+  derivation flagged in round 11 (its 3-stage cascade's Gram matrix has a
+  tiered 64/16/4 diagonal, not a uniform 4 — the true inverse is
+  `transpose(cascade) / tieredScale`, confirmed by basis injection, not
+  DCT4x4's debunked self-inverse shape). **Checked, not assumed, the
+  suspected shared `*64` bug** round 11 explicitly left open
+  ("hornuss/dct2/afv... unverifiable without an encoder... check when
+  implementing those types"): two dedicated djxl round-trip tests using
+  non-degenerate content (a smooth gradient for Hornuss, random noise for
+  DCT2x2 — deliberately not flat/checkerboard content, which would make
+  every governed coefficient exactly zero and hide a scaling error) both
+  passed first try — the `*64` convention is correct as-is for these two
+  modes, unlike dct4's genuine bug. `tryMergeLevel` now runs all three
+  bespoke types (Hornuss, DCT2x2, DCT4x4) in sequence at the bootstrap
+  tier, still under the single `enableBespokeTransforms` flag. **A more
+  precise default-path A/B than prior rounds ran** (checked a non-default
+  distance, not just 1.0) found that "byte-identical" only holds at
+  distance=1.0: at distance=2.0, output already grew 36B after round 11
+  (confirmed by rebuilding at the pre-round-11 commit) and grew another
+  54B after this round, on a ~900KB file (~0.006% each time) — because
+  `customParamsByIndex` writes a real but unused custom quant-weight table
+  for every `_activeTransformTypes` entry whenever any non-default
+  distance is used, regardless of that type's own enable flag. Pre-existing
+  and cumulative (not new to this round), correctness-neutral (djxl
+  decodes the extra tables fine, full suite green throughout), and
+  negligible in size — doesn't block, but every prior round's
+  "byte-identical" claim should be read as "at distance=1.0 specifically."
+  Filed as a cleanup item below rather than fixed now (touches every
+  tranche, not just this round's scope). Mixed-layout test now covers all
+  5 active types at once (confirmed via encdebug tally:
+  `{Hornuss: 39, DCT 8x8: 6, DCT 4x4: 1, DCT 2x2: 2, DCT 16x16: 4}` at
+  distance=0.5). Full suite green (363 tests, up from 351).
+  `enableBespokeTransforms` stays off by default (unchanged flag, now
+  gating three types; same "never worse than plain 8x8/bootstrap" caveat
+  `enableRectangularTransforms` already documents, not a stricter
+  joint-optimum guarantee). This continues Tranche C (21 of 27 types now
+  implemented, 6 to go: DCT4x8/DCT8x4 next — share DCT4x4's "butterfly +
+  sub-block IDCT" shape almost exactly — then AFV last, most complex: a
+  16x16 fixed basis matrix, a 3-region split, a decoder comment flagging a
+  sign combination to double-check, and its own still-unverified `*64`
+  suspicion). See doc/spec_notes.md for the full write-up.
+
+- **Cleanup (not yet scheduled): gate `customParamsByIndex` by reachability.**
+  `vardct_l0_encoder.dart`'s `customParamsByIndex` currently includes an
+  entry for every `_activeTransformTypes` member whenever any non-default
+  distance is used, regardless of whether that type's own config flag
+  (`enableVariableTransforms`/`enableRectangularTransforms`/
+  `enableBespokeTransforms`/`maxTransformSize`) could actually place it —
+  writing a real but unused custom quant-weight table into HfGlobal for
+  every such type (found by round 12's more precise default-path A/B,
+  above). Restricting it to only the types reachable given the active
+  flags would restore true distance-independent byte-identity on the
+  default path and stop this small cost from compounding as DCT4x8/DCT8x4/
+  AFV land. Low priority (each increment is a few dozen bytes on a
+  multi-hundred-KB file) but worth doing once Tranche C is complete rather
+  than letting it grow type by type.
 
 ---
 

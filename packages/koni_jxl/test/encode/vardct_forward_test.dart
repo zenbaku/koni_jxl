@@ -351,6 +351,218 @@ void main() {
       }
     });
   });
+
+  // Tranche C, second/third slices (ROADMAP.md/spec_notes.md): Hornuss and
+  // DCT2x2 share DCT4x4's verified single-stage butterfly for their own
+  // cross-quadrant (Hornuss) or top-level (DCT2x2) DC combination, but each
+  // needed its own independent forward derivation verified the same way —
+  // by basis injection against the real decoder logic (0.0 deviation, see
+  // doc/spec_notes.md), not by extrapolating DCT4x4's shape. These groups
+  // are the permanent Dart form of that check (the "duplicate the decoder's
+  // private arithmetic in test code" pattern the DCT4x4 group above already
+  // uses) — they catch *port* errors (e.g. an index swap) that the Python
+  // basis-injection proof, run once during planning, cannot.
+  group('Hornuss (Tranche C, bespoke)', () {
+    // Mirrors vardct_inverter.dart's TransformMethod.hornuss case exactly,
+    // for a single isolated 8x8 block at the origin (ppgY=ppgX=ppfY=ppfX=0).
+    List<Float32List> decodeHornuss(List<Float32List> cc) {
+      final (b00, b01, b10, b11) = _dct4Butterfly(cc[0][0].toDouble(),
+          cc[0][1].toDouble(), cc[1][0].toDouble(), cc[1][1].toDouble());
+      final blockLF = [
+        Float32List.fromList([b00, b01]),
+        Float32List.fromList([b10, b11]),
+      ];
+      final fb = List.generate(8, (_) => Float32List(8));
+      for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+          var residual = 0.0;
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              if (iy == 0 && ix == 0) continue;
+              residual += cc[y + iy * 2][x + ix * 2];
+            }
+          }
+          final center = blockLF[y][x] - residual * 0.0625;
+          fb[4 * y + 1][4 * x + 1] = center;
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              if (ix == 1 && iy == 1) continue;
+              fb[y * 4 + iy][x * 4 + ix] = cc[y + iy * 2][x + ix * 2] + center;
+            }
+          }
+          fb[4 * y][4 * x] = cc[y + 2][x + 2] + center;
+        }
+      }
+      return fb;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's computeCoeffBuf TransformMethod
+    // .hornuss branch exactly (the production forward derivation under
+    // test).
+    List<Float32List> encodeHornuss(List<Float32List> pixels) {
+      final cc = List.generate(8, (_) => Float32List(8));
+      final blockLF = List.generate(2, (_) => Float32List(2));
+      for (var qy = 0; qy < 2; qy++) {
+        for (var qx = 0; qx < 2; qx++) {
+          var sum = 0.0;
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              sum += pixels[qy * 4 + iy][qx * 4 + ix];
+            }
+          }
+          blockLF[qy][qx] = sum * 0.0625;
+          final center = pixels[qy * 4 + 1][qx * 4 + 1];
+          for (var iy = 0; iy < 4; iy++) {
+            for (var ix = 0; ix < 4; ix++) {
+              if ((iy == 0 && ix == 0) || (iy == 1 && ix == 1)) continue;
+              cc[qy + iy * 2][qx + ix * 2] =
+                  pixels[qy * 4 + iy][qx * 4 + ix] - center;
+            }
+          }
+          cc[qy + 2][qx + 2] = pixels[qy * 4][qx * 4] - center;
+        }
+      }
+      final (e00, e01, e10, e11) = _dct4Butterfly(
+          blockLF[0][0].toDouble(),
+          blockLF[0][1].toDouble(),
+          blockLF[1][0].toDouble(),
+          blockLF[1][1].toDouble());
+      cc[0][0] = e00 / 4;
+      cc[0][1] = e01 / 4;
+      cc[1][0] = e10 / 4;
+      cc[1][1] = e11 / 4;
+      return cc;
+    }
+
+    test(
+        'forward derivation followed by the real decoder reconstruction '
+        'is the identity, over random 8x8 blocks', () {
+      final rng = math.Random(7);
+      for (var trial = 0; trial < 50; trial++) {
+        final pixels = List.generate(
+            8,
+            (_) => Float32List.fromList(
+                List.generate(8, (_) => rng.nextDouble() * 10 - 5)));
+        final cc = encodeHornuss(pixels);
+        final recon = decodeHornuss(cc);
+        for (var y = 0; y < 8; y++) {
+          for (var x = 0; x < 8; x++) {
+            expect(recon[y][x], closeTo(pixels[y][x], 1e-3),
+                reason: 'trial $trial, pixel ($y, $x)');
+          }
+        }
+      }
+    });
+  });
+
+  group('DCT2x2 (Tranche C, bespoke)', () {
+    // Mirrors vardct_inverter.dart's private `_auxDCT2`, restricted to the
+    // pY=pX=psY=psX=0 case TransformMethod.dct2's 3-stage cascade always
+    // uses.
+    void auxDCT2(List<Float32List> coeffs, List<Float32List> result, int s) {
+      for (var y = 0; y < 8; y++) {
+        result[y].setRange(0, 8, coeffs[y]);
+      }
+      final num = s ~/ 2;
+      for (var iy = 0; iy < num; iy++) {
+        for (var ix = 0; ix < num; ix++) {
+          final c00 = coeffs[iy][ix];
+          final c01 = coeffs[iy][ix + num];
+          final c10 = coeffs[iy + num][ix];
+          final c11 = coeffs[iy + num][ix + num];
+          result[iy * 2][ix * 2] = c00 + c01 + c10 + c11;
+          result[iy * 2][ix * 2 + 1] = c00 + c01 - c10 - c11;
+          result[iy * 2 + 1][ix * 2] = c00 - c01 + c10 - c11;
+          result[iy * 2 + 1][ix * 2 + 1] = c00 - c01 - c10 + c11;
+        }
+      }
+    }
+
+    // Mirrors vardct_inverter.dart's TransformMethod.dct2 case exactly, for
+    // a single isolated 8x8 block at the origin.
+    List<Float32List> decodeDct2(List<Float32List> cc) {
+      final s0 = List.generate(8, (_) => Float32List(8));
+      final s1 = List.generate(8, (_) => Float32List(8));
+      final fb = List.generate(8, (_) => Float32List(8));
+      auxDCT2(cc, s0, 2);
+      auxDCT2(s0, s1, 4);
+      auxDCT2(s1, fb, 8);
+      return fb;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's private `_auxDCT2Transposed` exactly
+    // (see that function's doc comment for why the transpose has this
+    // simple "same H4 formula, read/write roles swapped" closed form —
+    // verified against the true matrix transpose by basis injection, not
+    // assumed from the algebra alone).
+    void auxDCT2Transposed(
+        List<Float32List> coeffs, List<Float32List> result, int s) {
+      for (var y = 0; y < 8; y++) {
+        result[y].setRange(0, 8, coeffs[y]);
+      }
+      final num = s ~/ 2;
+      for (var iy = 0; iy < num; iy++) {
+        for (var ix = 0; ix < num; ix++) {
+          final dA = coeffs[iy * 2][ix * 2];
+          final dB = coeffs[iy * 2][ix * 2 + 1];
+          final dC = coeffs[iy * 2 + 1][ix * 2];
+          final dD = coeffs[iy * 2 + 1][ix * 2 + 1];
+          result[iy][ix] = dA + dB + dC + dD;
+          result[iy][ix + num] = dA + dB - dC - dD;
+          result[iy + num][ix] = dA - dB + dC - dD;
+          result[iy + num][ix + num] = dA - dB - dC + dD;
+        }
+      }
+    }
+
+    // Mirrors vardct_l0_encoder.dart's private `_dct2x2GramScale` exactly.
+    double gramScale(int row, int col) {
+      var scale = 4.0;
+      if (row < 4 && col < 4) scale *= 4.0;
+      if (row < 2 && col < 2) scale *= 4.0;
+      return scale;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's computeCoeffBuf TransformMethod.dct2
+    // branch exactly (the production forward derivation under test).
+    List<Float32List> encodeDct2(List<Float32List> pixels) {
+      final s0 = List.generate(8, (_) => Float32List(8));
+      final s1 = List.generate(8, (_) => Float32List(8));
+      final cc = List.generate(8, (_) => Float32List(8));
+      for (var y = 0; y < 8; y++) {
+        cc[y].setRange(0, 8, pixels[y]);
+      }
+      auxDCT2Transposed(cc, s0, 8);
+      auxDCT2Transposed(s0, s1, 4);
+      auxDCT2Transposed(s1, cc, 2);
+      for (var y = 0; y < 8; y++) {
+        for (var x = 0; x < 8; x++) {
+          cc[y][x] /= gramScale(y, x);
+        }
+      }
+      return cc;
+    }
+
+    test(
+        'forward derivation followed by the real decoder reconstruction '
+        'is the identity, over random 8x8 blocks', () {
+      final rng = math.Random(8);
+      for (var trial = 0; trial < 50; trial++) {
+        final pixels = List.generate(
+            8,
+            (_) => Float32List.fromList(
+                List.generate(8, (_) => rng.nextDouble() * 10 - 5)));
+        final cc = encodeDct2(pixels);
+        final recon = decodeDct2(cc);
+        for (var y = 0; y < 8; y++) {
+          for (var x = 0; x < 8; x++) {
+            expect(recon[y][x], closeTo(pixels[y][x], 1e-3),
+                reason: 'trial $trial, pixel ($y, $x)');
+          }
+        }
+      }
+    });
+  });
 }
 
 /// The decoder's `_auxDCT2` (`vardct_inverter.dart`) single-stage (`s=2`,

@@ -332,6 +332,54 @@ List<Float32List> getDct4x4QuantWeights(
   return target;
 }
 
+/// Computes the raw (pre-inversion) Hornuss quantization weight matrix for
+/// one channel: [param] holds 3 absolute weight values used directly (not a
+/// band-interpolated table) — `param[0]` fills every position, then
+/// `param[1]` overrides the two positions adjacent to the LLF corner and
+/// `param[2]` overrides the position diagonal to it; the LLF corner itself
+/// is fixed at 1.0 (it's dequantized from the DC plane, never from this
+/// table). Public for the same single-sourcing reason as
+/// [getDct4x4QuantWeights].
+List<Float32List> getHornussQuantWeights(List<double> param) {
+  final w = floatMatrix(8, 8);
+  for (var y = 0; y < 8; y++) {
+    for (var x = 0; x < 8; x++) {
+      w[y][x] = param[0];
+    }
+  }
+  w[1][1] = param[2];
+  w[0][1] = w[1][0] = param[1];
+  w[0][0] = 1.0;
+  return w;
+}
+
+/// Computes the raw (pre-inversion) DCT2x2 quantization weight matrix for
+/// one channel: [param] holds 6 absolute weight values, tiered to match the
+/// 3-stage cascade's own tiered structure — `param[0]`/`param[1]` cover the
+/// top-left 2x2 (minus the LLF corner, fixed at 1.0), `param[2]`/`param[3]`
+/// the ring completing the 4x4, `param[4]`/`param[5]` the ring completing
+/// the full 8x8. Public for the same single-sourcing reason as
+/// [getDct4x4QuantWeights].
+List<Float32List> getDct2x2QuantWeights(List<double> param) {
+  final w = floatMatrix(8, 8);
+  w[0][0] = 1.0;
+  w[0][1] = w[1][0] = param[0];
+  w[1][1] = param[1];
+  for (var y = 0; y < 2; y++) {
+    for (var x = 0; x < 2; x++) {
+      w[y][x + 2] = w[x + 2][y] = param[2];
+      w[y + 2][x + 2] = param[3];
+    }
+  }
+  for (var y = 0; y < 4; y++) {
+    for (var x = 0; x < 4; x++) {
+      w[y][x + 4] = w[x + 4][y] = param[4];
+      w[y + 4][x + 4] = param[5];
+    }
+  }
+  return w;
+}
+
 /// HfGlobal: the 17 dequantization weight matrices plus the HF preset count.
 final class HfGlobal {
   HfGlobal(BitReader reader, Frame frame) {
@@ -414,15 +462,26 @@ final class HfGlobal {
       case TransformMode.library:
         return defaultDctParams[index];
       case TransformMode.hornuss:
+        // *64 confirmed correct (not dct4's bug below): these 3 values are
+        // absolute weight-table entries used directly (see
+        // getHornussQuantWeights), the same role a dct-shaped table's own
+        // band[0] plays via _readDCTParams -- verified via djxl round-trips
+        // once the lossy encoder could exercise a *custom* Hornuss quant
+        // table with non-degenerate content (vardct_l0_test.dart's
+        // "weight-table override positions carry real signal" test). See
+        // doc/spec_notes.md.
         final m = List.generate(
             3, (_) => List<double>.generate(3, (_) => 64.0 * reader.readF16()));
         return DctParams(null, m, encodingMode);
       case TransformMode.dct2:
+        // *64 confirmed correct for the same reason as hornuss above (see
+        // getDct2x2QuantWeights and vardct_l0_test.dart's "weight-table
+        // ring positions carry real signal" test).
         final m = List.generate(
             3, (_) => List<double>.generate(6, (_) => 64.0 * reader.readF16()));
         return DctParams(null, m, encodingMode);
       case TransformMode.dct4:
-        // NOT *64 (unlike hornuss/dct2 below, and unlike a dct-shaped
+        // NOT *64 (unlike hornuss/dct2 above, and unlike a dct-shaped
         // table's own first value via _readDCTParams) -- a real decoder
         // bug, found and fixed via the lossy encoder's DCT4x4 support
         // (vardct_l0_encoder.dart): reading these 2 raw overrides per
@@ -431,7 +490,10 @@ final class HfGlobal {
         // decoder perfectly but was found to disagree with djxl once an
         // encoder could actually exercise a *custom* (non-default) DCT4x4
         // quant table -- nothing ever had before, since no natural corpus
-        // file happens to trigger it. See doc/spec_notes.md.
+        // file happens to trigger it. See doc/spec_notes.md. Confirmed NOT
+        // shared by hornuss/dct2 (see above) -- the distinguishing factor
+        // is that these 2 dct4 values are DIVISORS layered on a separate
+        // base table, not absolute weights themselves.
         final m = List.generate(
             3, (_) => List<double>.generate(2, (_) => reader.readF16()));
         return DctParams(_readDCTParams(reader), m, encodingMode);
@@ -529,34 +591,9 @@ final class HfGlobal {
           weights[index][c] =
               getDct4x4QuantWeights(p.dctParam![c], p.param![c]);
         case TransformMode.dct2:
-          final w = floatMatrix(8, 8);
-          w[0][0] = 1.0;
-          w[0][1] = w[1][0] = p.param![c][0];
-          w[1][1] = p.param![c][1];
-          for (var y = 0; y < 2; y++) {
-            for (var x = 0; x < 2; x++) {
-              w[y][x + 2] = w[x + 2][y] = p.param![c][2];
-              w[y + 2][x + 2] = p.param![c][3];
-            }
-          }
-          for (var y = 0; y < 4; y++) {
-            for (var x = 0; x < 4; x++) {
-              w[y][x + 4] = w[x + 4][y] = p.param![c][4];
-              w[y + 4][x + 4] = p.param![c][5];
-            }
-          }
-          weights[index][c] = w;
+          weights[index][c] = getDct2x2QuantWeights(p.param![c]);
         case TransformMode.hornuss:
-          final w = floatMatrix(8, 8);
-          for (var y = 0; y < 8; y++) {
-            for (var x = 0; x < 8; x++) {
-              w[y][x] = p.param![c][0];
-            }
-          }
-          w[1][1] = p.param![c][2];
-          w[0][1] = w[1][0] = p.param![c][1];
-          w[0][0] = 1.0;
-          weights[index][c] = w;
+          weights[index][c] = getHornussQuantWeights(p.param![c]);
         case TransformMode.dct4x8:
           final target = floatMatrix(8, 8);
           final w = getDCTQuantWeights(4, 8, p.dctParam![c]);

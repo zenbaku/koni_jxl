@@ -2186,6 +2186,149 @@ a 3-region split, and a decoder comment flagging a sign combination to
 double-check) — checking the suspected `*64` override bug in each along
 the way, not assuming it's isolated to `dct4`.
 
+### Lossy (VarDCT) encoder — Tranche C, second/third slices: Hornuss and DCT2x2
+
+Both forward derivations were verified the same way DCT4x4's was — a
+Python basis-injection 64x64 matrix built from a literal port of the real
+decoder logic (`vardct_inverter.dart`'s `TransformMethod.hornuss`/`dct2`
+cases), checked against the proposed forward map to exact `0.0` deviation
+(not the DCT4x4 round's `4.4e-16`-level near-zero — these two came out
+bit-exact) — before any Dart was written, then re-verified as permanent
+Dart identity tests (`vardct_forward_test.dart`) which also passed on the
+first try, confirming the *port* (not just the math) is correct.
+
+**Hornuss's derivation**, algebraically: the decoder combines the 4
+quadrants' own DC terms via the same isolated single-stage butterfly
+DCT4x4 uses (self-inverse up to `/4`, already verified), then within each
+quadrant sets local pixel `(1,1)` to a "center" value and every other
+pixel to a raw coefficient plus that center — except `(0,0)` and `(1,1)`
+swap roles (`(0,0)` uses the coefficient that "should" belong to `(1,1)`,
+and `(1,1)` itself carries no separate coefficient, since it IS the
+center). Solving this directly (not by hand-waving) collapses to something
+clean: `center = pixel(1,1)` is a one-to-one assignment (not solved for),
+every other coefficient is `pixel - center`, and the quadrant's own
+blockLF (the butterfly's input) is exactly the quadrant's pixel mean — no
+DCT machinery needed at all, unlike DCT4x4.
+
+**DCT2x2's derivation** needed the "tiered-scaling-plus-transpose" shape
+flagged as the correction to the original (wrong) DCT4x4-planning-round
+guess, not reused blindly: its 3-stage `_auxDCT2` cascade (`s=2` then `4`
+then `8`) is an orthogonal-but-not-orthonormal linear map — basis
+injection confirmed `M^T . M` is exactly diagonal with a **tiered** value
+per position (64/16/4, matching the earlier finding), so the true inverse
+is `D^-1 . M^T`, not `M` applied again. Each stage's own 4-value
+combination (H4, a symmetric Hadamard tensor square) is identical in both
+directions; what differs is which positions are read vs. written — the
+decoder reads 4 "quadrant-decimated" positions and writes 4 "interleaved"
+ones, so the transpose just swaps those roles (read interleaved, write
+decimated, same H4 formula) — confirmed by basis injection to match the
+true matrix transpose to `0.0` deviation, then applied in reverse stage
+order (`s=8` then `4` then `2`) with the tiered scale divided out
+afterward.
+
+**The suspected shared `*64` bug — checked, not assumed, and found NOT to
+be shared.** DCT4x4's round flagged that `hornuss`/`dct2`'s own
+`_setupDctParam` override reads have the identical `*64` pattern as
+dct4's genuine bug and left it explicitly unverified ("no encoder exists
+yet to test them against djxl"). This round is that encoder. Verified via
+two dedicated djxl round-trip tests using **non-degenerate** content
+(a smooth global gradient for Hornuss, random per-pixel noise for
+DCT2x2) — deliberately not the checkerboard content the "genuinely wins"
+tests below use, since that content is period-4-aligned and therefore
+perfectly flat within every quadrant, making every one of Hornuss/DCT2x2's
+own AC coefficients exactly zero and any `*64` scaling error invisible
+(zero times anything is still zero). Both passed at the first try: the
+`*64` convention is correct as-is for `hornuss`/`dct2`, unlike dct4's
+override reads. The distinguishing factor, understood only after
+dct4's fix: dct4's 2 override values are *divisors* layered on a separate
+already-`*64`-scaled base table, while hornuss/dct2's param values ARE
+the absolute weight-table entries themselves (`getHornussQuantWeights`/
+`getDct2x2QuantWeights`) — the same role a dct-shaped table's own
+`band[0]` plays via `_readDCTParams`, which legitimately gets `*64`. AFV's
+own override reads still have the same pattern and remain unverified —
+don't assume they're fine either, when that type's round comes up.
+
+**Architecture and plumbing**: no new mechanism needed — `getHornussQuantWeights`/
+`getDct2x2QuantWeights` were extracted from the decoder's existing
+`_generateWeights` cases (behavior-preserving) the same way
+`getDct4x4QuantWeights` was, single-sourcing the table the encoder
+quantizes against and the table the decoder rebuilds. `customParams`'s
+`acScale` fineness-knob handling needed its own case for these two modes
+(scale *every* param value uniformly, not just the first): unlike a
+dct-shaped table's band-interpolation chain (where scaling `band[0]`
+alone scales the whole table, since every other band is a multiplicative
+ratio relative to it), hornuss/dct2's params are ALL independent absolute
+weights with no such chain — scaling only the first would leave the rest
+at their unscaled defaults, not give a uniform fineness knob. The
+bootstrap pre-pass now tries all three bespoke types in sequence
+(Hornuss, DCT2x2, DCT4x4) under the same single `enableBespokeTransforms`
+flag — each `tryMergeLevel` call compares against whatever the *previous*
+bespoke call already placed, a greedy chain (not a joint 4-way choice per
+cell among {8x8, hornuss, dct2, dct4}), the same caveat already
+documented for the rectangular pre-pass's own internal ordering.
+
+**A more precise default-path A/B check than prior rounds ran — found a
+real, small, non-blocking effect.** Every previous tranche's round claimed
+"byte-identical" from a `git stash` A/B, apparently checked only at
+`distance=1.0` (where `acScale == 1.0`, so `usesCustomWeights` is false
+and no custom weight table is written to the bitstream at all regardless
+of `_activeTransformTypes`'s contents). This round's A/B additionally
+checked a non-default distance and found that claim doesn't hold there: at
+`distance=2.0`, output grew by 36 bytes after DCT4x4's round (913107B ->
+913143B, confirmed by rebuilding at the pre-DCT4x4 commit) and by another
+54 bytes after this round (913143B -> 913197B) — on a corpus PGM
+encoding to ~900KB, i.e. ~0.006% each time — with `enableBespokeTransforms:
+false` in every case. Root cause: `customParamsByIndex` (built whenever
+`usesCustomWeights`) includes an entry for **every** type in
+`_activeTransformTypes` unconditionally, regardless of whether that
+type's own enable flag ever lets it appear in the actual layout, so
+`_writeHfGlobalAndPass` writes a real (if unused) custom quant-weight
+table into HfGlobal for it. This is a pre-existing, cumulative property of
+every tranche's growth (confirmed structural, not a new bug: the same
+mechanism already applied to DCT4x4's own parameterIndex and, before that,
+to every Tranche A/B type), not something unique to this round — it just
+hadn't been measured this precisely before. Correctness is unaffected
+(djxl decodes the extra unused tables fine; the full corpus suite,
+including non-default-distance round-trips, stayed green throughout) and
+the byte cost is negligible, so this doesn't block shipping — but the
+"byte-identical" framing in every prior round's write-up should be read
+as "byte-identical at distance=1.0 specifically," not universally. Filed
+as a roadmap cleanup (see ROADMAP.md): gate `customParamsByIndex`
+entries by whether each type's own flag could actually place it, which
+would restore true byte-identity and stop this cost from compounding as
+DCT4x8/DCT8x4/AFV land.
+
+**Verification, full order** (same discipline as DCT4x4's round): the
+Python basis-injection proof for both derivations during planning; two
+permanent Dart identity tests; a "genuinely wins" test (config found via
+`jxl.encdebug` tallies — a 32x32 canvas with a gentler, amplitude-12
+4x4-quadrant checkerboard than DCT4x4's own test, which makes Hornuss win
+at distance=0.5 and DCT2x2 win at 1.0/2.0/4.0) with djxl round-trip and
+decode-vs-original RMSE bound at all 4 standard distances; two dedicated
+non-degenerate-content tests confirming the `*64` convention (above); a
+mixed-layout test (a 64x64 canvas quartered into 4 regions each favoring a
+different type, confirmed via the encdebug tally to place all 5 active
+types — `{Hornuss: 39, DCT 8x8: 6, DCT 4x4: 1, DCT 2x2: 2, DCT 16x16: 4}`
+at distance=0.5) round-tripped through djxl at all 4 standard distances;
+the default-path A/B above (with its one caveat, not a plain pass).
+
+**Shipped**: Hornuss and DCT2x2 both exist, are correct (verified
+numerically, via permanent identity tests, and against djxl including in
+mixed layouts and at distances specifically chosen to stress each type's
+own weight-table positions), and confirmed NOT to share dct4's `*64` bug.
+`VardctL0Config.enableBespokeTransforms` stays off by default (unchanged
+flag, now gating three types). Note: this flag's "never worse" guarantee
+is the same one `enableRectangularTransforms` already documents — never
+worse than plain 8x8/bootstrap, NOT a stricter "the 3-way greedy bespoke
+choice always finds the joint optimum" guarantee (see that flag's own doc
+comment for why). Full suite green (363 tests, up from 351). 21 of 27
+transform types now implemented. Next: DCT4x8/DCT8x4 (share DCT4x4's
+"butterfly + sub-block IDCT" shape almost exactly), then AFV last (most
+complex: a 16x16 fixed basis matrix, a 3-region split, a decoder comment
+flagging a sign combination to double-check, and its own still-unverified
+`*64` suspicion) — plus the `customParamsByIndex` gating cleanup flagged
+above, whenever it's worth doing.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
