@@ -129,8 +129,10 @@ bounds-checks the context, so most decode-time index bugs surface there.
 
 ## Remaining known gaps (throw `JxlUnsupportedException`)
 
-Spot-color rendering, JPEG bitstream reconstruction, float (HDR) sample
-formats, ICC-driven output transforms. None block the manga use case.
+Spot-color rendering, JPEG bitstream reconstruction, ICC-driven output
+transforms. None block the manga use case. Float (HDR) sample *decode* is
+now supported (encoding one remains unimplemented, no encoder path ever
+attempted it).
 Encoder sizing decisions must use exact Huffman code lengths, never
 Shannon entropy (the 1-bit-per-symbol prefix floor dominates skewed
 histograms). Known slow path: EPF pass 0 (epfIterations == 3, rare) is

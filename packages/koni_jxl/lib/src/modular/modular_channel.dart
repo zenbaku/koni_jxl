@@ -116,10 +116,16 @@ final class ModularChannel {
   /// Flat pixel buffer, row stride == [width].
   Int32List? buffer;
 
-  // Weighted-predictor state, live only during decode().
+  // Weighted-predictor state, live only during decode(). _err0-4 mirror
+  // libjxl's `pred_errors`/`error` (uint32_t/int32_t, narrow -- summed and
+  // re-masked or re-truncated by their readers, see _wpPlaneWeight and the
+  // main decode loop's `_err4` write). _pred/_subpred mirror libjxl's
+  // `pred`/`prediction[]` (`pixel_type_w`, i.e. int64_t): NOT narrowed
+  // until they're finally combined into a stored (int32) pixel value, so
+  // these must stay wide.
   Int32List? _err0, _err1, _err2, _err3, _err4;
-  Int32List? _pred;
-  final Int32List _subpred = Int32List(4);
+  Int64List? _pred;
+  final Int64List _subpred = Int64List(4);
 
   void allocate() {
     if (height < 0 ||
@@ -213,29 +219,34 @@ final class ModularChannel {
                 ? b[o - 1]
                 : 0;
       case 3:
-        // Truncate to signed 32 bits before dividing, matching jxlatte's
-        // auto-truncating Java `int` arithmetic (`(west+north)/2`) --
-        // load-bearing once a neighbor value can approach +-2^31 (e.g.
-        // float samples reinterpreted as packed 32-bit integers, see
-        // ImageBuffer.reconstructFloatSamples), where the un-truncated sum
-        // can exceed int32 range and change the division's result.
-        return (_west(b, o, x, y) + _north(b, o, x, y)).toSigned(32) ~/ 2;
+        // NOT truncated to 32 bits: libjxl computes every predictor
+        // (context_predict.h's `PredictOne`) in `pixel_type_w` (int64_t),
+        // not `pixel_type` (int32_t) -- only the *stored* pixel value
+        // (`trueValue` in the caller) is ever narrowed to 32 bits. An
+        // earlier session added `.toSigned(32)` truncation here on the
+        // (wrong) assumption that jxlatte's Java `int` arithmetic was the
+        // reference semantics; jxlatte has no float-sample support at all
+        // (see doc/spec_notes.md), so that assumption was never exercised
+        // against wide-range content and was never checked against
+        // libjxl's actual (wider) types. Confirmed via direct libjxl
+        // source read (lib/jxl/modular/encoding/context_predict.h).
+        return (_west(b, o, x, y) + _north(b, o, x, y)) ~/ 2;
       case 4:
         final w = _west(b, o, x, y);
         final n = _north(b, o, x, y);
         final nw = _northWest(b, o, x, y);
-        // Truncate each difference to signed 32 bits before abs(), matching
-        // Java's auto-truncating `int` subtraction (see case 3's comment).
-        return (n - nw).toSigned(32).abs() < (w - nw).toSigned(32).abs()
-            ? w
-            : n;
+        // See case 3: no truncation -- matches libjxl's `Select`, computed
+        // entirely in pixel_type_w.
+        return (n - nw).abs() < (w - nw).abs() ? w : n;
       case 5:
         final w = _west(b, o, x, y);
         final n = _north(b, o, x, y);
-        final v = (w + n - _northWest(b, o, x, y)).toSigned(32);
+        // See case 3: no truncation -- matches libjxl's `ClampedGradient`,
+        // computed entirely in pixel_type_w.
+        final v = w + n - _northWest(b, o, x, y);
         return _clamp3(v, n, w);
       case 6:
-        return (_pred![o] + 3) >> 3;
+        return wideShrSigned(_pred![o] + 3, 3);
       case 7:
         return _northEast(b, o, x, y);
       case 8:
@@ -243,21 +254,24 @@ final class ModularChannel {
       case 9:
         return _westWest(b, o, x, y);
       case 10:
-        return (_west(b, o, x, y) + _northWest(b, o, x, y)).toSigned(32) ~/ 2;
+        return (_west(b, o, x, y) + _northWest(b, o, x, y)) ~/ 2;
       case 11:
-        return (_north(b, o, x, y) + _northWest(b, o, x, y)).toSigned(32) ~/ 2;
+        return (_north(b, o, x, y) + _northWest(b, o, x, y)) ~/ 2;
       case 12:
-        return (_north(b, o, x, y) + _northEast(b, o, x, y)).toSigned(32) ~/ 2;
+        return (_north(b, o, x, y) + _northEast(b, o, x, y)) ~/ 2;
       case 13:
-        // Same truncate-before-divide reasoning as case 3 above.
+        // See case 3: no truncation -- matches libjxl's `PredictOne`'s
+        // `Predictor::Average4` case, computed entirely in pixel_type_w
+        // (confirmed: `(6 * top - 2 * toptop + 7 * left + 1 * leftleft +
+        // 1 * toprightright + 3 * topright + 8) / 16` with no intermediate
+        // narrowing anywhere in that expression).
         return (6 * _north(b, o, x, y) -
-                    2 * _northNorth(b, o, x, y) +
-                    7 * _west(b, o, x, y) +
-                    _westWest(b, o, x, y) +
-                    _northEastEast(b, o, x, y) +
-                    3 * _northEast(b, o, x, y) +
-                    8)
-                .toSigned(32) ~/
+                2 * _northNorth(b, o, x, y) +
+                7 * _west(b, o, x, y) +
+                _westWest(b, o, x, y) +
+                _northEastEast(b, o, x, y) +
+                3 * _northEast(b, o, x, y) +
+                8) ~/
             16;
       default:
         throw const JxlInvalidBitstreamException('illegal predictor');
@@ -308,41 +322,42 @@ final class ModularChannel {
   int _prePredictWpInterior(WpParams wp, int x, int y) {
     final b = buffer!;
     final o = y * width + x;
-    // jxlatte computes n3/nw3/.../subpred[...] entirely in Java `int`
-    // (32-bit, auto-truncating on every `+`/`-`/`*`/`<<`) — normally a
-    // no-op to replicate for ordinary 8-16-bit samples, whose values never
-    // approach 32-bit range, but load-bearing for wide-range content (e.g.
-    // float samples reinterpreted as packed 32-bit integers, see
-    // ImageBuffer.reconstructFloatSamples): Dart's plain arithmetic doesn't
-    // auto-truncate, so a pixel value near +-2^31 shifted by 3 (or a
-    // param-weighted error sum before its own `>>5`) overflows int32
-    // *without* wrapping, diverging from Java. `+`/`-`/`*` are associative
-    // under mod-2^32 truncation, so it's enough to truncate once per Java
-    // assignment/shift point, not after every sub-expression.
-    final n3 = (b[o - width] << 3).toSigned(32);
-    final nw3 = (b[o - width - 1] << 3).toSigned(32);
-    final ne3 = (b[o - width + 1] << 3).toSigned(32);
-    final w3 = (b[o - 1] << 3).toSigned(32);
-    final nn3 = (b[o - 2 * width] << 3).toSigned(32);
+    // NOT truncated to 32 bits: libjxl's `weighted::State::Predict`
+    // (context_predict.h) computes N/W/NE/NW/NN, the error terms, and
+    // `prediction[0-3]` entirely in `pixel_type_w` (int64_t) -- only
+    // values actually stored into a narrower array (`pred_errors`, a
+    // `vector<uint32_t>`; `error`, a `vector<int32_t>`) are ever narrowed,
+    // at the point of that assignment. An earlier session added
+    // `.toSigned(32)` truncation throughout this function on the (wrong)
+    // assumption that jxlatte's Java `int` arithmetic was the reference
+    // semantics; jxlatte has no float-sample support at all (see
+    // doc/spec_notes.md), so that assumption was never exercised against
+    // wide-range content and was never checked against libjxl's actual
+    // (wider) types. `_err0-4` (this class's narrow storage, matching
+    // `pred_errors`/`error`) still narrow correctly at their own
+    // assignment in [decode] -- only the *intermediate* truncation here
+    // was wrong. Confirmed via direct libjxl source read.
+    final n3 = b[o - width] << 3;
+    final nw3 = b[o - width - 1] << 3;
+    final ne3 = b[o - width + 1] << 3;
+    final w3 = b[o - 1] << 3;
+    final nn3 = b[o - 2 * width] << 3;
     final e4 = _err4!;
     final tN = e4[o - width];
     final tW = e4[o - 1];
     final tNE = e4[o - width + 1];
     final tNW = e4[o - width - 1];
-    _subpred[0] = (w3 + ne3 - n3).toSigned(32);
-    _subpred[1] =
-        (n3 - (((tW + tN + tNE) * wp.param1).toSigned(32) >> 5)).toSigned(32);
-    _subpred[2] =
-        (w3 - (((tW + tN + tNW) * wp.param2).toSigned(32) >> 5)).toSigned(32);
-    _subpred[3] = (n3 -
-            ((tNW * wp.param3a +
-                        tN * wp.param3b +
-                        tNE * wp.param3c +
-                        (nn3 - n3) * wp.param3d +
-                        (nw3 - w3) * wp.param3e)
-                    .toSigned(32) >>
-                5))
-        .toSigned(32);
+    _subpred[0] = w3 + ne3 - n3;
+    _subpred[1] = n3 - wideShrSigned((tW + tN + tNE) * wp.param1, 5);
+    _subpred[2] = w3 - wideShrSigned((tW + tN + tNW) * wp.param2, 5);
+    _subpred[3] = n3 -
+        wideShrSigned(
+            tNW * wp.param3a +
+                tN * wp.param3b +
+                tNE * wp.param3c +
+                (nn3 - n3) * wp.param3d +
+                (nw3 - w3) * wp.param3e,
+            5);
     final wpw = wp.weight;
     final rw0 = _wpPlaneWeightInterior(_err0!, o, wpw[0]);
     final rw1 = _wpPlaneWeightInterior(_err1!, o, wpw[1]);
@@ -381,34 +396,30 @@ final class ModularChannel {
   int _prePredictWp(WpParams wp, int x, int y) {
     final b = buffer!;
     final o = y * width + x;
-    // See _prePredictWpInterior's comment: truncating to signed 32 bits at
-    // each Java-`int` assignment/shift point mirrors jxlatte's auto-
-    // truncating `int` arithmetic, required for wide-range (float sample)
-    // content.
-    final n3 = (_north(b, o, x, y) << 3).toSigned(32);
-    final nw3 = (_northWest(b, o, x, y) << 3).toSigned(32);
-    final ne3 = (_northEast(b, o, x, y) << 3).toSigned(32);
-    final w3 = (_west(b, o, x, y) << 3).toSigned(32);
-    final nn3 = (_northNorth(b, o, x, y) << 3).toSigned(32);
+    // See _prePredictWpInterior's comment: not truncated to 32 bits --
+    // libjxl computes this entirely in pixel_type_w (int64_t), narrowing
+    // only at _err0-4's own storage.
+    final n3 = _north(b, o, x, y) << 3;
+    final nw3 = _northWest(b, o, x, y) << 3;
+    final ne3 = _northEast(b, o, x, y) << 3;
+    final w3 = _west(b, o, x, y) << 3;
+    final nn3 = _northNorth(b, o, x, y) << 3;
     final e4 = _err4!;
     final tN = _errNorth(e4, o, y);
     final tW = _errWest(e4, o, x);
     final tNE = _errNorthEast(e4, o, x, y);
     final tNW = _errNorthWest(e4, o, x, y);
-    _subpred[0] = (w3 + ne3 - n3).toSigned(32);
-    _subpred[1] =
-        (n3 - (((tW + tN + tNE) * wp.param1).toSigned(32) >> 5)).toSigned(32);
-    _subpred[2] =
-        (w3 - (((tW + tN + tNW) * wp.param2).toSigned(32) >> 5)).toSigned(32);
-    _subpred[3] = (n3 -
-            ((tNW * wp.param3a +
-                        tN * wp.param3b +
-                        tNE * wp.param3c +
-                        (nn3 - n3) * wp.param3d +
-                        (nw3 - w3) * wp.param3e)
-                    .toSigned(32) >>
-                5))
-        .toSigned(32);
+    _subpred[0] = w3 + ne3 - n3;
+    _subpred[1] = n3 - wideShrSigned((tW + tN + tNE) * wp.param1, 5);
+    _subpred[2] = w3 - wideShrSigned((tW + tN + tNW) * wp.param2, 5);
+    _subpred[3] = n3 -
+        wideShrSigned(
+            tNW * wp.param3a +
+                tN * wp.param3b +
+                tNE * wp.param3c +
+                (nn3 - n3) * wp.param3d +
+                (nw3 - w3) * wp.param3e,
+            5);
     final wpw = wp.weight;
     final rw0 = _wpPlaneWeight(_err0!, o, x, y, wpw[0]);
     final rw1 = _wpPlaneWeight(_err1!, o, x, y, wpw[1]);
@@ -550,7 +561,7 @@ final class ModularChannel {
       _err2 = Int32List(n);
       _err3 = Int32List(n);
       _err4 = Int32List(n);
-      _pred = Int32List(n);
+      _pred = Int64List(n);
     }
     final wp = useWp ? wpParams : null;
     final b = buffer!;
@@ -586,17 +597,18 @@ final class ModularChannel {
         final o = y * width + x;
         b[o] = trueValue;
         if (useWp) {
-          final tv3 = (trueValue << 3).toSigned(32);
-          // `.abs()` on the truncated difference, not the raw one: Java's
-          // `Math.abs(Integer.MIN_VALUE)` overflows back to itself rather
-          // than negating, so the *truncated* difference must be what
-          // gets abs()'d to match (matters only at the extreme -2^31
-          // corner, but that's exactly the corner wide-range content can
-          // reach).
-          _err0![o] = ((_subpred[0] - tv3).toSigned(32).abs() + 3) >> 3;
-          _err1![o] = ((_subpred[1] - tv3).toSigned(32).abs() + 3) >> 3;
-          _err2![o] = ((_subpred[2] - tv3).toSigned(32).abs() + 3) >> 3;
-          _err3![o] = ((_subpred[3] - tv3).toSigned(32).abs() + 3) >> 3;
+          // NOT truncated to 32 bits: libjxl's `AddBits` (context_predict.h)
+          // shifts the already-narrow stored pixel value left by
+          // kPredExtraBits within `pixel_type_w` (int64_t), with no
+          // intermediate narrowing before `UpdateErrors`'s own per-array
+          // assignment (`pred_errors`/`error`, matched by _err0-4 being
+          // Int32List below -- storing into a typed list truncates on
+          // write, exactly mirroring that assignment).
+          final tv3 = trueValue << 3;
+          _err0![o] = wideShrSigned((_subpred[0] - tv3).abs() + 3, 3);
+          _err1![o] = wideShrSigned((_subpred[1] - tv3).abs() + 3, 3);
+          _err2![o] = wideShrSigned((_subpred[2] - tv3).abs() + 3, 3);
+          _err3![o] = wideShrSigned((_subpred[3] - tv3).abs() + 3, 3);
           _err4![o] = _pred![o] - tv3;
         }
       }

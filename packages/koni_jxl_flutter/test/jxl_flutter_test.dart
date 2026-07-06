@@ -14,7 +14,7 @@ void main() {
   final sample = File('test/assets/screentone_256_d0_e5.jxl');
   final alphaSample = File('test/assets/alpha_page_d0_e3.jxl');
   final lossySample = File('test/assets/color_cover_d1.0_e3.jxl');
-  final unsupportedSample = File('test/assets/float_samples.jxl');
+  final floatSample = File('test/assets/float_samples.jxl');
 
   group('decodeJxlToUiImage', () {
     test('decodes a lossless grayscale page', () async {
@@ -38,13 +38,11 @@ void main() {
       image.dispose();
     });
 
-    test('propagates JxlUnsupportedException for unsupported features',
-        () async {
-      await expectLater(
-        decodeJxlToUiImage(unsupportedSample.readAsBytesSync()),
-        throwsA(isA<JxlUnsupportedException>()
-            .having((e) => e.feature, 'feature', 'float-samples')),
-      );
+    test('decodes a float-sample image', () async {
+      final image = await decodeJxlToUiImage(floatSample.readAsBytesSync());
+      expect(image.width, 16);
+      expect(image.height, 16);
+      image.dispose();
     });
   });
 
@@ -265,20 +263,20 @@ void main() {
       info.dispose();
     });
 
-    test('reports decode errors through the image stream', () async {
-      final provider =
-          JxlImageProvider.memory(unsupportedSample.readAsBytesSync());
-      final completer = Completer<Object>();
+    test('resolves a float-sample image through the image stream', () async {
+      final provider = JxlImageProvider.memory(floatSample.readAsBytesSync());
+      final completer = Completer<ImageInfo>();
       final stream = provider.resolve(ImageConfiguration.empty);
       late ImageStreamListener listener;
       listener = ImageStreamListener(
-        (info, _) => completer.completeError(StateError('unexpected success')),
-        onError: (error, stack) => completer.complete(error),
+        (info, _) => completer.complete(info),
+        onError: (error, stack) => completer.completeError(error, stack),
       );
       stream.addListener(listener);
-      final error = await completer.future;
-      expect(error, isA<JxlUnsupportedException>());
+      final info = await completer.future;
+      expect(info.image.width, 16);
       stream.removeListener(listener);
+      info.dispose();
     });
 
     test('equality keys the image cache correctly', () {

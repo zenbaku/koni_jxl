@@ -952,7 +952,17 @@ None block the manga use case; listed for completeness.
 - 🔲 **Spot-color rendering.** Spot-color extra channels.
 - 🔲 **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
   a JPEG-transcoded `.jxl` (needs the jbrd box + JPEG serialization).
-- 🔲 **Float (HDR) sample formats.** 16/32-bit float output samples.
+- ✅ **Float (HDR) sample formats — decode.** Modular-mode float samples
+  (`lossless_pfm` conformance testcase) now decode bit-exact. Root cause
+  was a class of premature 32-bit truncation in prediction arithmetic —
+  the opposite mistake from the class of bugs a prior session had just
+  fixed (that session correctly added truncation to match jxlatte's Java
+  `int` semantics in several places, but wrongly assumed the same model
+  applied to predictor computation, where libjxl's real C++ source uses a
+  wider `int64_t` type throughout and truncates only at genuine storage
+  points). See doc/spec_notes.md for the full write-up. Encoding
+  (lossless or lossy) float samples remains unimplemented — out of scope
+  here, no encoder path ever attempted it.
 
 ---
 

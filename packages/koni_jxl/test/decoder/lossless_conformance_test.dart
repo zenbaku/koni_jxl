@@ -13,7 +13,8 @@ import '../util/pnm.dart';
 ///
 /// Excluded (tracked for later milestones): alpha_nonpremultiplied and
 /// alpha_premultiplied (VarDCT, M5), grayscale_public_university (lossy
-/// modular with gaborish, M6), lossless_pfm (float samples).
+/// modular with gaborish, M6). lossless_pfm (float samples) has its own
+/// test below, since its reference is a float PFM, not an int PNM/PAM.
 final conformanceDir = Directory('../../third_party/conformance/testcases');
 
 const cases = [
@@ -62,4 +63,30 @@ void main() {
       skip: haveConformance && haveDjxl
           ? null
           : 'conformance corpus or djxl not available');
+
+  group('lossless_pfm (float samples) vs conformance reference', () {
+    if (!haveConformance) return;
+
+    test('lossless_pfm', () {
+      final tc = '${conformanceDir.path}/lossless_pfm';
+      final image = JxlDecoder.decode(File('$tc/input.jxl').readAsBytesSync());
+      final ref = PnmImage.parse(File('$tc/ref.pfm').readAsBytesSync());
+      expect(image.width, ref.width);
+      expect(image.height, ref.height);
+      for (var c = 0; c < ref.channels; c++) {
+        final ours = image.channels[c].floatRows;
+        final theirs = ref.floatPlanes![c];
+        for (var y = 0; y < ref.height; y++) {
+          final row = ours[y];
+          for (var x = 0; x < ref.width; x++) {
+            final want = theirs[y * ref.width + x];
+            if (row[x] != want) {
+              fail('lossless_pfm channel $c differs at ($x, $y): '
+                  'ours=${row[x]} ref=$want');
+            }
+          }
+        }
+      }
+    });
+  }, skip: haveConformance ? null : 'conformance corpus not available');
 }

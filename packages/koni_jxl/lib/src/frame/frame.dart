@@ -217,20 +217,6 @@ final class Frame {
 
   void decodeFrame({List<ImageBuffer>? lfFrame}) {
     this.lfFrame = lfFrame;
-    // Modular-path float-sample decode hits an unresolved entropy-stream
-    // desync for content wide enough to need it (see doc/spec_notes.md) --
-    // gated off until that's found, even though the int-to-float
-    // reconstruction itself (ImageBuffer.reconstructFloatSamples) is
-    // already implemented and verified correct in isolation.
-    if (globalMetadata.bitDepth.usesFloatSamples) {
-      throw JxlUnsupportedException('float-samples');
-    }
-    for (final ec in globalMetadata.extraChannels) {
-      if (ec.bitDepth.usesFloatSamples) {
-        throw JxlUnsupportedException('float-samples');
-      }
-    }
-
     const timings = bool.fromEnvironment('jxl.timings');
     final sw = timings ? (Stopwatch()..start()) : null;
     void mark(String label) {

@@ -95,7 +95,9 @@ header-driven allocations.
 
 Not yet supported (decoding throws `JxlUnsupportedException` with a
 stable feature id): spot-color rendering, JPEG bitstream reconstruction,
-and float (HDR) sample formats.
+and ICC-driven output transforms (files whose color is described only by
+an embedded ICC profile decode as sRGB). Modular-mode float (HDR) sample
+*decoding* is supported; encoding one is not.
 
 ## Performance
 
