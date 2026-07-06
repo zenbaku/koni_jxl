@@ -116,6 +116,103 @@ final class ImageBuffer {
   }
 
   void castToInt(int depth) => castToIntWithMax((1 << depth) - 1);
+
+  /// Reconstructs true IEEE-754-style floating-point samples from a
+  /// modular-mode integer plane holding the JPEG XL spec's custom float
+  /// layout: `sign(1) | exponent([expBits]) | mantissa([bits]-1-[expBits])`,
+  /// exponent bias `(1 << (expBits-1)) - 1`. This is a completely different
+  /// operation from [castToFloat]/[castToFloatWithMax] (a simple normalize-
+  /// to-`[0,1]` linear rescale for *ordinary* integer samples) — here the
+  /// integer's bits ARE the float's bits, not a value to be scaled.
+  ///
+  /// Ported bit-for-bit from libjxl's `int_to_float`
+  /// (`lib/jxl/dec_modular.cc`) — neither this project's usual jxlatte
+  /// reference nor any other implementation available gets this right
+  /// (jxlatte's own float handling is a naive linear scale, which would
+  /// silently produce wrong pixels for true float samples). No-op if
+  /// already float.
+  void reconstructFloatSamples(int bits, int expBits) {
+    final ints = _intRows;
+    if (ints == null) return;
+    final floats =
+        List.generate(height, (_) => Float32List(width), growable: false);
+    final scratch = ByteData(4);
+    double bitsToFloat32(int u32) {
+      scratch.setUint32(0, u32, Endian.host);
+      return scratch.getFloat32(0, Endian.host);
+    }
+
+    if (bits == 32) {
+      assert(expBits == 8, 'bits=32 requires expBits=8');
+      for (var y = 0; y < height; y++) {
+        final src = ints[y];
+        final dst = floats[y];
+        for (var x = 0; x < width; x++) {
+          dst[x] = bitsToFloat32(src[x] & 0xFFFFFFFF);
+        }
+      }
+      _floatRows = floats;
+      _intRows = null;
+      return;
+    }
+
+    final expBias = (1 << (expBits - 1)) - 1;
+    final signShift = bits - 1;
+    final mantBits = bits - expBits - 1;
+    final mantShift = 23 - mantBits;
+    final expAllOnes = (1 << expBits) - 1;
+
+    for (var y = 0; y < height; y++) {
+      final src = ints[y];
+      final dst = floats[y];
+      for (var x = 0; x < width; x++) {
+        final raw = src[x] & 0xFFFFFFFF;
+        final signbit = (raw >> signShift) != 0;
+        final f = raw & ((1 << signShift) - 1);
+
+        if (f == 0) {
+          dst[x] = signbit ? -0.0 : 0.0;
+          continue;
+        }
+
+        var exp = f >> mantBits;
+        var mantissa = f & ((1 << mantBits) - 1);
+
+        if (exp == expAllOnes) {
+          // NaN or infinity: same all-ones-exponent convention, mapped
+          // directly onto binary32's.
+          var bits32 = signbit ? 0x80000000 : 0;
+          bits32 |= 0xFF << 23;
+          bits32 |= mantissa << mantShift;
+          dst[x] = bitsToFloat32(bits32);
+          continue;
+        }
+
+        mantissa <<= mantShift;
+        if (exp == 0 && expBits < 8) {
+          // Subnormal: renormalize into binary32's normalized form (skipped
+          // when expBits==8, since that bias already equals binary32's own
+          // 127 — a custom subnormal there already lands correctly via the
+          // plain shift above).
+          while ((mantissa & 0x800000) == 0) {
+            mantissa <<= 1;
+            exp--;
+          }
+          exp++;
+          mantissa &= 0x7fffff;
+        }
+        exp = exp - expBias + 127;
+        assert(exp >= 0);
+
+        var bits32 = signbit ? 0x80000000 : 0;
+        bits32 |= exp << 23;
+        bits32 |= mantissa;
+        dst[x] = bitsToFloat32(bits32);
+      }
+    }
+    _floatRows = floats;
+    _intRows = null;
+  }
 }
 
 /// A free-standing jagged float matrix (Java-style `float[h][w]`), used by

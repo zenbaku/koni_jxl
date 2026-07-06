@@ -213,16 +213,26 @@ final class ModularChannel {
                 ? b[o - 1]
                 : 0;
       case 3:
-        return (_west(b, o, x, y) + _north(b, o, x, y)) ~/ 2;
+        // Truncate to signed 32 bits before dividing, matching jxlatte's
+        // auto-truncating Java `int` arithmetic (`(west+north)/2`) --
+        // load-bearing once a neighbor value can approach +-2^31 (e.g.
+        // float samples reinterpreted as packed 32-bit integers, see
+        // ImageBuffer.reconstructFloatSamples), where the un-truncated sum
+        // can exceed int32 range and change the division's result.
+        return (_west(b, o, x, y) + _north(b, o, x, y)).toSigned(32) ~/ 2;
       case 4:
         final w = _west(b, o, x, y);
         final n = _north(b, o, x, y);
         final nw = _northWest(b, o, x, y);
-        return (n - nw).abs() < (w - nw).abs() ? w : n;
+        // Truncate each difference to signed 32 bits before abs(), matching
+        // Java's auto-truncating `int` subtraction (see case 3's comment).
+        return (n - nw).toSigned(32).abs() < (w - nw).toSigned(32).abs()
+            ? w
+            : n;
       case 5:
         final w = _west(b, o, x, y);
         final n = _north(b, o, x, y);
-        final v = w + n - _northWest(b, o, x, y);
+        final v = (w + n - _northWest(b, o, x, y)).toSigned(32);
         return _clamp3(v, n, w);
       case 6:
         return (_pred![o] + 3) >> 3;
@@ -233,19 +243,21 @@ final class ModularChannel {
       case 9:
         return _westWest(b, o, x, y);
       case 10:
-        return (_west(b, o, x, y) + _northWest(b, o, x, y)) ~/ 2;
+        return (_west(b, o, x, y) + _northWest(b, o, x, y)).toSigned(32) ~/ 2;
       case 11:
-        return (_north(b, o, x, y) + _northWest(b, o, x, y)) ~/ 2;
+        return (_north(b, o, x, y) + _northWest(b, o, x, y)).toSigned(32) ~/ 2;
       case 12:
-        return (_north(b, o, x, y) + _northEast(b, o, x, y)) ~/ 2;
+        return (_north(b, o, x, y) + _northEast(b, o, x, y)).toSigned(32) ~/ 2;
       case 13:
+        // Same truncate-before-divide reasoning as case 3 above.
         return (6 * _north(b, o, x, y) -
-                2 * _northNorth(b, o, x, y) +
-                7 * _west(b, o, x, y) +
-                _westWest(b, o, x, y) +
-                _northEastEast(b, o, x, y) +
-                3 * _northEast(b, o, x, y) +
-                8) ~/
+                    2 * _northNorth(b, o, x, y) +
+                    7 * _west(b, o, x, y) +
+                    _westWest(b, o, x, y) +
+                    _northEastEast(b, o, x, y) +
+                    3 * _northEast(b, o, x, y) +
+                    8)
+                .toSigned(32) ~/
             16;
       default:
         throw const JxlInvalidBitstreamException('illegal predictor');
@@ -260,6 +272,16 @@ final class ModularChannel {
         _errWestWest(ep, o, x) +
         _errNorthEast(ep, o, x, y);
     if (x + 1 == width) eSum += _errWest(ep, o, x);
+    // jxlatte masks to unsigned 32 bits here (`eSum &= 0xffffffffL`) before
+    // its `>>>` shifts below — normally a no-op for ordinary 8-16-bit
+    // samples, whose summed errors never reach 32 bits, but load-bearing
+    // for wide-range content (e.g. float samples reinterpreted as packed
+    // 32-bit integers, `ImageBuffer.reconstructFloatSamples`): without it,
+    // a large enough real sum reads as a negative Dart int (unlike Java's
+    // `int`, Dart's plain `+` doesn't truncate to 32 bits on overflow — see
+    // CLAUDE.md's Java-to-Dart semantics notes) and the *un*masked `>>`
+    // below stays negative, indexing `_oneL24OverKP1` out of bounds.
+    eSum &= 0xFFFFFFFF;
     var shift = floorLog1p(eSum) - 5;
     if (shift < 0) shift = 0;
     return 4 + ((wpWeight * _oneL24OverKP1[eSum >> shift]) >> shift);
@@ -267,11 +289,15 @@ final class ModularChannel {
 
   @pragma('vm:prefer-inline')
   int _wpPlaneWeightInterior(Int32List ep, int o, int wpWeight) {
-    final eSum = ep[o - width] +
-        ep[o - 1] +
-        ep[o - width - 1] +
-        ep[o - 2] +
-        ep[o - width + 1];
+    // See _wpPlaneWeight's comment: masking to unsigned 32 bits mirrors
+    // jxlatte's `eSum &= 0xffffffffL`, required for wide-range (float
+    // sample) content.
+    final eSum = (ep[o - width] +
+            ep[o - 1] +
+            ep[o - width - 1] +
+            ep[o - 2] +
+            ep[o - width + 1]) &
+        0xFFFFFFFF;
     var shift = floorLog1p(eSum) - 5;
     if (shift < 0) shift = 0;
     return 4 + ((wpWeight * _oneL24OverKP1[eSum >> shift]) >> shift);
@@ -282,26 +308,41 @@ final class ModularChannel {
   int _prePredictWpInterior(WpParams wp, int x, int y) {
     final b = buffer!;
     final o = y * width + x;
-    final n3 = b[o - width] << 3;
-    final nw3 = b[o - width - 1] << 3;
-    final ne3 = b[o - width + 1] << 3;
-    final w3 = b[o - 1] << 3;
-    final nn3 = b[o - 2 * width] << 3;
+    // jxlatte computes n3/nw3/.../subpred[...] entirely in Java `int`
+    // (32-bit, auto-truncating on every `+`/`-`/`*`/`<<`) — normally a
+    // no-op to replicate for ordinary 8-16-bit samples, whose values never
+    // approach 32-bit range, but load-bearing for wide-range content (e.g.
+    // float samples reinterpreted as packed 32-bit integers, see
+    // ImageBuffer.reconstructFloatSamples): Dart's plain arithmetic doesn't
+    // auto-truncate, so a pixel value near +-2^31 shifted by 3 (or a
+    // param-weighted error sum before its own `>>5`) overflows int32
+    // *without* wrapping, diverging from Java. `+`/`-`/`*` are associative
+    // under mod-2^32 truncation, so it's enough to truncate once per Java
+    // assignment/shift point, not after every sub-expression.
+    final n3 = (b[o - width] << 3).toSigned(32);
+    final nw3 = (b[o - width - 1] << 3).toSigned(32);
+    final ne3 = (b[o - width + 1] << 3).toSigned(32);
+    final w3 = (b[o - 1] << 3).toSigned(32);
+    final nn3 = (b[o - 2 * width] << 3).toSigned(32);
     final e4 = _err4!;
     final tN = e4[o - width];
     final tW = e4[o - 1];
     final tNE = e4[o - width + 1];
     final tNW = e4[o - width - 1];
-    _subpred[0] = w3 + ne3 - n3;
-    _subpred[1] = n3 - (((tW + tN + tNE) * wp.param1) >> 5);
-    _subpred[2] = w3 - (((tW + tN + tNW) * wp.param2) >> 5);
-    _subpred[3] = n3 -
-        ((tNW * wp.param3a +
-                tN * wp.param3b +
-                tNE * wp.param3c +
-                (nn3 - n3) * wp.param3d +
-                (nw3 - w3) * wp.param3e) >>
-            5);
+    _subpred[0] = (w3 + ne3 - n3).toSigned(32);
+    _subpred[1] =
+        (n3 - (((tW + tN + tNE) * wp.param1).toSigned(32) >> 5)).toSigned(32);
+    _subpred[2] =
+        (w3 - (((tW + tN + tNW) * wp.param2).toSigned(32) >> 5)).toSigned(32);
+    _subpred[3] = (n3 -
+            ((tNW * wp.param3a +
+                        tN * wp.param3b +
+                        tNE * wp.param3c +
+                        (nn3 - n3) * wp.param3d +
+                        (nw3 - w3) * wp.param3e)
+                    .toSigned(32) >>
+                5))
+        .toSigned(32);
     final wpw = wp.weight;
     final rw0 = _wpPlaneWeightInterior(_err0!, o, wpw[0]);
     final rw1 = _wpPlaneWeightInterior(_err1!, o, wpw[1]);
@@ -340,26 +381,34 @@ final class ModularChannel {
   int _prePredictWp(WpParams wp, int x, int y) {
     final b = buffer!;
     final o = y * width + x;
-    final n3 = _north(b, o, x, y) << 3;
-    final nw3 = _northWest(b, o, x, y) << 3;
-    final ne3 = _northEast(b, o, x, y) << 3;
-    final w3 = _west(b, o, x, y) << 3;
-    final nn3 = _northNorth(b, o, x, y) << 3;
+    // See _prePredictWpInterior's comment: truncating to signed 32 bits at
+    // each Java-`int` assignment/shift point mirrors jxlatte's auto-
+    // truncating `int` arithmetic, required for wide-range (float sample)
+    // content.
+    final n3 = (_north(b, o, x, y) << 3).toSigned(32);
+    final nw3 = (_northWest(b, o, x, y) << 3).toSigned(32);
+    final ne3 = (_northEast(b, o, x, y) << 3).toSigned(32);
+    final w3 = (_west(b, o, x, y) << 3).toSigned(32);
+    final nn3 = (_northNorth(b, o, x, y) << 3).toSigned(32);
     final e4 = _err4!;
     final tN = _errNorth(e4, o, y);
     final tW = _errWest(e4, o, x);
     final tNE = _errNorthEast(e4, o, x, y);
     final tNW = _errNorthWest(e4, o, x, y);
-    _subpred[0] = w3 + ne3 - n3;
-    _subpred[1] = n3 - (((tW + tN + tNE) * wp.param1) >> 5);
-    _subpred[2] = w3 - (((tW + tN + tNW) * wp.param2) >> 5);
-    _subpred[3] = n3 -
-        ((tNW * wp.param3a +
-                tN * wp.param3b +
-                tNE * wp.param3c +
-                (nn3 - n3) * wp.param3d +
-                (nw3 - w3) * wp.param3e) >>
-            5);
+    _subpred[0] = (w3 + ne3 - n3).toSigned(32);
+    _subpred[1] =
+        (n3 - (((tW + tN + tNE) * wp.param1).toSigned(32) >> 5)).toSigned(32);
+    _subpred[2] =
+        (w3 - (((tW + tN + tNW) * wp.param2).toSigned(32) >> 5)).toSigned(32);
+    _subpred[3] = (n3 -
+            ((tNW * wp.param3a +
+                        tN * wp.param3b +
+                        tNE * wp.param3c +
+                        (nn3 - n3) * wp.param3d +
+                        (nw3 - w3) * wp.param3e)
+                    .toSigned(32) >>
+                5))
+        .toSigned(32);
     final wpw = wp.weight;
     final rw0 = _wpPlaneWeight(_err0!, o, x, y, wpw[0]);
     final rw1 = _wpPlaneWeight(_err1!, o, x, y, wpw[1]);
@@ -416,24 +465,34 @@ final class ModularChannel {
         return _north(b, o, x, y);
       case 7:
         return _west(b, o, x, y);
+      // Cases 8-14 truncate to signed 32 bits, matching jxlatte's
+      // auto-truncating Java `int` arithmetic (see case 3's comment in
+      // [prediction]) -- these feed MA-tree property/context selection
+      // directly, so an untruncated overflow here doesn't just mispredict
+      // a pixel, it can pick the wrong entropy context and desync the
+      // whole stream (surfacing far downstream as "illegal final modular
+      // state" rather than at the point of the actual divergence).
       case 8:
         if (x <= 0) return _west(b, o, x, y);
-        return _west(b, o, x, y) -
-            (_west(b, o - 1, x - 1, y) +
-                _north(b, o - 1, x - 1, y) -
-                _northWest(b, o - 1, x - 1, y));
+        return (_west(b, o, x, y) -
+                (_west(b, o - 1, x - 1, y) +
+                        _north(b, o - 1, x - 1, y) -
+                        _northWest(b, o - 1, x - 1, y))
+                    .toSigned(32))
+            .toSigned(32);
       case 9:
-        return _west(b, o, x, y) + _north(b, o, x, y) - _northWest(b, o, x, y);
+        return (_west(b, o, x, y) + _north(b, o, x, y) - _northWest(b, o, x, y))
+            .toSigned(32);
       case 10:
-        return _west(b, o, x, y) - _northWest(b, o, x, y);
+        return (_west(b, o, x, y) - _northWest(b, o, x, y)).toSigned(32);
       case 11:
-        return _northWest(b, o, x, y) - _north(b, o, x, y);
+        return (_northWest(b, o, x, y) - _north(b, o, x, y)).toSigned(32);
       case 12:
-        return _north(b, o, x, y) - _northEast(b, o, x, y);
+        return (_north(b, o, x, y) - _northEast(b, o, x, y)).toSigned(32);
       case 13:
-        return _north(b, o, x, y) - _northNorth(b, o, x, y);
+        return (_north(b, o, x, y) - _northNorth(b, o, x, y)).toSigned(32);
       case 14:
-        return _west(b, o, x, y) - _westWest(b, o, x, y);
+        return (_west(b, o, x, y) - _westWest(b, o, x, y)).toSigned(32);
       case 15:
         return maxError;
       default:
@@ -457,7 +516,13 @@ final class ModularChannel {
           final rW = x > 0 ? cb[o - 1] : 0;
           final rN = y > 0 ? cb[o - width] : rW;
           final rNW = x > 0 && y > 0 ? cb[o - width - 1] : rW;
-          final rG = rC - _clamp3(rW + rN - rNW, rN, rW);
+          // Truncate to signed 32 bits at each Java-`int` step (see
+          // [prediction]'s case-3 comment) -- cross-channel properties are
+          // the default/common encoding choice for color images, so this
+          // path is very likely exercised for any RGB content, not an
+          // edge case.
+          final rG =
+              (rC - _clamp3((rW + rN - rNW).toSigned(32), rN, rW)).toSigned(32);
           if (k2++ == k) return rG.abs();
           if (k2++ == k) return rG;
         }
@@ -505,16 +570,33 @@ final class ModularChannel {
         }
         final diff = stream.readSymbol(reader, node.context,
             distanceMultiplier: distMultiplier);
-        final diff2 = unpackSigned(diff) * node.multiplier + node.offset;
-        final trueValue = diff2 + prediction(y, x, node.predictor);
+        // Truncate to signed 32 bits at each Java-`int` assignment point
+        // (see [prediction]'s case-3 comment) -- this is *the* per-pixel
+        // decode hot path, run unconditionally for every pixel, so an
+        // untruncated `trueValue` here doesn't just corrupt one pixel, it
+        // feeds the WP error state (_err0-4 below) that every *later*
+        // pixel's context selection depends on, silently desyncing the
+        // whole entropy stream for wide-range content (e.g. float samples
+        // reinterpreted as packed 32-bit integers, see
+        // ImageBuffer.reconstructFloatSamples).
+        final diff2 =
+            (unpackSigned(diff) * node.multiplier + node.offset).toSigned(32);
+        final trueValue =
+            (diff2 + prediction(y, x, node.predictor)).toSigned(32);
         final o = y * width + x;
         b[o] = trueValue;
         if (useWp) {
-          final tv3 = trueValue << 3;
-          _err0![o] = ((_subpred[0] - tv3).abs() + 3) >> 3;
-          _err1![o] = ((_subpred[1] - tv3).abs() + 3) >> 3;
-          _err2![o] = ((_subpred[2] - tv3).abs() + 3) >> 3;
-          _err3![o] = ((_subpred[3] - tv3).abs() + 3) >> 3;
+          final tv3 = (trueValue << 3).toSigned(32);
+          // `.abs()` on the truncated difference, not the raw one: Java's
+          // `Math.abs(Integer.MIN_VALUE)` overflows back to itself rather
+          // than negating, so the *truncated* difference must be what
+          // gets abs()'d to match (matters only at the extreme -2^31
+          // corner, but that's exactly the corner wide-range content can
+          // reach).
+          _err0![o] = ((_subpred[0] - tv3).toSigned(32).abs() + 3) >> 3;
+          _err1![o] = ((_subpred[1] - tv3).toSigned(32).abs() + 3) >> 3;
+          _err2![o] = ((_subpred[2] - tv3).toSigned(32).abs() + 3) >> 3;
+          _err3![o] = ((_subpred[3] - tv3).toSigned(32).abs() + 3) >> 3;
           _err4![o] = _pred![o] - tv3;
         }
       }

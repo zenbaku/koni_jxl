@@ -7,7 +7,76 @@ during gate testing:
 ## Lossless (modular)
 
 Bit-exact against `djxl` on the entire local corpus and the modular
-conformance testcases. No known deviations.
+conformance testcases (excluding float samples, below). No known
+deviations.
+
+## Float/HDR samples (modular path) — unresolved decode bug, feature gated off
+
+Modular-mode float samples (`bit_depth.floating_point_sample`, e.g. the
+`lossless_pfm` conformance testcase) are rejected with
+`JxlUnsupportedException('float-samples')` in `Frame.decodeFrame` —
+intentionally, pending a real fix, not because the reconstruction math is
+unimplemented. `ImageBuffer.reconstructFloatSamples` (bit-for-bit ported
+from libjxl's `int_to_float`, `lib/jxl/dec_modular.cc`) and its wiring in
+`decoder.dart`'s `_finalizeCanvas` are already implemented and believed
+correct in isolation — they're just unreachable while the throw is in
+place.
+
+The blocker is upstream of reconstruction: decoding `lossless_pfm` throws
+`illegal final modular state` (an ANS final-state desync) partway through
+a 256×256×3 RCT-transformed group. This only manifests for content whose
+per-pixel modular values approach the full ±2^31 range (a float32 bit
+pattern reinterpreted as an int, unlike ordinary 8–16-bit samples) —
+jxlatte has no float-sample support at all, so this code path has never
+been exercised there either.
+
+Confirmed and fixed during this investigation (all verified safe against
+the full test suite, zero regressions):
+
+- `_wpPlaneWeight`/`_wpPlaneWeightInterior` (`modular_channel.dart`):
+  missing `eSum &= 0xFFFFFFFF` before the shift (jxlatte has this mask;
+  it was dropped in the port) — this was the original `RangeError` crash,
+  a real robustness-contract violation.
+- `_prePredictWp`/`_prePredictWpInterior`: `n3/nw3/ne3/w3/nn3` and
+  `subpred[0-3]` need `.toSigned(32)` truncation matching Java's
+  auto-truncating `int` arithmetic (confirmed against jxlatte).
+- `prediction()` cases 3/4/5/10-13 (simple averaging/gradient
+  predictors): same truncate-before-divide/abs pattern.
+- `_property()` cases 8-14 (MA-tree property computation, including the
+  cross-channel gradient property `rG`): same pattern — these values
+  directly select entropy contexts, so an untruncated overflow here can
+  desync the whole stream, not just mispredict one pixel.
+- The core per-pixel decode loop (`diff2`/`trueValue`/`tv3`/the WP error
+  arrays in `ModularChannel.decode`): same pattern, on the hottest path.
+- `_readHybridInteger` (`entropy_stream.dart`): missing final
+  `& 0xFFFFFFFF` mask on the reconstructed value (libjxl computes this at
+  `size_t`/64-bit width then does an explicit `static_cast<uint32_t>` at
+  the end — confirmed via direct libjxl source read, not just jxlatte).
+- **A genuine divergence from both jxlatte and libjxl's actual behavior**:
+  the extra-bit count `n` in `_readHybridInteger` was rejecting `n > 32`
+  outright; libjxl instead does `nbits &= 31u` — for `n == 32` exactly
+  this means reading *zero* extra bits, not 32. jxlatte has the same
+  `if (n > 32) throw` shape, so this is a bug inherited from the porting
+  reference, not introduced here — just never triggered before, since
+  ordinary content never needs `n` anywhere near 32.
+
+None of the above resolved `lossless_pfm` itself. Further tracing (bit
+positions, RCT transform config, per-symbol hybrid-integer configs,
+cluster-map/distribution-table structure) found the failing group uses an
+unusually large entropy configuration (2,641 leaf contexts, 127 ANS
+clusters — far more than any currently-passing test exercises) and that
+the *first* decoded pixel is already wrong, not a late accumulation. A
+line-by-line audit of the ANS histogram reader (`ans.dart`:
+shift/bitcount/RLE/same-prev logic) and the VLC lookup table (both
+contents and mechanism) against libjxl's actual C++ source
+(`ReadHistogram` in `dec_ans.cc`, `GetPopulationCountPrecision` in
+`ans_common.h`) turned up no divergence. The remaining bug is somewhere
+not yet identified — plausibly a rarely-exercised histogram/cluster-map
+code path only reachable at this scale, or something else entirely. Next
+step if resumed: a byte-level bitstream trace against `djxl`'s own
+internal state, or a from-scratch synthetic bitstream that isolates the
+RCT + large-tree combination for a smaller repro than the full 256×256
+group.
 
 ## Lossy (VarDCT)
 

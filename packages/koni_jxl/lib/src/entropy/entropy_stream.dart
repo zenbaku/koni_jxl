@@ -198,21 +198,36 @@ final class EntropyStream {
       BitReader reader, HybridIntegerConfig config, int token) {
     final split = 1 << config.splitExponent;
     if (token < split) return token;
-    final n = config.splitExponent -
-        config.lsbInToken -
-        config.msbInToken +
-        ((token - split) >> (config.msbInToken + config.lsbInToken));
-    if (n > 32) {
-      throw const JxlInvalidBitstreamException('hybrid integer n too large');
-    }
+    // libjxl (lib/jxl/dec_ans.h, ReadHybridUintConfig) masks this to 0-31
+    // via `nbits &= 31u` -- NOT a "reject if too large" check. For n==32
+    // specifically this means reading *zero* extra bits (32 & 31 == 0),
+    // not 32 -- a real, confirmed divergence from the "if (n>32) throw"
+    // shape jxlatte uses (and this code used to mirror), normally
+    // unreachable for ordinary 8-16-bit samples, whose residuals never
+    // push `n` anywhere near 32, but load-bearing for wide-range content
+    // (e.g. float samples reinterpreted as packed 32-bit integers, see
+    // ImageBuffer.reconstructFloatSamples) where it silently desyncs the
+    // entropy stream instead of throwing.
+    final n = (config.splitExponent -
+            config.lsbInToken -
+            config.msbInToken +
+            ((token - split) >> (config.msbInToken + config.lsbInToken))) &
+        31;
     final low = token & ((1 << config.lsbInToken) - 1);
     token >>= config.lsbInToken;
     token &= (1 << config.msbInToken) - 1;
     token |= 1 << config.msbInToken;
-    // n can be up to 32 (checked above): a plain `token << n` would break
-    // on dart2js there, since a *computed* shift by exactly 32 silently
-    // returns 0 (see wideShl's doc).
-    return ((wideShl(token, n) | reader.readBits(n)) << config.lsbInToken) |
-        low;
+    // n is now always 0-31 (masked above), so a plain `token << n` would
+    // be safe here too, but wideShl costs nothing extra and keeps this
+    // consistent with the rest of this file's shift handling. The
+    // hybrid-uint result is a 32-bit *unsigned* quantity by construction
+    // (libjxl computes this via `size_t` then an explicit
+    // `static_cast<uint32_t>` at the end, lib/jxl/dec_ans.h
+    // ReadHybridUintConfig) -- masking once at the end reproduces that,
+    // since truncation commutes with `<<`/`|` (unlike `+`/`*`, no carry
+    // crosses the truncation boundary).
+    return (((wideShl(token, n) | reader.readBits(n)) << config.lsbInToken) |
+            low) &
+        0xFFFFFFFF;
   }
 }

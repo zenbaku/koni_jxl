@@ -203,6 +203,27 @@ final class _DecoderState {
     }
     final planes =
         copy ? [for (final b in canvas) ImageBuffer.copy(b!)] : canvas;
+    // Modular (non-XYB) float-sample channels are still holding their raw
+    // decoded integers at this point — the packed sign/exponent/mantissa
+    // bits, not a value to scale (see [ImageBuffer.reconstructFloatSamples]).
+    // Float samples and XYB encoding are mutually exclusive in the format,
+    // so this never touches a channel the transfer-function step below
+    // also needs. Not verified against blending/patches/splines combined
+    // with float samples — only the plain single-frame case.
+    final colors = imageHeader.colorChannelCount;
+    for (var c = 0; c < colors; c++) {
+      final bd = imageHeader.bitDepth;
+      if (bd.usesFloatSamples) {
+        planes[c]!.reconstructFloatSamples(bd.bitsPerSample, bd.expBits);
+      }
+    }
+    for (var i = 0; i < imageHeader.extraChannels.length; i++) {
+      final bd = imageHeader.extraChannels[i].bitDepth;
+      if (bd.usesFloatSamples) {
+        planes[colors + i]!
+            .reconstructFloatSamples(bd.bitsPerSample, bd.expBits);
+      }
+    }
     // XYB frames come out of the color transform in linear RGB; convert to
     // the image's tagged transfer function (what djxl outputs).
     if (imageHeader.xybEncoded) {
