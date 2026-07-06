@@ -2329,6 +2329,106 @@ flagging a sign combination to double-check, and its own still-unverified
 `*64` suspicion) — plus the `customParamsByIndex` gating cleanup flagged
 above, whenever it's worth doing.
 
+### Lossy (VarDCT) encoder — Tranche C, fourth/fifth slices: DCT4x8 and DCT8x4
+
+Unlike Hornuss/DCT2x2 (no real DCT machinery at all — just Hadamard
+butterflies and pixel arithmetic), DCT4x8/DCT8x4 share DCT4x4's "butterfly
++ sub-block IDCT" shape closely: the block's 2 strips' own DC terms
+combine via a plain 2-point Hadamard (sum/difference — the 1D analog of
+DCT4x4's 4-point butterfly, self-inverse up to `/2` by the same argument),
+and each strip is reconstructed via a genuine `(height=4, width=8)`
+`inverseDCT2D` call — DCT4x8's strips are top/bottom halves
+(`transposed=false`), DCT8x4's are left/right halves (`transposed=true`,
+reusing the exact `transposed` handling DCT4x4's own per-quadrant case
+already established: `inverseDCT2D(...,transposed=true)` computes
+`transpose(inverseDCT2D(...,false))`, dimensions swapped included, so the
+forward is `forwardDCT2D(transpose(strip), height, width)`). Both
+derivations verified the same way as every prior slice: a Python
+basis-injection 64x64 matrix built from the real decoder logic
+(`vardct_inverter.dart`'s `TransformMethod.dct4x8`/`dct8x4` cases),
+confirmed to ~2.2e-15 deviation before writing any Dart, then re-derived
+as permanent Dart identity tests.
+
+**One test bug (not a production bug) found and fixed while writing the
+identity test**: the first draft of `DCT8x4`'s duplicated-decoder-logic
+test helper sized its intermediate destination buffer to `(height=4,
+width=8)`, matching `DCT4x8`'s own helper — but `inverseDCT2D(...,
+transposed=true)` with `(height=4, width=8)` writes a `(width=8,
+height=4)`-shaped *output* (the dimension swap under transpose), so the
+buffer needed 8 rows, not 4 — a `RangeError` on the very first test run
+caught it immediately. Fixed by writing directly into the shared 8x8
+`fb` buffer, matching how the real decoder (`vardct_inverter.dart`) and
+DCT4x4's own already-shipped test both already do it — avoiding the
+redundant intermediate buffer entirely rather than just resizing it.
+
+**`DCT4x8`/`DCT8x4` share one `parameterIndex` (9) and one `TransformMode`
+(`dct4x8`)**, distinguished only by `vardct_inverter.dart`'s reconstruction
+switch — mirroring Tranche B's `DCT16x8`/`DCT8x16` precedent (one shared
+weight table, two placement/reconstruction paths). Extracted
+`getDct4x8QuantWeights` (public, single-sourced between decoder and
+encoder, same precedent as every prior extraction this tranche).
+`customParams`'s `acScale` handling mirrors dct4 exactly (scale the nested
+`dctParam`'s band[0] only; leave the 1 override value at its unscaled
+default — a rate-tuning choice, not a correctness one, same reasoning as
+dct4's own overrides).
+
+**The override read/write convention was ALREADY correct** (unlike dct4's
+own history): `_setupDctParam`'s `TransformMode.dct4x8` case reads its 1
+override value per channel with NO `*64` — already matching dct4's
+*fixed* convention (the override is a divisor on a separately-built base
+table, not an absolute weight like hornuss/dct2's). Verified anyway, not
+assumed correct just because the code already looked right: two
+dedicated djxl round-trip tests at non-default distances (0.5, 1.0) with
+content chosen so the override-affected coefficient carries real,
+nonzero signal. **The first content tried for this was found degenerate,
+the same trap Hornuss's own test deliberately avoided**: a full-period
+sine wave summed to exactly zero per strip (8 evenly-spaced samples of
+`sin` over one period sum to `0`), making both strips' own DC terms
+identical and the override-affected coefficient (their *difference*)
+trivially zero regardless of any encoding bug. Switched to a
+"step+gradient" pattern (a real DC difference between strips, `step`,
+plus a real per-strip gradient, `slope`, found via `jxl.encdebug` tallies
+to win outright — uniform `{DCT 4x8: 16}` / `{DCT 8x4: 16}` tallies — at
+distances 0.5 and 1.0), which both carries real override signal and
+genuinely wins, so one pair of tests covers both properties at once.
+
+**Verification, full order**: the Python basis-injection proof for both
+derivations; two permanent Dart identity tests (one test-only bug found
+and fixed, above); "genuinely wins" tests at the 2 distances where the
+step+gradient content wins outright, with djxl round-trip and
+decode-vs-original RMSE bound (these same tests double as the `*64`
+verification, since the content was specifically chosen to avoid the
+sine's degenerate-signal trap); a mixed-layout test — a 96x64 canvas,
+six 32x32 regions, one per flavor of "genuinely wins" content tried this
+tranche — confirmed via the encdebug tally at distance=0.5 to place ALL
+SEVEN active transform types (`DCT8x8`, `Hornuss`, `DCT2x2`, `DCT4x4`,
+`DCT4x8`, `DCT8x4`, `DCT16x16`) in one bitstream at once (`{Hornuss: 38,
+DCT 8x8: 5, DCT 4x8: 17, DCT 4x4: 1, DCT 8x4: 18, DCT 2x2: 1, DCT 16x16:
+4}`), round-tripped through djxl at all 4 standard distances; the
+default-path A/B (same `gray_screentone` corpus golden as round 12's
+check) — at `distance=2.0`, output grew another 31B (913197B -> 913228B),
+consistent with the already-documented `customParamsByIndex` cost (one
+more parameterIndex slot, one more unused custom table written even with
+`enableBespokeTransforms:false`), not a new anomaly; `distance=1.0`
+stayed exactly unchanged, as expected.
+
+**Shipped**: DCT4x8 and DCT8x4 both exist, are correct (verified
+numerically, via permanent identity tests catching a test-only sizing
+bug, and against djxl including in a 7-type mixed layout and at distances
+specifically chosen to avoid a degenerate-content blind spot), and
+confirmed their pre-existing `*64`-free override convention was never a
+bug (unlike dct4's own history). `VardctL0Config.enableBespokeTransforms`
+stays off by default (unchanged flag, now gating five types). Full suite
+green (373 tests, up from 363); `flutter test` green on both packages.
+23 of 27 transform types now implemented. Next: AFV0-3 last — the most
+complex remaining type (a 16x16 fixed basis matrix, a 3-region split, a
+decoder comment flagging a sign combination to double-check, and its own
+still-unverified `*64` suspicion) — plus the `customParamsByIndex` gating
+cleanup, whenever it's worth doing (now two increments deep: 36B + 54B +
+31B = 121B total drift from the pre-Tranche-C baseline at
+`distance=2.0`, still under 0.02% of file size, but growing by a small
+fixed amount with each new type regardless of that type's own default).
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

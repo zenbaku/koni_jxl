@@ -563,6 +563,169 @@ void main() {
       }
     });
   });
+
+  // Tranche C, fourth/fifth slices (ROADMAP.md/spec_notes.md): DCT4x8 and
+  // DCT8x4 -- unlike Hornuss/DCT2x2 (a single-stage butterfly, no real DCT),
+  // these share DCT4x4's "butterfly + sub-block IDCT" shape: a plain
+  // 2-point Hadamard (sum/difference, the 1D analog of DCT4x4's 4-point
+  // butterfly) combines the block's 2 strips' own DC terms, and each strip
+  // is reconstructed via a genuine (height=4,width=8) forwardDCT2D/
+  // inverseDCT2D pair -- DCT8x4's strips use `transposed=true`, the same
+  // shape DCT4x4's own per-quadrant reconstruction already established and
+  // verified. Both derivations verified by basis injection against the real
+  // decoder logic to ~2e-15 deviation before writing any Dart (see
+  // doc/spec_notes.md); these groups are the permanent form of that check.
+  group('DCT4x8 (Tranche C, bespoke)', () {
+    // Mirrors vardct_inverter.dart's TransformMethod.dct4x8 case exactly,
+    // for a single isolated 8x8 block at the origin.
+    List<Float32List> decodeDct4x8(List<Float32List> cc) {
+      final coeff0 = cc[0][0].toDouble(), coeff1 = cc[1][0].toDouble();
+      final lfs = [coeff0 + coeff1, coeff0 - coeff1];
+      final fb = List.generate(8, (_) => Float32List(8));
+      final s0 = List.generate(4, (_) => Float32List(8));
+      final s1 = List.generate(4, (_) => Float32List(8));
+      final scratch0 = List.generate(8, (_) => Float32List(8));
+      final scratch1 = List.generate(8, (_) => Float32List(8));
+      for (var y = 0; y < 2; y++) {
+        s0[0][0] = lfs[y];
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = iy == 0 ? 1 : 0; ix < 8; ix++) {
+            s0[iy][ix] = cc[y + iy * 2][ix];
+          }
+        }
+        inverseDCT2D(s0, s1, 0, 0, 0, 0, 4, 8, scratch0, scratch1, false);
+        for (var iy = 0; iy < 4; iy++) {
+          fb[y * 4 + iy].setRange(0, 8, s1[iy]);
+        }
+      }
+      return fb;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's computeCoeffBuf TransformMethod
+    // .dct4x8 branch exactly (the production forward derivation under
+    // test).
+    List<Float32List> encodeDct4x8(List<Float32List> pixels) {
+      final cc = List.generate(8, (_) => Float32List(8));
+      final strip = List.generate(4, (_) => Float32List(8));
+      final stripCoeffs = List.generate(4, (_) => Float32List(8));
+      final scratch0 = List.generate(8, (_) => Float32List(8));
+      final scratch1 = List.generate(8, (_) => Float32List(8));
+      final lf = Float32List(2);
+      for (var y = 0; y < 2; y++) {
+        for (var iy = 0; iy < 4; iy++) {
+          strip[iy].setRange(0, 8, pixels[y * 4 + iy]);
+        }
+        forwardDCT2D(strip, stripCoeffs, 0, 0, 0, 0, 4, 8, scratch0, scratch1);
+        lf[y] = stripCoeffs[0][0];
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 8; ix++) {
+            if (iy == 0 && ix == 0) continue;
+            cc[y + iy * 2][ix] = stripCoeffs[iy][ix];
+          }
+        }
+      }
+      cc[0][0] = (lf[0] + lf[1]) / 2;
+      cc[1][0] = (lf[0] - lf[1]) / 2;
+      return cc;
+    }
+
+    test(
+        'forward derivation followed by the real decoder reconstruction '
+        'is the identity, over random 8x8 blocks', () {
+      final rng = math.Random(9);
+      for (var trial = 0; trial < 50; trial++) {
+        final pixels = List.generate(
+            8,
+            (_) => Float32List.fromList(
+                List.generate(8, (_) => rng.nextDouble() * 10 - 5)));
+        final cc = encodeDct4x8(pixels);
+        final recon = decodeDct4x8(cc);
+        for (var y = 0; y < 8; y++) {
+          for (var x = 0; x < 8; x++) {
+            expect(recon[y][x], closeTo(pixels[y][x], 1e-3),
+                reason: 'trial $trial, pixel ($y, $x)');
+          }
+        }
+      }
+    });
+  });
+
+  group('DCT8x4 (Tranche C, bespoke)', () {
+    // Mirrors vardct_inverter.dart's TransformMethod.dct8x4 case exactly,
+    // for a single isolated 8x8 block at the origin.
+    List<Float32List> decodeDct8x4(List<Float32List> cc) {
+      final coeff0 = cc[0][0].toDouble(), coeff1 = cc[1][0].toDouble();
+      final lfs = [coeff0 + coeff1, coeff0 - coeff1];
+      final fb = List.generate(8, (_) => Float32List(8));
+      final s0 = List.generate(4, (_) => Float32List(8));
+      final scratch0 = List.generate(8, (_) => Float32List(8));
+      final scratch1 = List.generate(8, (_) => Float32List(8));
+      for (var x = 0; x < 2; x++) {
+        s0[0][0] = lfs[x];
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = iy == 0 ? 1 : 0; ix < 8; ix++) {
+            s0[iy][ix] = cc[x + iy * 2][ix];
+          }
+        }
+        // transposed=true: inverseDCT2D(...,height=4,width=8,...) writes an
+        // 8x4 (width x height) region directly into fb -- see
+        // dct.dart's inverseDCT2D and vardct_inverter.dart's own
+        // TransformMethod.dct8x4 case, which writes into fb the same way.
+        inverseDCT2D(s0, fb, 0, 0, 0, x << 2, 4, 8, scratch0, scratch1, true);
+      }
+      return fb;
+    }
+
+    // Mirrors vardct_l0_encoder.dart's computeCoeffBuf TransformMethod
+    // .dct8x4 branch exactly (the production forward derivation under
+    // test).
+    List<Float32List> encodeDct8x4(List<Float32List> pixels) {
+      final cc = List.generate(8, (_) => Float32List(8));
+      final stripT = List.generate(4, (_) => Float32List(8));
+      final stripCoeffs = List.generate(4, (_) => Float32List(8));
+      final scratch0 = List.generate(8, (_) => Float32List(8));
+      final scratch1 = List.generate(8, (_) => Float32List(8));
+      final lf = Float32List(2);
+      for (var x = 0; x < 2; x++) {
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 8; ix++) {
+            stripT[iy][ix] = pixels[ix][x * 4 + iy];
+          }
+        }
+        forwardDCT2D(stripT, stripCoeffs, 0, 0, 0, 0, 4, 8, scratch0, scratch1);
+        lf[x] = stripCoeffs[0][0];
+        for (var iy = 0; iy < 4; iy++) {
+          for (var ix = 0; ix < 8; ix++) {
+            if (iy == 0 && ix == 0) continue;
+            cc[x + iy * 2][ix] = stripCoeffs[iy][ix];
+          }
+        }
+      }
+      cc[0][0] = (lf[0] + lf[1]) / 2;
+      cc[1][0] = (lf[0] - lf[1]) / 2;
+      return cc;
+    }
+
+    test(
+        'forward derivation followed by the real decoder reconstruction '
+        'is the identity, over random 8x8 blocks', () {
+      final rng = math.Random(10);
+      for (var trial = 0; trial < 50; trial++) {
+        final pixels = List.generate(
+            8,
+            (_) => Float32List.fromList(
+                List.generate(8, (_) => rng.nextDouble() * 10 - 5)));
+        final cc = encodeDct8x4(pixels);
+        final recon = decodeDct8x4(cc);
+        for (var y = 0; y < 8; y++) {
+          for (var x = 0; x < 8; x++) {
+            expect(recon[y][x], closeTo(pixels[y][x], 1e-3),
+                reason: 'trial $trial, pixel ($y, $x)');
+          }
+        }
+      }
+    });
+  });
 }
 
 /// The decoder's `_auxDCT2` (`vardct_inverter.dart`) single-stage (`s=2`,

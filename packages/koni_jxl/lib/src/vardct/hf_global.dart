@@ -380,6 +380,30 @@ List<Float32List> getDct2x2QuantWeights(List<double> param) {
   return w;
 }
 
+/// Computes the raw (pre-inversion) DCT4x8/DCT8x4 quantization weight
+/// matrix for one channel: a 2x-nearest-neighbor-upsampled 4x8 quant-weight
+/// table (see [getDCTQuantWeights]), upsampled only along the height axis
+/// (the sub-block DCTs this shares are already 8 wide), with one
+/// low-frequency position overridden by [override] (`target[1][0]` divided
+/// by it — the same "override is a divisor on a separately-built base
+/// table" shape as [getDct4x4QuantWeights], not an absolute weight like
+/// [getHornussQuantWeights]/[getDct2x2QuantWeights]). Shared by both
+/// DCT4x8 and DCT8x4 (same `parameterIndex`, distinguished only by
+/// `vardct_inverter.dart`'s reconstruction switch). Public for the same
+/// single-sourcing reason as [getDct4x4QuantWeights].
+List<Float32List> getDct4x8QuantWeights(
+    List<double> dctParam, double override) {
+  final target = floatMatrix(8, 8);
+  final w = getDCTQuantWeights(4, 8, dctParam);
+  for (var y = 0; y < 8; y++) {
+    for (var x = 0; x < 8; x++) {
+      target[y][x] = w[y ~/ 2][x];
+    }
+  }
+  target[1][0] /= override;
+  return target;
+}
+
 /// HfGlobal: the 17 dequantization weight matrices plus the HF preset count.
 final class HfGlobal {
   HfGlobal(BitReader reader, Frame frame) {
@@ -521,6 +545,16 @@ final class HfGlobal {
         }
         return DctParams(null, m, encodingMode, denominator: den);
       case TransformMode.dct4x8:
+        // NOT *64 already, matching dct4's fixed convention (this override
+        // is a divisor on a separately-built base table -- see
+        // getDct4x8QuantWeights -- the same shape as dct4's overrides, not
+        // hornuss/dct2's absolute-weight shape). Confirmed correct via
+        // djxl round-trips at non-default distances with content carrying
+        // real, nonzero signal at the override position for both DCT4x8
+        // and DCT8x4 (vardct_l0_test.dart's "genuinely wins on a
+        // step+gradient pattern" tests) -- not assumed correct just
+        // because the read code already looked right. See
+        // doc/spec_notes.md.
         final m = List.generate(
             3, (_) => List<double>.generate(1, (_) => reader.readF16()));
         return DctParams(_readDCTParams(reader), m, encodingMode);
@@ -595,15 +629,8 @@ final class HfGlobal {
         case TransformMode.hornuss:
           weights[index][c] = getHornussQuantWeights(p.param![c]);
         case TransformMode.dct4x8:
-          final target = floatMatrix(8, 8);
-          final w = getDCTQuantWeights(4, 8, p.dctParam![c]);
-          for (var y = 0; y < 8; y++) {
-            for (var x = 0; x < 8; x++) {
-              target[y][x] = w[y ~/ 2][x];
-            }
-          }
-          target[1][0] /= p.param![c][0];
-          weights[index][c] = target;
+          weights[index][c] =
+              getDct4x8QuantWeights(p.dctParam![c], p.param![c][0]);
         case TransformMode.afv:
           weights[index][c] = _getAFVTransformWeights(index, c);
         case TransformMode.raw:

@@ -124,11 +124,12 @@ quality lives.
   round 6; rounds 7/8 completed Tranche A — all square DCT sizes, 8x8
   through 256x256, 6 of 27 types; rounds 9/10 completed Tranche B — all 12
   rectangular types, 18 of 27 total; round 11 started Tranche C with
-  DCT4x4, 19 of 27 total; round 12 below added Hornuss and DCT2x2, 21 of 27
-  total; 6 remain) and a real rate-distortion search over transform size
-  itself (rounds 6-12 choose between fixed candidates per region, not a
-  search) remain open — see round 12's write-up for the phased plan
-  covering the rest.
+  DCT4x4, 19 of 27 total; round 12 added Hornuss and DCT2x2, 21 of 27
+  total; round 13 below added DCT4x8 and DCT8x4, 23 of 27 total; 4 remain,
+  all AFV0-3) and a real rate-distortion search over transform size itself
+  (rounds 6-13 choose between fixed candidates per region, not a search)
+  remain open — see round 13's write-up for the phased plan covering the
+  rest.
 - ✅ **L4 — API + gates.** `JxlEncoder.encodeLossy(..., distance:)` (done
   since L1). Added: `encodeJxlLossyFromRgba`/`encodeJxlLossyFromUiImage`
   Flutter helpers (`koni_jxl_flutter`, alpha dropped — RGB-only, matching
@@ -681,6 +682,49 @@ output for where the gap actually is.
   sign combination to double-check, and its own still-unverified `*64`
   suspicion). See doc/spec_notes.md for the full write-up.
 
+- ✅ **Round 13 / Tranche C continued: DCT4x8 and DCT8x4.** Unlike
+  Hornuss/DCT2x2 (no real DCT machinery), these share DCT4x4's "butterfly +
+  sub-block IDCT" shape: a plain 2-point Hadamard (self-inverse up to /2,
+  the 1D analog of DCT4x4's 4-point butterfly) combines the block's 2
+  strips' own DC terms, each strip reconstructed via a genuine
+  (height=4,width=8) forward/inverse DCT pair — DCT8x4's strips reuse the
+  same `transposed=true` handling (dimension swap included) DCT4x4's own
+  per-quadrant case already established. Both derivations verified by
+  basis injection to ~2.2e-15 deviation before writing Dart, then
+  re-derived as permanent Dart identity tests — which caught a real
+  **test-only** bug immediately (a `RangeError` on first run): the DCT8x4
+  identity test's first draft sized its intermediate decode buffer to
+  (height=4,width=8) like DCT4x8's, but `transposed=true` at (4,8) writes
+  an 8x4 *output* (the dimension swap), needing 8 rows not 4 — fixed by
+  writing directly into the shared `fb` buffer, matching both the real
+  decoder and DCT4x4's own test. DCT4x8/DCT8x4 share one parameterIndex
+  and TransformMode (mirrors Tranche B's DCT16x8/DCT8x16 precedent).
+  **The override read/write convention (`_setupDctParam`'s
+  `TransformMode.dct4x8` case) was ALREADY `*64`-free**, matching dct4's
+  fixed convention rather than hornuss/dct2's — verified anyway, not
+  assumed: two djxl round-trip tests found the first content tried (a
+  full-period sine) was **degenerate** for this purpose (sums to exactly
+  zero per strip, making the override-affected coefficient trivially
+  zero regardless of any bug — the same trap Hornuss's test avoided),
+  switched to a "step+gradient" pattern (real DC difference between
+  strips + a real per-strip gradient) that both wins outright (uniform
+  `{DCT 4x8: 16}`/`{DCT 8x4: 16}` tallies at distances 0.5/1.0) and
+  carries real override signal, confirming the convention correct.
+  Mixed-layout test now covers ALL SEVEN active types at once (encdebug-
+  confirmed: `{Hornuss: 38, DCT 8x8: 5, DCT 4x8: 17, DCT 4x4: 1, DCT 8x4:
+  18, DCT 2x2: 1, DCT 16x16: 4}` at distance=0.5). Default-path A/B found
+  another small, consistent increment (+31B at distance=2.0, unchanged at
+  1.0) — same pre-existing `customParamsByIndex` cost flagged in round 12,
+  not a new anomaly (cumulative drift from the pre-Tranche-C baseline: 36B
+  + 54B + 31B = 121B at distance=2.0, still under 0.02% of file size).
+  Full suite green (373 tests, up from 363); `flutter test` green on both
+  packages. `enableBespokeTransforms` stays off by default (unchanged
+  flag, now gating five types). This continues Tranche C (23 of 27 types
+  now implemented, 4 to go — all AFV0-3: a 16x16 fixed basis matrix, a
+  3-region split, a decoder comment flagging a sign combination to
+  double-check, and its own still-unverified `*64` suspicion). See
+  doc/spec_notes.md for the full write-up.
+
 - **Cleanup (not yet scheduled): gate `customParamsByIndex` by reachability.**
   `vardct_l0_encoder.dart`'s `customParamsByIndex` currently includes an
   entry for every `_activeTransformTypes` member whenever any non-default
@@ -689,12 +733,12 @@ output for where the gap actually is.
   `enableBespokeTransforms`/`maxTransformSize`) could actually place it —
   writing a real but unused custom quant-weight table into HfGlobal for
   every such type (found by round 12's more precise default-path A/B,
-  above). Restricting it to only the types reachable given the active
-  flags would restore true distance-independent byte-identity on the
-  default path and stop this small cost from compounding as DCT4x8/DCT8x4/
-  AFV land. Low priority (each increment is a few dozen bytes on a
-  multi-hundred-KB file) but worth doing once Tranche C is complete rather
-  than letting it grow type by type.
+  above; round 13 confirmed the pattern continues, +31B more). Restricting
+  it to only the types reachable given the active flags would restore true
+  distance-independent byte-identity on the default path and stop this
+  small cost from compounding as AFV lands. Low priority (121B cumulative
+  on a multi-hundred-KB file so far) but worth doing once Tranche C is
+  complete rather than letting it grow type by type.
 
 ---
 
