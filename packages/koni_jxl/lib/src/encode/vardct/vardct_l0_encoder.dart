@@ -1399,6 +1399,32 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   // `_PlacedBlock` — the caller runs RD-hfMult/RDOQ separately on each
   // candidate, and those passes mutate hfMult/acInt in place (see
   // `_PlacedBlock.copy`'s doc comment).
+  // Quantizes a fresh candidate of `tt` at `(by,bx)` and scores it against
+  // `predictedForPosition(by,bx)` — never mutates anything (the block
+  // returned is uncommitted; the caller decides whether to `commit()` it).
+  // Extracted from `tryMergeLevel`'s own inline body so `decideLevel0`/
+  // `decideLevel1` below can score arbitrary candidates the same way,
+  // without a merge decision's `costIn`/`layoutBlockAt` bookkeeping.
+  ({
+    _PlacedBlock block,
+    ({List<double> dc, List<Int32List> ac, double distortion}) quant,
+    int mult,
+    double rate,
+    double cost
+  }) scoreFreshCandidate(
+      int by, int bx, TransformType tt, double lambdaForLevel) {
+    final ctx = ctxByType[tt.type]!;
+    final candidate = _PlacedBlock(by, bx, tt);
+    final coeffBuf =
+        candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
+    final (mult, quant) = candidate.chooseCandidate(
+        coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
+    final rate = _blockRate(
+        ctx, hfctx, quant.ac, predictedForPosition(by, bx), clusterMap, lengths);
+    final cost = quant.distortion + lambdaForLevel * rate;
+    return (block: candidate, quant: quant, mult: mult, rate: rate, cost: cost);
+  }
+
   (List<_PlacedBlock>, List<Int32List>, bool) tryMergeLevel(
       List<_PlacedBlock> layoutIn,
       List<Int32List> dcIntIn,
@@ -1406,7 +1432,6 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
       double lambdaForLevel) {
     final strideY = targetType.dctSelectHeight;
     final strideX = targetType.dctSelectWidth;
-    final ctx = ctxByType[targetType.type]!;
     final layoutBlockAt = List<_PlacedBlock?>.filled(bh * bw, null);
     for (final block in layoutIn) {
       final blockH = block.tt.dctSelectHeight, blockW = block.tt.dctSelectWidth;
@@ -1460,24 +1485,16 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
           }
 
           if (mergeable) {
-            final candidate = _PlacedBlock(by, bx, targetType);
-            final coeffBuf =
-                candidate.computeCoeffBuf(planes, cfl, scratchA, scratchB);
-            final (mult, quant) = candidate.chooseCandidate(
-                coeffBuf, refStep, sd, ctx.rawWeight, scaleFactor);
-            final rate = _blockRate(ctx, hfctx, quant.ac,
-                predictedForPosition(by, bx), clusterMap, lengths);
-            final cost = quant.distortion + lambdaForLevel * rate;
-
-            if (cost < costIn) {
+            final scored = scoreFreshCandidate(by, bx, targetType, lambdaForLevel);
+            if (scored.cost < costIn) {
               assert(
-                  candidate.by % targetType.dctSelectHeight == 0 &&
-                      candidate.bx % targetType.dctSelectWidth == 0,
+                  scored.block.by % targetType.dctSelectHeight == 0 &&
+                      scored.block.bx % targetType.dctSelectWidth == 0,
                   'merge candidate not aligned to its own dctSelect '
                   'footprint');
-              candidate.commit(quant, mult, dcIntNext, bw);
-              updateLiveGrid(candidate);
-              merged = candidate;
+              scored.block.commit(scored.quant, scored.mult, dcIntNext, bw);
+              updateLiveGrid(scored.block);
+              merged = scored.block;
             }
           }
         }
