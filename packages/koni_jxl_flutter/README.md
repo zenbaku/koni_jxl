@@ -48,6 +48,16 @@ participate in Flutter's `ImageCache` normally.
   encoding in a background isolate.
 - **`encodeJxlLossyFromRgba` / `encodeJxlLossyFromUiImage`** — lossy
   (VarDCT) encoding in a background isolate (RGB-only; alpha is dropped).
+- **`JxlPagePrefetcher`** — decodes upcoming pages of a sequential reader
+  (manga chapters, documents) on background isolates ahead of display,
+  keeping a window of pages decoded around the current one and
+  cancelling/evicting as the reader navigates:
+
+  ```dart
+  final prefetcher = JxlPagePrefetcher.fromFiles(pageFiles);
+  prefetcher.setCurrentIndex(currentPage);
+  final ui.Image page = await prefetcher.imageFor(currentPage);
+  ```
 
 Full lossless (bit-exact) and lossy (VarDCT) decoding, animation,
 splines and streaming come from the underlying

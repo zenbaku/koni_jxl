@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2
+
+- **`JxlPagePrefetcher`** — decodes upcoming pages of a sequential reader
+  (manga chapters, documents, etc.) on background isolates ahead of when
+  they're displayed. `setCurrentIndex` keeps a
+  `[index - behindCount, index + aheadCount]` window decoded or decoding,
+  cancelling in-flight decodes and evicting cached results outside the
+  window as the reader navigates; `imageFor` returns the decoded image
+  whether or not it was prefetched. `.fromBytesList` / `.fromFiles` /
+  `.fromAssets` constructors. Cancellation interrupts an in-flight decode
+  within 1-2ms. Falls back to on-demand decode on the web, which has no
+  isolates.
+- Picked up `koni_jxl` 0.1.2's decoder correctness fixes and ~18-24%
+  faster real-manga decode (see that package's changelog).
+
 ## 0.1.1
 
 - **`decodeJxlToUiCodec`** — decode to a `ui.Codec`, the shape custom

@@ -66,24 +66,26 @@ playback, background-isolate encode), use
   weighted-predictor DC prediction, a per-AC-coefficient rate-distortion
   search (RDOQ, on by default), adaptive 8x8/16x16 transform-size
   selection (on by default), multi-group and multi-LF-group support
-- Gaborish/EPF filters and larger square transform sizes up to 256x256
-  (`maxTransformSize`, opt-in) are implemented but **off by default** —
-  filters measurably help photographic content but hurt manga's
-  screentone/line-art content; bigger transforms help synthetic/corpus
-  content with large flat regions but were found, against real manga
-  chapter pages, to win only -0.0% to -0.6% there for a 40-100%+
-  encode-time cost depending on how far the cascade is raised (see
+- **All 27 VarDCT transform types now exist and are `djxl`-verified
+  correct**: every square DCT size up to 256x256 (`maxTransformSize`),
+  all 12 rectangular types (`enableRectangularTransforms`), and all 9
+  bespoke types — DCT4x4, DCT2x2, Hornuss, DCT4x8/DCT8x4, AFV0-3
+  (`enableBespokeTransforms`). Only 8x8/16x16 selection is **on by
+  default**: Gaborish/EPF filters measurably help photographic content
+  but hurt manga's screentone/line-art content; the larger/rectangular/
+  bespoke transforms were found, against real manga chapter pages, to
+  win only -0.0% to -0.86% there (best combination, at 6.1x baseline
+  encode time) — real but small next to the cost, so every one of these
+  knobs stays off by default (see
   [doc/spec_notes.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/spec_notes.md)
-  in the repository for both sets of numbers)
+  in the repository for the full numbers)
 - Correctness is djxl-verified; **compression efficiency is a work in
   progress, with real wins already banked** — on manga-typical
   screentone content at low-to-mid `distance` (0.5-2.0), files are
   already *smaller* than `cjxl -e1` (0.81-0.94x, measured); on smooth
-  photographic content the gap is larger (1.5x+), mostly structural
-  (only 6 of 27 transform types implemented — 8x8/16x16 on by default,
-  32x32/64x64/128x128/256x256 opt-in — no transform-type RD search yet).
-  Full 27-transform-type support is tracked as a completeness goal
-  independent of manga ROI. See
+  photographic content the gap is larger (1.5x+), mostly structural (no
+  transform-type or per-block quantization rate-distortion search yet).
+  See
   [doc/BENCHMARKS.md](https://github.com/zenbaku/koni_jxl/blob/main/doc/BENCHMARKS.md)
   in the repository for the full, reproducible comparison
 

@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.1.2
+
+### Decoding
+
+- Fixed 7 Java-int-truncation overflow bugs in modular (lossless)
+  prediction and entropy reconstruction: the weighted predictor's `eSum`
+  masking (the original crash) and its subpred/n3 truncation, the simple
+  predictor's averaging/gradient cases, MA-tree property computation
+  (including cross-channel gradient), the core per-pixel decode loop, and
+  hybrid-uint reconstruction's final mask. Found while auditing
+  float-sample support (packed values approach the full ±2^31 range,
+  unlike ordinary 8/16-bit samples) and verified against jxlatte/libjxl
+  source; includes a genuine bug inherited from jxlatte, where the
+  hybrid-integer extra-bit count now correctly wraps via `n &= 31`
+  (matching libjxl) instead of rejecting anything over 32.
+- Fixed 32-bit bitwise-op truncation on the `dart2js` web target.
+  `dart2js` compiles `int` to a JS double and coerces every bitwise
+  operator through JS's `ToInt32`/`ToUint32`, silently corrupting the bit
+  reader, the weighted predictor (decode and encode), VLC/hybrid-integer
+  sentinels, and `XorShiro`'s 64-bit noise constants whenever a value or
+  shift amount left 32-bit range — latent on `dart2wasm` (real 64-bit
+  ints, this project's actual web target), live on `dart2js`. Found with
+  a new differential oracle comparing native vs. `dart2js` output on the
+  corpus.
+- 18-24% faster real-manga decode (~0.3s → ~0.25s): skip redundant
+  integer divisions in the AC coefficient context computation for the
+  (common, for JPEG-transcoded manga content) single-block case, and
+  replace six full-block-list scans with a precomputed per-LF-group
+  index. Lossless decode is also 2-4% faster generally from a matching
+  fix to `MaTree.compactify()`.
+
+### Encoding
+
+- **Fixed 16x16 transform-size selection, now on by default.** Replaced
+  the old pre-quantization coefficient-magnitude proxy — which
+  over-selected 16x16 on manga content (+20% screentone, +31% line art)
+  — with a real bootstrap-frozen bit-rate estimate plus a whole-image
+  real-assembly safety net, so enabling this can never produce a larger
+  file than leaving it off. `VardctL0Config.enableVariableTransforms` now
+  defaults to **true**: 4-27% smaller with better RMSE on photographic
+  content across `distance` 0.5-8.0, never worse on screentone/line-art;
+  narrows the gap to `cjxl -e1` from 1.52x-2.79x to 1.18x-1.82x on the
+  benchmark corpus. A further cascade refinement (candidate scoring now
+  uses a live, incrementally-updated neighbor-prediction grid instead of
+  a frozen bootstrap snapshot) shrinks output up to a further ~4% on
+  multi-level transform-size configurations.
+- **All 27 VarDCT transform types now exist and are `djxl`-verified
+  correct** (up from 8x8/16x16 only): every remaining square size (32x32
+  through 256x256, `maxTransformSize`), all 12 rectangular types
+  (`enableRectangularTransforms`), and all 9 bespoke types — DCT4x4,
+  DCT2x2, Hornuss, DCT4x8/DCT8x4, AFV0-3 (`enableBespokeTransforms`).
+  This completes the full-format-coverage goal tracked since 0.1.1's L3
+  milestone. A real-manga ROI evaluation across 144 encodes of real
+  chapter pages found real but small wins (best combination: -0.86% at
+  6.1x baseline encode time) — every one of these knobs stays **off by
+  default**; existence and default-on-ness remain separate questions.
+  See `ROADMAP.md`/`doc/spec_notes.md` for the full numbers.
+
 ## 0.1.1
 
 ### API
