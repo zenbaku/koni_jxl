@@ -61,6 +61,7 @@ class VardctL0Config {
     this.rdHfMultLambdaOverride,
     this.perceptualMask = false,
     this.maskParamsOverride,
+    this.spatialMask = false,
     this.enableRdoq = true,
     this.rdoqLambdaOverride,
   });
@@ -311,6 +312,26 @@ class VardctL0Config {
   /// curve shape in one process, not a recompile. Null (the default) uses the
   /// shipped constants.
   final ({double hi, double knee, double gamma})? maskParamsOverride;
+
+  /// Whether [perceptualMask] derives its per-block masking signal from a
+  /// **spatially blurred** local-activity measure (Y-plane pixel-gradient
+  /// energy averaged over the 3x3 block neighborhood) instead of the block's
+  /// own AC energy. Only meaningful when [perceptualMask] is on. Defaults to
+  /// **off**.
+  ///
+  /// Rationale: a smooth block sitting next to busy texture is perceptually
+  /// *masked* (nearby high-frequency detail hides its quantization error),
+  /// while an equally-smooth block in a uniformly smooth region genuinely
+  /// needs precision (banding). The per-block AC-energy signal can't tell
+  /// these apart — both have low own-energy — so it protects both equally.
+  /// The blurred neighborhood signal distinguishes them, which is where the
+  /// masking win at higher quality (more uniform content, e.g. manga's actual
+  /// operating point) is expected to come from. The knee in
+  /// [maskParamsOverride] is interpreted in RMS-pixel-gradient units (0-255
+  /// scale) when this is on, not the AC-energy `relEnergy` units. Falls back
+  /// to per-block AC energy for any non-8x8 block (mixed variable-transform
+  /// layouts).
+  final bool spatialMask;
 
   /// Whether to run a rate-distortion coefficient-dropping pass ("RDOQ")
   /// over each block's already-committed AC coefficients (from the L2
@@ -999,7 +1020,8 @@ Uint8List _finishEncode(
         config.rdHfMultLambdaOverride,
         config.perceptualMask,
         config.maskParamsOverride,
-        config.acScale);
+        config.acScale,
+        config.spatialMask);
   }
 
   // 5.8. Optional: a rate-distortion coefficient-dropping pass ("RDOQ")
@@ -3715,7 +3737,8 @@ void _chooseHfMultRd(
     double? lambdaOverride,
     bool perceptualMask,
     ({double hi, double knee, double gamma})? maskOverride,
-    double acScale) {
+    double acScale,
+    bool spatialMask) {
   final predictedOut = <_PlacedBlock, Int32List>{};
   final bootstrapTokens = <_GroupTokens>[
     for (var gy = 0; gy < groupsY; gy++)
@@ -3741,6 +3764,59 @@ void _chooseHfMultRd(
       ? kLambda * acScale * acScale
       : kLambda * refStep * refStep;
 
+  // Spatial masking pre-pass: per-8x8-cell Y pixel-gradient activity, blurred
+  // over the 3x3 block neighborhood, so a block's masking reflects how busy its
+  // SURROUNDINGS are (a smooth block next to texture is masked), not just its
+  // own smoothness. Only the uniform 8x8 grid participates; non-8x8 blocks fall
+  // back to per-block AC energy in the loop. RMS-pixel-gradient units, 0-255.
+  Float32List? spatialRel;
+  if (maskParams != null && spatialMask) {
+    final yPlane = planes[1];
+    final bh = yPlane.length ~/ 8;
+    final act = Float32List(bw * bh);
+    for (var by = 0; by < bh; by++) {
+      for (var bx = 0; bx < bw; bx++) {
+        final x0 = bx * 8, y0 = by * 8;
+        var e = 0.0;
+        for (var y = 0; y < 8; y++) {
+          final row = yPlane[y0 + y];
+          final prevRow = y > 0 ? yPlane[y0 + y - 1] : null;
+          for (var x = 0; x < 8; x++) {
+            final v = row[x0 + x];
+            if (x > 0) {
+              final d = v - row[x0 + x - 1];
+              e += d * d;
+            }
+            if (prevRow != null) {
+              final d = v - prevRow[x0 + x];
+              e += d * d;
+            }
+          }
+        }
+        act[by * bw + bx] = e;
+      }
+    }
+    // 8x8 block has 8*7*2 = 112 gradient terms; blur then convert to RMS.
+    spatialRel = Float32List(bw * bh);
+    for (var by = 0; by < bh; by++) {
+      for (var bx = 0; bx < bw; bx++) {
+        var sum = 0.0;
+        var n = 0;
+        for (var dy = -1; dy <= 1; dy++) {
+          final ny = by + dy;
+          if (ny < 0 || ny >= bh) continue;
+          for (var dx = -1; dx <= 1; dx++) {
+            final nx = bx + dx;
+            if (nx < 0 || nx >= bw) continue;
+            sum += act[ny * bw + nx];
+            n++;
+          }
+        }
+        spatialRel[by * bw + bx] = math.sqrt(sum / (n * 112));
+      }
+    }
+  }
+
   final chosenHistogram = const bool.fromEnvironment('jxl.encdebug')
       ? <int, int>{for (final m in _rdHfMultCandidates) m: 0}
       : null;
@@ -3751,26 +3827,33 @@ void _chooseHfMultRd(
     final predicted = predictedOut[block]!;
 
     // Per-block perceptual masking weight on distortion (constant across this
-    // block's candidates). Uses the same relative-Y-AC-energy signal the L2
-    // heuristic buckets on (`_PlacedBlock.chooseCandidate`). 1.0 when masking
-    // is off, so this is a pure no-op vs. round 3's plain weighted-MSE search.
+    // block's candidates). 1.0 when masking is off, so this is a pure no-op
+    // vs. round 3's plain weighted-MSE search. The signal is either the
+    // spatially-blurred neighborhood activity (spatialMask, 8x8 blocks) or the
+    // block's own relative-Y-AC-energy — the same signal the L2 heuristic
+    // buckets on (`_PlacedBlock.chooseCandidate`).
     var maskWeight = 1.0;
     if (maskParams != null) {
-      final tt = block.tt;
-      final ph = tt.pixelHeight, pw = tt.pixelWidth;
-      final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
-      final y1 = coeffBuf[1];
-      var acEnergy = 0.0;
-      for (var y = 0; y < ph; y++) {
-        final row = y1[y];
-        for (var x = 0; x < pw; x++) {
-          if (y < llfH && x < llfW) continue;
-          acEnergy += row[x] * row[x];
+      double signal;
+      if (spatialRel != null && block.tt.type == _tt8.type) {
+        signal = spatialRel[block.by * bw + block.bx];
+      } else {
+        final tt = block.tt;
+        final ph = tt.pixelHeight, pw = tt.pixelWidth;
+        final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+        final y1 = coeffBuf[1];
+        var acEnergy = 0.0;
+        for (var y = 0; y < ph; y++) {
+          final row = y1[y];
+          for (var x = 0; x < pw; x++) {
+            if (y < llfH && x < llfW) continue;
+            acEnergy += row[x] * row[x];
+          }
         }
+        signal = math.sqrt(acEnergy) / refStep;
       }
-      final relEnergy = math.sqrt(acEnergy) / refStep;
-      maskWeight = _maskWeight(
-          relEnergy, maskParams.hi, maskParams.knee, maskParams.gamma);
+      maskWeight =
+          _maskWeight(signal, maskParams.hi, maskParams.knee, maskParams.gamma);
     }
 
     var bestCost = double.infinity;

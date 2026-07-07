@@ -389,11 +389,13 @@ void main() {
     // plus a runtime maskParamsOverride. Correctness only — the shipped
     // default stays off pending multi-distance calibration
     // (tool/calibrate_perceptual_mask.dart).
-    for (final (w, h, distance) in [
-      (256, 256, 1.0),
-      (264, 104, 1.0), // multi-group
-      (2056, 8, 1.0), // multi-LF-group
-      (256, 256, 4.0), // acScale != 1 -> exercises acScale^2 scaling
+    for (final (w, h, distance, spatial) in [
+      (256, 256, 1.0, false),
+      (264, 104, 1.0, false), // multi-group
+      (2056, 8, 1.0, false), // multi-LF-group
+      (256, 256, 4.0, false), // acScale != 1 -> exercises acScale^2 scaling
+      (256, 256, 2.0, true), // spatial-blur masking signal
+      (264, 104, 1.0, true), // spatial + multi-group (grid indexing)
     ]) {
       final pixels = _synthetic(w, h, 7);
       final base = VardctL0Config.fromDistance(distance);
@@ -406,7 +408,12 @@ void main() {
               enableVariableTransforms: false,
               enableRdHfMult: true,
               perceptualMask: true,
-              maskParamsOverride: (hi: 8.0, knee: 1.5, gamma: 2.0)));
+              spatialMask: spatial,
+              maskParamsOverride: (
+                hi: 8.0,
+                knee: spatial ? 8.0 : 1.5,
+                gamma: 2.0
+              )));
       final image = JxlDecoder.decode(encoded);
       expect(image.width, w);
       expect(image.height, h);

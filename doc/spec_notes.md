@@ -3283,11 +3283,45 @@ a crude stand-in for libjxl's continuous per-block field, and the masking
 signal here is per-block Y AC energy rather than libjxl's blurred spatial
 activity. Going further needs: (a) a finer/continuous quant candidate set, (b)
 a real spatial masking model, and (c) joint `(K, lambda, hi)` calibration per
-quality target. The coarsen-baseline lever is prototyped in
-`tool/bench_perceptual_rd.dart` only — it is **not** yet an encoder API knob.
-`perceptualMask` (the distortion term) is committed as an opt-in; the
-coarsen-baseline productionization is deferred pending the above. All 391+1
-tests green; `dart analyze` clean.
+quality target.
+
+**Productionization started (same session).** Two of those three explored:
+
+- **Candidate-set expansion (a): not a clean standalone win, folded into
+  calibration.** Widening `_rdHfMultCandidates` from `{1,2,4}` to
+  `{1,2,3,4,6,8}` is a *superset*, so it can only improve the RD search's own
+  objective (`distortion + lambda*rate`) — but that objective is weighted-MSE,
+  not ssimulacra2, and at a *fixed* lambda the finer set just shifts the
+  operating point up the curve (the K=3/d=2 color_cover win went -14.6% ->
+  -5.4% not because the curve worsened but because the point moved to higher
+  quality/more bytes). Fair evaluation needs a full lambda sweep per candidate
+  set — so this is a *dimension of calibration (c)*, not an isolated change.
+  Reverted to `{1,2,4}` pending that.
+
+- **Spatial masking signal (b): a real improvement, committed as opt-in
+  `VardctL0Config.spatialMask`.** Replaces the per-block Y-AC-energy mask
+  signal with a **3x3-block-blurred Y pixel-gradient activity** (libjxl-style
+  spatial masking, computed cheaply from pixels — no second DCT). Rationale: a
+  smooth block next to busy texture is perceptually *masked*; one in a
+  uniformly smooth region needs precision — the own-energy signal can't tell
+  them apart, the blurred neighborhood signal can. Measured (`tool/bench_
+  perceptual_rd.dart`, ssimulacra2): on `color_cover` it both **enlarges the
+  win and pushes it to higher quality** — K=2/d=2 goes -9.6% (AC-energy) ->
+  **-16.7% (spatial)** at matched ss2, landing at ss2~88.5 vs the AC signal's
+  ~87.2, with butteraugli corroborating (1.65 vs 2.05); on line art (manga
+  proxy) it is byte-neutral but markedly cleaner perceptually (butteraugli
+  ~0.6 vs ~1.4). Falls back to per-block AC energy for non-8x8 blocks; knee is
+  in RMS-pixel-gradient units (0-255) not `relEnergy` units when on. Default
+  off, djxl round-trip gated (the opt-in correctness test now covers spatial +
+  multi-group grid indexing).
+
+Still deferred: joint `(K, lambda, hi[, candidate-set])` calibration on the
+perceptual axis (the prerequisite for flipping any default on), and turning
+the tool-only coarsen-baseline composition into a single high-level encoder
+option. `perceptualMask`/`spatialMask` (the distortion terms) are committed as
+opt-ins; the coarsen-baseline lever itself is still expressed via the existing
+`acScale`/`quantLF` decoupling (which is why no new "coarsen" knob was
+added — it would be redundant). All 405 tests green; `dart analyze` clean.
 
 ## Robustness
 

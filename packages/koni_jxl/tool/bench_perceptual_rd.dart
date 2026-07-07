@@ -68,20 +68,21 @@ void main() {
       print('  ${_p(d, 4)} | ${_b(r.bytes)} | ${_f2(r.ss)} | ${_f3(r.ba)}');
     }
 
-    print('-- coarsen-mask (baseline acScale/K + mask-RD refine) --');
-    print('   K  dist  lam  hi |    bytes | ssim2  | butter | vs-heur@ssim2');
-    // Coarsen factor K, at a target distance chosen so the coarse baseline
-    // lands near the quality band we care about. lam in acScale^2 units.
+    print('-- coarsen-mask: AC-energy (E) vs spatial-blur (S) signal --');
+    print('  sig  K  dist |    bytes | ssim2  | butter | vs-heur@ssim2');
     for (final K in <double>[1.5, 2.0, 3.0]) {
       for (final d
           in (sparse ? <double>[1.0, 2.0] : <double>[0.75, 1.5, 2.5])) {
-        final r = _koni(px, w, h, _coarsenMask(d, K, lam: 0.08, hi: 8.0));
-        final vs = _bytesAtSs(heur, r.ss);
-        final tag = vs == null
-            ? '(off-curve)'
-            : '${_pct(r.bytes, vs)} (${_b(vs)}B heur)';
-        print('  ${_p(K, 2)} ${_p(d, 4)} 0.08  8 | ${_b(r.bytes)} | '
-            '${_f2(r.ss)} | ${_f3(r.ba)} | $tag');
+        for (final spatial in [false, true]) {
+          final r = _koni(px, w, h,
+              _coarsenMask(d, K, lam: 0.08, hi: 8.0, spatial: spatial));
+          final vs = _bytesAtSs(heur, r.ss);
+          final tag = vs == null
+              ? '(off-curve)'
+              : '${_pct(r.bytes, vs)} (${_b(vs)}B heur)';
+          print('   ${spatial ? 'S' : 'E'}  ${_p(K, 2)} ${_p(d, 4)} | '
+              '${_b(r.bytes)} | ${_f2(r.ss)} | ${_f3(r.ba)} | $tag');
+        }
       }
     }
   }
@@ -104,7 +105,7 @@ int? _bytesAtSs(List<(int, double)> pts, double ss) {
 }
 
 VardctL0Config _coarsenMask(double dTarget, double K,
-    {required double lam, required double hi}) {
+    {required double lam, required double hi, bool spatial = false}) {
   final base = VardctL0Config.fromDistance(dTarget);
   return VardctL0Config(
     quantLF: base.quantLF, // keep DC/LF fine (banding lives here)
@@ -113,7 +114,12 @@ VardctL0Config _coarsenMask(double dTarget, double K,
     enableRdHfMult: true,
     rdHfMultLambdaOverride: lam,
     perceptualMask: true,
-    maskParamsOverride: (hi: hi, knee: 1.5, gamma: 2.0),
+    // Spatial knee is in RMS-pixel-gradient units (0-255); AC-energy knee is
+    // in relEnergy units. Different scales, so different knee per signal.
+    maskParamsOverride: spatial
+        ? (hi: hi, knee: 8.0, gamma: 2.0)
+        : (hi: hi, knee: 1.5, gamma: 2.0),
+    spatialMask: spatial,
   );
 }
 
