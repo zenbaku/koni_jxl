@@ -920,21 +920,37 @@ output for where the gap actually is.
   round 18. Page 017 `+bespoke` goes +3.9% → **exactly baseline (0%)**;
   the color-chapter win (-1.5%) is preserved; bespoke-off configs stay
   bit-identical. See doc/spec_notes.md's round 19 entry.
-- 🔲 **Remaining: is transform selection even the biggest lever left?**
-  Round 19 restored the never-worse guarantee but did not, on its own,
-  make the wins large enough to flip `enableBespokeTransforms`/
-  `enableRectangularTransforms` on by default. The open question round 17
-  flagged is now the load-bearing one: the remaining gap to `cjxl -e7`
-  (0.37-0.54x per doc/BENCHMARKS.md) may not be primarily a
-  transform-selection problem at all. Candidates that may be bigger levers
-  than searching transform type/size harder: `enableRdHfMult`'s own
-  still-unresolved distance-scaling gap (start from `acScale^2` scaling,
-  not `refStep^2` — see the hfMult follow-up in doc/spec_notes.md), or a
-  real per-block quantization rate-distortion search. A genuinely-unified
-  transform search is no longer the obvious next step — round 19 showed
-  the transform-selection regressions were a missing-candidate problem, not
-  an insufficiently-joint-estimate problem, so more joint estimation is
-  unlikely to be where the remaining compression lives.
+- ✅ **Answered (round 20): transform selection is *not* the lever, and the
+  manga `cjxl -e7` gap is not a quantization problem at all — the
+  compression thread is closed for the manga use case.** Round 19's open
+  question ("is transform selection even the biggest lever left?") drove a
+  full investigation of the other candidate — per-block quantization RD —
+  with three durable results (full write-up: doc/spec_notes.md round 20):
+  1. **The gap was mis-measured.** BENCHMARKS' "vs `cjxl -e1`" figures
+     compared at matched *distance*; koni maps distance to a finer quality
+     point. At matched **RMSE** koni actually beats `cjxl -e1`; the real gap
+     is to `cjxl -e7` (~1.9-2.7x), worst at high quality.
+  2. **Round 3's `enableRdHfMult` blocker is resolved** — a perceptual
+     masking distortion term (`VardctL0Config.perceptualMask`, +
+     `spatialMask` for blurred spatial activity, `acScale^2` scaling) gives
+     a real, banding-safe **photo** win (−13% to −22% at matched
+     ssimulacra2). Both shipped as **opt-ins, default off** (djxl-gated).
+  3. **The lever is photo-only and actively *hurts* manga.** `hfMult` is
+     refine-only, so the win needs coarsening the AC baseline + mask-driven
+     refinement — validated on a new perceptual pipeline (ssimulacra2/
+     butteraugli). On **real** `manga_samples/` pages it loses **+10-25%**
+     at matched ssimulacra2: manga screentone is high-frequency *essential
+     signal*, which masking mis-classifies as coarsenable texture. (The
+     synthetic line-art proxy said "neutral" — the DCT32/round-7 lesson
+     again: synthetic understated the real cost.)
+  Net: koni's heuristic already keeps screentone AC fine and is competitive/
+  winning on manga content; the remaining `e7` headroom is on continuous-
+  tone/photo content koni doesn't target. **Do not re-open this as a
+  transform-selection or quant-field problem for manga.** New permanent
+  infrastructure: an ssimulacra2/butteraugli perceptual-RD measurement
+  pipeline (`tool/bench_perceptual_rd.dart`, `calibrate_perceptual_mask.dart`,
+  `calibrate_coarsen_mask.dart`, `validate_manga_perceptual.dart`) reusable
+  for any future lossy-quality work.
 
 ---
 
