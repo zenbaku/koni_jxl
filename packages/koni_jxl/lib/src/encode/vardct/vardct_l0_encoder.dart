@@ -59,6 +59,8 @@ class VardctL0Config {
     this.enableBespokeTransforms = false,
     this.enableRdHfMult = false,
     this.rdHfMultLambdaOverride,
+    this.perceptualMask = false,
+    this.maskParamsOverride,
     this.enableRdoq = true,
     this.rdoqLambdaOverride,
   });
@@ -284,6 +286,31 @@ class VardctL0Config {
   /// so `tool/calibrate_rd_lambda.dart` can sweep it in one process).
   /// Null (the default) uses the shipped, calibrated constant.
   final double? rdHfMultLambdaOverride;
+
+  /// Whether the [enableRdHfMult] search weights each block's distortion by
+  /// a perceptual **masking** factor before the `distortion + lambda * rate`
+  /// trade (see `_maskWeight`). Only meaningful when [enableRdHfMult] is also
+  /// on. Defaults to **off**.
+  ///
+  /// This is the banding-aware distortion term round 3 identified as the
+  /// missing piece (see `_chooseHfMultRd`'s doc comment and
+  /// doc/spec_notes.md): plain weighted-squared-error, at a lambda that wins
+  /// on photo content, strips the L2 heuristic's smooth-block precision
+  /// boosts because it can't see that banding is far more objectionable than
+  /// its raw MSE contribution. The masking weight amplifies the distortion of
+  /// smooth/low-AC-energy blocks (restoring banding protection) and reverts
+  /// to plain weighted-MSE (weight ~1) in busy blocks where masking genuinely
+  /// hides quantization noise — a continuous generalization of the L2
+  /// 3-bucket relative-AC-energy heuristic, driven by an RD search rather
+  /// than fixed thresholds.
+  final bool perceptualMask;
+
+  /// Overrides the perceptual masking curve's `(hi, knee, gamma)` constants
+  /// (`_kMaskHi`/`_kMaskKnee`/`_kMaskGamma`) used by [perceptualMask] — a
+  /// runtime knob for `tool/calibrate_perceptual_mask.dart` to sweep the
+  /// curve shape in one process, not a recompile. Null (the default) uses the
+  /// shipped constants.
+  final ({double hi, double knee, double gamma})? maskParamsOverride;
 
   /// Whether to run a rate-distortion coefficient-dropping pass ("RDOQ")
   /// over each block's already-committed AC coefficients (from the L2
@@ -969,7 +996,10 @@ Uint8List _finishEncode(
         groupsX,
         groupsY,
         blocksByGroup,
-        config.rdHfMultLambdaOverride);
+        config.rdHfMultLambdaOverride,
+        config.perceptualMask,
+        config.maskParamsOverride,
+        config.acScale);
   }
 
   // 5.8. Optional: a rate-distortion coefficient-dropping pass ("RDOQ")
@@ -3544,6 +3574,40 @@ double _tokenRate(
 /// set is deferred — see doc/spec_notes.md).
 const _rdHfMultCandidates = [1, 2, 4];
 
+/// Perceptual masking curve constants (see [VardctL0Config.perceptualMask]
+/// and [_maskWeight]). Placeholders pending calibration
+/// (`tool/calibrate_perceptual_mask.dart`); overridable at runtime via
+/// [VardctL0Config.maskParamsOverride].
+///
+/// - [_kMaskHi]: distortion amplification for a maximally-smooth block
+///   (relEnergy -> 0). Must be large enough to make the RD search keep a
+///   smooth block's precision boost that plain weighted-MSE (weight 1) threw
+///   away — i.e. to overcome the rate cost round 3's photo-favorable lambda
+///   couldn't justify on absolute-MSE grounds alone.
+/// - [_kMaskKnee]: the relative-AC-energy value at which the weight is halfway
+///   between [_kMaskHi] and 1. Sits near the L2 heuristic's own thresholds
+///   (1.0 / 4.0) so the masking transition tracks where the heuristic already
+///   switches buckets.
+/// - [_kMaskGamma]: transition sharpness. Higher = a more step-like cutoff
+///   between "protected as smooth" and "left to masking".
+const _kMaskHi = 8.0;
+const _kMaskKnee = 1.5;
+const _kMaskGamma = 2.0;
+
+/// Perceptual masking multiplier applied to a block's RD distortion, as a
+/// continuous function of its relative AC energy (`relEnergy = sqrt(Y AC
+/// energy) / refStep`, the exact signal the L2 3-bucket heuristic buckets on
+/// — see `_PlacedBlock.chooseCandidate`).
+///
+/// Smooth/banding-prone blocks (low `relEnergy`) get their distortion
+/// amplified toward [hi] so the `distortion + lambda * rate` trade favors
+/// keeping their precision; busy blocks (high `relEnergy`) revert to plain
+/// weighted-MSE (weight -> 1) since visual masking hides quantization noise
+/// there. Monotonically decreasing in `relEnergy`; equals `1 + (hi-1)/2` at
+/// `relEnergy == knee`.
+double _maskWeight(double relEnergy, double hi, double knee, double gamma) =>
+    1.0 + (hi - 1.0) / (1.0 + math.pow(relEnergy / knee, gamma).toDouble());
+
 /// Lagrange multiplier trading rate for distortion (`cost = distortion +
 /// lambda * rate`), scaled by `refStep^2` (standard scalar-quantizer RD
 /// theory: the rate/distortion trade-off's slope near a given step size
@@ -3648,7 +3712,10 @@ void _chooseHfMultRd(
     int groupsX,
     int groupsY,
     List<List<_PlacedBlock>> blocksByGroup,
-    double? lambdaOverride) {
+    double? lambdaOverride,
+    bool perceptualMask,
+    ({double hi, double knee, double gamma})? maskOverride,
+    double acScale) {
   final predictedOut = <_PlacedBlock, Int32List>{};
   final bootstrapTokens = <_GroupTokens>[
     for (var gy = 0; gy < groupsY; gy++)
@@ -3661,7 +3728,18 @@ void _chooseHfMultRd(
   final lengths = bootstrap.codes.tokenBitLengths();
   final clusterMap = bootstrap.clusterMap;
   final kLambda = lambdaOverride ?? _kRdLambda;
-  final lambda = kLambda * refStep * refStep;
+  // The masking path uses acScale^2 scaling (round 3's mandated fix: refStep^2
+  // grows the rate/distortion trade in the *opposite* direction from how this
+  // metric scales with the dequant table as distance rises, causing a
+  // high-distance banding-protection collapse — see _kRdLambda's doc comment).
+  // The plain (non-mask) path keeps refStep^2 so round 3's calibrated (if
+  // unshipped) _kRdLambda is undisturbed.
+  final maskParams = perceptualMask
+      ? (maskOverride ?? (hi: _kMaskHi, knee: _kMaskKnee, gamma: _kMaskGamma))
+      : null;
+  final lambda = perceptualMask
+      ? kLambda * acScale * acScale
+      : kLambda * refStep * refStep;
 
   final chosenHistogram = const bool.fromEnvironment('jxl.encdebug')
       ? <int, int>{for (final m in _rdHfMultCandidates) m: 0}
@@ -3672,6 +3750,29 @@ void _chooseHfMultRd(
     final rawWeight = ctx.rawWeight;
     final predicted = predictedOut[block]!;
 
+    // Per-block perceptual masking weight on distortion (constant across this
+    // block's candidates). Uses the same relative-Y-AC-energy signal the L2
+    // heuristic buckets on (`_PlacedBlock.chooseCandidate`). 1.0 when masking
+    // is off, so this is a pure no-op vs. round 3's plain weighted-MSE search.
+    var maskWeight = 1.0;
+    if (maskParams != null) {
+      final tt = block.tt;
+      final ph = tt.pixelHeight, pw = tt.pixelWidth;
+      final llfH = tt.dctSelectHeight, llfW = tt.dctSelectWidth;
+      final y1 = coeffBuf[1];
+      var acEnergy = 0.0;
+      for (var y = 0; y < ph; y++) {
+        final row = y1[y];
+        for (var x = 0; x < pw; x++) {
+          if (y < llfH && x < llfW) continue;
+          acEnergy += row[x] * row[x];
+        }
+      }
+      final relEnergy = math.sqrt(acEnergy) / refStep;
+      maskWeight = _maskWeight(
+          relEnergy, maskParams.hi, maskParams.knee, maskParams.gamma);
+    }
+
     var bestCost = double.infinity;
     var bestMult = _rdHfMultCandidates[0];
     ({List<double> dc, List<Int32List> ac, double distortion})? bestCandidate;
@@ -3680,7 +3781,7 @@ void _chooseHfMultRd(
           block.quantizeCandidate(coeffBuf, mult, sd, rawWeight, scaleFactor);
       final rate =
           _blockRate(ctx, hfctx, candidate.ac, predicted, clusterMap, lengths);
-      final cost = candidate.distortion + lambda * rate;
+      final cost = maskWeight * candidate.distortion + lambda * rate;
       if (cost < bestCost) {
         bestCost = cost;
         bestMult = mult;

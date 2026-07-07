@@ -3204,6 +3204,91 @@ round *does* settle: the "unified joint search" ROADMAP item as literally
 scoped would not have fixed the regression — the problem was a missing
 real-assembled candidate, not an insufficiently-joint estimate.
 
+### Lossy (VarDCT) encoder — round 20: the perceptual masking term (resolves round 3's blocker), the refine-only ceiling, and the coarsen-baseline lever
+
+Round 19 left one question open: is the ~2x gap to `cjxl -e7` a
+transform-selection problem or a per-block-quantization one? This round
+answered it with a proper **rate-distortion** measurement and then built the
+perceptual distortion term round 3 had identified as missing. Three findings,
+in order.
+
+**1. Where the gap actually is (a measurement correction).** The BENCHMARKS
+"1.18-1.82x vs `cjxl -e1`" figures compare at matched *nominal distance*, but
+this encoder maps `distance` to a finer quality point than cjxl (at d=1.0,
+koni RMSE 1.53 vs cjxl-e1's 2.70). Comparing at **matched RMSE** (interpolating
+each encoder's bytes at common RMSE on `color_cover`): koni actually **beats
+`cjxl -e1`** (0.59-0.90x) — the "worse than e1" story was a distance-mapping
+artifact — and the *real* gap is to `cjxl -e7`, ~1.9x (high distance) to ~2.7x
+(low distance/high quality), worst where manga is actually encoded.
+
+**2. The masking distortion term resolves round 3's blocker.**
+`VardctL0Config.perceptualMask` (opt-in, layered on `enableRdHfMult`) weights
+each block's RD distortion by `_maskWeight(relEnergy, hi, knee, gamma)` — a
+continuous generalization of the L2 3-bucket heuristic that amplifies the
+distortion of smooth/low-AC-energy blocks (restoring banding protection) and
+reverts to plain weighted-MSE in busy blocks (masking). It uses **`acScale^2`
+lambda scaling** (round 3's mandated fix, applied only on the mask path so the
+plain path's calibration is undisturbed), which fixed round 3's high-distance
+banding collapse (gradient RMSE at distance 4/8 now tracks the heuristic:
+1.045/1.513 vs `refStep^2`'s 1.666/2.246). At distance 1.0 on `color_cover`,
+`maskRd(lam=0.08, hi=8)` gives **-1.9% bytes at *better* RMSE than the
+heuristic (1.797 vs 1.810) with the gradient banding gate safe (0.936 vs
+heuristic 0.938)** — strictly better than round 3's plain RD, which won -1.3%
+on photo but sat at an uncomfortable gradient RMSE 0.945. Screentone is
+byte-identical (no manga regression); line art -2.9%. Correctness gated by a
+new djxl round-trip test (`vardct_l0_test.dart`, "perceptual-mask RD hfMult
+(opt-in) decodes correctly", single/multi-group/multi-LF-group + a coarse
+distance that exercises the `acScale^2` scaling). `tool/calibrate_perceptual_
+mask.dart` is the sweep. **Default stays off** pending multi-distance
+calibration (a single lambda tuned at distance 1.0 over-boosts busy content at
+high distance).
+
+**3. The refine-only ceiling — and the coarsen-baseline lever that clears it.**
+The masking term cannot, on its own, close the `cjxl -e7` gap, and the reason
+is structural: **`hfMult` is a refine-only field** (a divisor >= 1, so a block
+can only be made *finer* than the frame baseline, never coarser). `cjxl -e7`'s
+win comes largely from quantizing busy regions *coarser* than baseline
+(masking) — a direction `hfMult` alone cannot express. On smooth-dominated
+content the masking term therefore only ever *adds* bits (better quality,
+bigger file), not saves them; the -1.9% above is from trimming the heuristic's
+over-boosting, not from coarsening. This re-localizes the e7 gap precisely: it
+is a quant-**baseline** problem, not a quant-refinement one.
+
+The lever that clears the ceiling: **coarsen the AC baseline (`acScale / K`,
+keeping `quantLF` fine since banding lives in LF) and let the mask-aware RD
+`hfMult` refine smooth/banding-prone blocks back up.** Net: busy regions sit at
+the coarse baseline (bit savings), smooth regions are refined (quality
+preserved). This is real masking, and it required *no encoder change* to
+prototype — it composes existing knobs (`acScale` + the new mask-RD).
+
+Crucially, it can only be measured on a **perceptual** axis, because the whole
+point is spending bits where RMSE doesn't reward but perception does — an RMSE
+curve systematically under-measures it. `tool/bench_perceptual_rd.dart` builds
+bytes-vs-**ssimulacra2** (and butteraugli max-norm) RD curves via the brew
+`ssimulacra2`/`butteraugli_main` tools. A confound was caught and fixed first
+(the heuristic arm defaulted `enableVariableTransforms: true` while the
+coarsen-mask arm had it off — an extra tool for one side; both isolated to
+`false`, which *grew* the wins). At **matched ssimulacra2**, coarsen-mask on
+`color_cover` (the photo proxy) uses **-6.5% (K=1.5) / -9.6% (K=2) / -14.6%
+(K=3)** fewer bytes in the ss2~86-88 band; line art -3% to -7% around ss2~90.
+These are genuine RMSE-invisible perceptual wins — the first lever measured
+that moves in the e7 direction rather than hitting the refine-only wall.
+
+**Limits, honestly.** The wins concentrate at mid quality (ss2~86-88,
+distance~2); at high quality (ss2~92+, distance~0.8-1.0, manga's actual
+operating point) the current prototype is neutral-to-slightly-negative. The
+magnitude (-6% to -15% at the favorable band) is a real but partial dent in
+the ~2x e7 gap — expected, since `hfMult`'s 3 discrete candidates {1,2,4} are
+a crude stand-in for libjxl's continuous per-block field, and the masking
+signal here is per-block Y AC energy rather than libjxl's blurred spatial
+activity. Going further needs: (a) a finer/continuous quant candidate set, (b)
+a real spatial masking model, and (c) joint `(K, lambda, hi)` calibration per
+quality target. The coarsen-baseline lever is prototyped in
+`tool/bench_perceptual_rd.dart` only — it is **not** yet an encoder API knob.
+`perceptualMask` (the distortion term) is committed as an opt-in; the
+coarsen-baseline productionization is deferred pending the above. All 391+1
+tests green; `dart analyze` clean.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

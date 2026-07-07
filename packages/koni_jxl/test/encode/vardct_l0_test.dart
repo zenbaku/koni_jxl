@@ -379,6 +379,51 @@ void main() {
     }
   });
 
+  test('perceptual-mask RD hfMult (opt-in) decodes correctly', () {
+    if (!_haveDjxl) return;
+    // The masking distortion term (VardctL0Config.perceptualMask, layered on
+    // enableRdHfMult) uses acScale^2 lambda scaling and per-block masking
+    // weights — a distinct code path from the plain RD search above. Gate it
+    // for correctness across the same size shapes and at a coarse distance
+    // (where acScale != 1, so the acScale^2 scaling is genuinely exercised),
+    // plus a runtime maskParamsOverride. Correctness only — the shipped
+    // default stays off pending multi-distance calibration
+    // (tool/calibrate_perceptual_mask.dart).
+    for (final (w, h, distance) in [
+      (256, 256, 1.0),
+      (264, 104, 1.0), // multi-group
+      (2056, 8, 1.0), // multi-LF-group
+      (256, 256, 4.0), // acScale != 1 -> exercises acScale^2 scaling
+    ]) {
+      final pixels = _synthetic(w, h, 7);
+      final base = VardctL0Config.fromDistance(distance);
+      final encoded = encodeLossyVardctL0(pixels,
+          width: w,
+          height: h,
+          config: VardctL0Config(
+              quantLF: base.quantLF,
+              acScale: base.acScale,
+              enableVariableTransforms: false,
+              enableRdHfMult: true,
+              perceptualMask: true,
+              maskParamsOverride: (hi: 8.0, knee: 1.5, gamma: 2.0)));
+      final image = JxlDecoder.decode(encoded);
+      expect(image.width, w);
+      expect(image.height, h);
+      final dir = Directory.systemTemp.createTempSync('koni_mask');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.ppm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl failed for ${w}x$h: ${r.stderr}');
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }
+  });
+
   test('RDOQ coefficient dropping (opt-in) decodes correctly', () {
     if (!_haveDjxl) return;
     // Phase 1 gate (doc/spec_notes.md): correctness only, not yet a
