@@ -3315,13 +3315,42 @@ quality target.
   off, djxl round-trip gated (the opt-in correctness test now covers spatial +
   multi-group grid indexing).
 
-Still deferred: joint `(K, lambda, hi[, candidate-set])` calibration on the
-perceptual axis (the prerequisite for flipping any default on), and turning
-the tool-only coarsen-baseline composition into a single high-level encoder
-option. `perceptualMask`/`spatialMask` (the distortion terms) are committed as
-opt-ins; the coarsen-baseline lever itself is still expressed via the existing
-`acScale`/`quantLF` decoupling (which is why no new "coarsen" knob was
-added — it would be redundant). All 405 tests green; `dart analyze` clean.
+**Joint calibration (c): done — a strong photo win, but manga-neutral, so a
+blanket default is blocked (same shape as `enableFilters`).**
+`tool/calibrate_coarsen_mask.dart` builds the full perceptual RD *envelope*
+(bytes vs ssimulacra2) for the incumbent heuristic vs. the coarsen-mask-spatial
+lever over a joint `(K, lambda, distance)` sweep, and reports byte savings at
+matched ssimulacra2 (envelope rule applied identically to both arms: best bytes
+at quality `ss*` = min bytes among points with `ssim2 >= ss*`). Result:
+
+- **`color_cover` (photo proxy): a large, consistent win across ss2 85-89 —
+  -14.8% / -22.3% / -14.9% / -16.1% / -13.5%.** The winning config trends
+  sensibly: aggressive (K=2, lam=0.15) at low quality, gentle (K=1.5, lam=0.04)
+  toward higher quality.
+- **`lineArt` (manga proxy): roughly neutral — a couple small wins (-6.0% at
+  ss2 89, -0.6% at ss2 90-91) but also small *losses* (+2.6% at ss2 85-88,
+  +3.0% at ss2 92).**
+
+So the lever is a genuine, large win on photographic content but neutral-to-
+slightly-negative on line art — it **cannot be a blanket default-on** without
+regressing manga's dominant content, exactly the value judgment `enableFilters`
+already faced (help photo, hurt manga -> stays off). It is a legitimate,
+now-calibrated **opt-in for non-manga/photo content**. A future default-on
+would require **content-adaptive gating** (photo vs line-art/screentone
+detection), not a single global constant. Caveat, per this project's standing
+lesson (DCT32, round 7): the manga conclusion rests on a *synthetic* line-art
+proxy — real screentone has more mid-frequency texture that masking might
+exploit differently, so a real-`manga_samples/` perceptual check (a perceptual
+analogue of `bench_manga_roi.dart`) is the honest prerequisite before any
+default decision.
+
+Still deferred: the real-manga perceptual validation above, and — only if that
+clears — turning the tool-only coarsen-baseline composition into a single
+high-level encoder option with content-adaptive gating. `perceptualMask`/
+`spatialMask` (the distortion terms) are committed as opt-ins; the
+coarsen-baseline lever itself is expressed via the existing `acScale`/`quantLF`
+decoupling (no redundant "coarsen" knob added). All 405 tests green; `dart
+analyze` clean.
 
 ## Robustness
 
