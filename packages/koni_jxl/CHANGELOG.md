@@ -4,6 +4,16 @@
 
 ### Decoding
 
+- **Float (HDR) sample decode is now supported.** Images with
+  floating-point samples previously threw `JxlUnsupportedException`; they
+  now decode. This root-causes a long-open `lossless_pfm` conformance
+  failure to a spurious 32-bit truncation (`.toSigned(32)`) that had been
+  applied to `prediction()` and the weighted predictor's internals —
+  libjxl computes those in 64-bit (`pixel_type_w`), narrowing to 32-bit
+  only at genuine storage points, never mid-expression. Verified bit-exact
+  against the `lossless_pfm` conformance reference: all 750,000 float
+  values across 3 channels, zero mismatches. Encoding float samples remains
+  unimplemented.
 - **`JxlDecoder.decode(bytes, {targetWidth, targetHeight})`** — reduced-
   resolution decode for callers that only need a smaller image (a manga
   reader's oversized-page safety cap, a thumbnail). For a single-frame
@@ -19,6 +29,20 @@
   upscales past native size (matches `ui.ResizeImage`'s contract).
   `JxlStreamingDecoder.decodePreview()`'s DC-image assembly is now shared
   with this path (`render/dc_image.dart`), unchanged in behavior.
+
+### Encoding
+
+- **Restored the never-worse-than-baseline guarantee for the opt-in
+  bespoke transforms** (`VardctL0Config.enableBespokeTransforms`, off by
+  default). The 0.1.2 16x16-selection rework regressed this: with bespoke
+  transforms enabled, an over-selected layout could be committed before
+  the 16x16-tier decision ran, producing up to +4% larger output than the
+  flags-off baseline on one real manga page. The transform-layout decision
+  now always feeds the flags-off baseline cascade into the same real-
+  assembly candidate pool it min-selects from, so the chosen output is
+  provably never larger than either the baseline or 0.1.2. Default (flags-
+  off) output is bit-identical to 0.1.2; every bespoke combination improved
+  on the 144-encode real-manga sweep (e.g. `+bespoke` -0.20% → -0.42%).
 
 ## 0.1.2
 

@@ -39,6 +39,13 @@ participate in Flutter's `ImageCache` normally.
     return jxlAwareDecode(bytes, decode);
   }
   ```
+
+  Pass `cacheWidth`/`cacheHeight` to `decodeJxlToUiImage`,
+  `decodeJxlToUiCodec` or `jxlAwareDecode` for a reduced-resolution decode
+  (a thumbnail, an oversized-page safety cap). Wrapping a JXL-backed
+  `ImageProvider` in `ResizeImage` has **no effect** — JXL bytes never
+  reach the engine's `decode` callback that `ResizeImage` relies on — so
+  the target size must be passed here explicitly instead.
 - **`JxlAnimationView`** and `decodeJxlAnimation` — play animated JPEG XL
   with correct per-frame timing and loop count.
 - **`JxlProgressiveImage`** and `decodeJxlProgressive` — show a blurry

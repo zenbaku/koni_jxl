@@ -9,6 +9,9 @@
   JXL bytes, since they never reach the engine's `decode` callback (and its
   `getTargetSize`) that `ResizeImage` relies on — `jxlAwareDecode` now
   needs the target size passed explicitly instead.
+- Float (HDR) sample images now decode and render through
+  `JxlImageProvider`/`decodeJxlToUiImage` (inherited from `koni_jxl`
+  0.1.3); they previously threw `JxlUnsupportedException`.
 
 ## 0.1.2
 
