@@ -1214,18 +1214,30 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 /// each block's predicted non-zero count), so unlike RDOQ it cannot
 /// promise never-worse on its own; the outer safety net is what
 /// makes the combination never-worse regardless of how many cascade
-/// levels are enabled. Because the bootstrap candidate is always first in
-/// the list and every later candidate must have beaten its own
-/// immediately-prior candidate to exist at all (see the cascade loop
-/// below), `min(assemble(c).length for c in candidates) <= bootstrap`
-/// holds structurally — this is what closes the exact gap a real
-/// end-to-end smoke test found during the 32x32 slice: a level whose
-/// per-region estimate looks fine in isolation can still be a genuine, if
-/// modest, size *regression* against the immediately-prior level (not
-/// just against the original bootstrap), and a candidate list checked
-/// only pairwise against the oldest baseline would miss that. The
-/// candidates share no mutable `_PlacedBlock` state (see
-/// [_PlacedBlock.copy]'s doc comment) — callers must not run
+/// levels are enabled.
+///
+/// **Two independent layout paths feed the one candidate pool** (this is
+/// what makes bespoke provably never-worse-than-baseline — see the "Method"
+/// note below and doc/spec_notes.md's round 19 write-up):
+/// - a **baseline path** (`runCascadeFrom(bootstrap)`), run unconditionally,
+///   producing exactly the layouts the flags-off (`enableBespokeTransforms:
+///   false`) config would — so the plain-8x8 + 16x16/rect/size layout is
+///   *always* a pool member;
+/// - a **bespoke path** (`decideLevel0` + `runCascadeFrom` on its result),
+///   only when [VardctL0Config.enableBespokeTransforms], adding the
+///   per-cell bespoke layouts.
+/// Because the baseline path's candidates are always present and the caller
+/// real-assembles every candidate, the chosen output is never larger than
+/// the same config with bespoke off — the guarantee round 18 lost by
+/// committing bespoke *before* the 16x16 decision (which let an over-selected
+/// bespoke type crowd out beneficial 16x16 merges that then had no plain
+/// candidate to fall back to). Within each path, the bootstrap is first and
+/// every later candidate beat its own immediately-prior one to exist, so
+/// `min(assemble(c).length) <= bootstrap` holds structurally too — closing
+/// the separate gap a 32x32 smoke test found (a level whose per-region
+/// estimate looks fine can still regress against the immediately-prior level,
+/// not just the bootstrap). The candidates share no mutable `_PlacedBlock`
+/// state (see [_PlacedBlock.copy]'s doc comment) — callers must not run
 /// [_PlacedBlock.computeAndQuantize] on any returned block (all are
 /// already committed).
 ///
@@ -1263,8 +1275,10 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 ///    artifact (the same type at the same cell could score differently
 ///    purely because of list order) confirmed as the mechanism behind a
 ///    real per-page regression (see doc/spec_notes.md's round 17/18
-///    entries). When bespoke is off, this returns the bootstrap unchanged
-///    rather than paying for a redundant re-quantization pass.
+///    entries). Runs only in the bespoke path (see the two-path structure
+///    above); the baseline path never invokes it, so a bespoke-off encode
+///    pays nothing for a redundant re-quantization pass and stays
+///    bit-identical to its prior behavior.
 /// 4. **Level 1** (`decideLevel1`): for every 2x2-cell (16x16px) region, a
 ///    true argmin among *stay split* (Level 0's own 4 per-cell results,
 ///    summed the same `distortion + lambda * _blockRate(...)` way),
@@ -1278,17 +1292,18 @@ const _kTransformRdLambdaBeyond16 = 3000.0;
 ///    (`writeLiveGridCells`/`snapshotGridCells`/`restoreGridCells`) so
 ///    every candidate in a region is compared against the exact same
 ///    starting state, and only the true winner's effect on the live grid
-///    is made permanent. **Both Level 0's own result and Level 1's own
-///    result are exposed as separate entries in the returned candidate
-///    list whenever each differs from what came before** — not folded
-///    into a single combined candidate. This isn't redundant: a region's
-///    *estimate* preferring to merge into 16x16 over staying split doesn't
-///    guarantee the real assembled bytes agree (found concretely while
-///    building this: content where every cell's true argmin was a bespoke
-///    type, but Level 1's estimate preferred 16x16 anyway, which assembled
-///    to *more* real bytes than staying split — 211B vs. 167B). Without
-///    Level 0's own result as its own candidate, that better layout would
-///    never have been tried for real at all.
+///    is made permanent. Run once per path: on the plain bootstrap
+///    (baseline path) and, when bespoke is on, again on `decideLevel0`'s
+///    per-cell result (bespoke path). **Level 0's own result and Level 1's
+///    own result are exposed as separate candidate entries whenever each
+///    differs from what came before** — not folded into a single combined
+///    candidate. This isn't redundant: a region's *estimate* preferring to
+///    merge into 16x16 over staying split doesn't guarantee the real
+///    assembled bytes agree (found concretely: content where every cell's
+///    true argmin was a bespoke type, but Level 1's estimate preferred 16x16
+///    anyway, which assembled to *more* real bytes than staying split — 211B
+///    vs. 167B). Without Level 0's own result as its own candidate, that
+///    better layout would never have been tried for real at all.
 /// 5. For each size in [_cascadeSizes] up to [VardctL0Config.maxTransformSize]
 ///    (32, then 64, then 128, then 256), repeat steps 3/4 one level up:
 ///    merge the *previous* cascade level's layout (mixed 8x8/16x16/.../
@@ -1393,6 +1408,19 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   final lengths = bootstrap.codes.tokenBitLengths();
   final clusterMap = bootstrap.clusterMap;
   final lambda = (lambdaOverride ?? _kTransformRdLambda) * refStep * refStep;
+
+  // Snapshot the freshly bootstrap-seeded live grid. The candidate-
+  // generation block at the end of this function runs two independent
+  // layout paths (the plain baseline cascade, then — when bespoke is on —
+  // the bespoke Level-0 layout and its own cascade); each must be scored
+  // from the same starting neighbor-prediction state, so `resetLiveGrid`
+  // restores this snapshot between them (see that block's own comment).
+  final liveGridInit = [for (final g in liveGrid) Int32List.fromList(g)];
+  void resetLiveGrid() {
+    for (var i = 0; i < liveGrid.length; i++) {
+      liveGrid[i].setRange(0, liveGrid[i].length, liveGridInit[i]);
+    }
+  }
 
   // Per-channel predicted non-zero count for whatever block currently (as
   // of the most recent `updateLiveGrid` call touching its west/north
@@ -1820,99 +1848,43 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
   final candidates = <(List<_PlacedBlock>, List<Int32List>)>[
     (bootstrapBlocks, dcIntBootstrap),
   ];
-  var layout = bootstrapBlocks;
-  var dcInt = dcIntBootstrap;
-
-  // 3. Level 0: true N-way per-cell argmin (DCT8x8 vs. all 9 bespoke
-  // alternatives, when [enableBespokeTransforms]) — see [decideLevel0]'s
-  // own doc comment. Added as its own `candidates` entry whenever it
-  // differs from the bootstrap: Level 1's *estimate* always folds Level
-  // 0's own result in as its "stay split" option using the identical cost
-  // formula, so Level 1's chosen layout is never worse than Level 0 alone
-  // *under that estimate* — but the estimate and real assembled bytes can
-  // still disagree (the same "estimates can't resolve near-ties, verify
-  // by real assembly" gap this project has hit before, e.g. round 7's
-  // 32x32 case) — confirmed concretely during this round's own testing:
-  // content engineered so a bespoke type wins every cell, where Level 1's
-  // estimate preferred merging into 16x16 (a lower *estimated* cost) but
-  // the real assembled bytes favored staying split by a wide margin (167B
-  // vs. 211B). Without Level 0's own result as a separate candidate here,
-  // that better layout would never be tried for real at all — only the
-  // bootstrap and Level 1's (real-bytes-worse) choice.
-  final (layout0, dcInt0) = decideLevel0(enableBespokeTransforms);
-  if (layout0.any((b) => b.tt.type != _tt8.type)) {
-    candidates.add((layout0, dcInt0));
-  }
-
-  // 4. Level 1: true argmin per 16x16 region among stay-split, whole
-  // 16x16, and (when [enableRectangularTransforms]) the 16x8/8x16
-  // half-strip pairs — see [decideLevel1]'s own doc comment. Added as its
-  // own `candidates` entry whenever it differs from Level 0's own result,
-  // same reasoning as step 3 above.
-  final (layout1, dcInt1, level1Merged) =
-      decideLevel1(layout0, dcInt0, enableRectangularTransforms);
-  layout = layout1;
-  dcInt = dcInt1;
-  if (level1Merged) {
-    candidates.add((layout1, dcInt1));
-  }
-
-  // 4.5. The "4:1 line" rectangular pair (wide 8x32, tall 32x8 — the only
-  // 4:1 case in the whole format, since no 16x8-square exists to pair
-  // further) tried directly on Level 1's output. Relocated to run *after*
-  // Level 0/1, not before as the old bootstrap-tier pre-pass did: Level
-  // 0's simplified per-cell sweep assumes every cell starts as an
-  // independent 1x1 block, which would no longer hold if 8x32/32x8 had
-  // already merged 4 cells into one block first (it would silently
-  // orphan that block's other cells, a corrupt layout, not just a
-  // suboptimal one). Safe here unmodified: 8x32/32x8 doesn't nest inside
-  // a 16x16 region (it's 4 cells wide/tall, wider than 16x16's 2-cell
-  // span), so `tryMergeLevel`'s existing containment guard handles
-  // comparing it against whatever mix Level 0/1 left behind. Off by
-  // default ([VardctL0Config.enableRectangularTransforms]); see that
-  // field's doc comment for why (existence-vs-default, same split as
-  // [VardctL0Config.maxTransformSize]).
-  if (enableRectangularTransforms) {
-    for (final tt in [_tt8x32, _tt32x8]) {
-      final (next, dcNext, changed) = tryMergeLevel(layout, dcInt, tt, lambda);
-      if (changed) {
-        layout = next;
-        dcInt = dcNext;
-        candidates.add((layout, dcInt));
-      }
-    }
-  }
-
-  // 5. Generic cascade for every size beyond 16 up to [maxTransformSize]
-  // (Tranche A: 32, then 64, then 128, then 256), structurally identical —
-  // reusing the same frozen bootstrap code-length table — sound for the
-  // same reason step 4's 16x16 decision already establishes (transform-type
-  // choice never shifts which cluster a token routes to, only what value
-  // lands there). A level that merges nothing is skipped as a *candidate*
-  // but the cascade still tries the next size up on the unchanged layout —
-  // see this function's doc comment for why "no 32x32 merge anywhere"
-  // doesn't provably rule out a 64x64 merge helping regardless.
-  //
-  // Each tier's own "2:1 pair" rectangular type (see [_cascadeRectPairs])
-  // is tried immediately before that tier's square merge, gated by the
-  // same [enableRectangularTransforms] flag and only when the tier itself
-  // is within [maxTransformSize] — no reason to try e.g. a 64x32 merge if
-  // 64x64 itself isn't being tried. Same rectangular-before-square nesting
-  // argument as the bootstrap-tier pre-pass: each pair's smaller stride is
-  // exactly half its square tier's, so alignment to the rectangular type's
-  // own stride always keeps it within one square-tier-aligned region.
   final lambdaBeyond16 =
       (lambdaOverrideBeyond16 ?? _kTransformRdLambdaBeyond16) *
           refStep *
           refStep;
-  for (var idx = 0; idx < _cascadeSizes.length; idx++) {
-    final tt = _cascadeSizes[idx];
-    if (tt.pixelWidth > maxTransformSize) break;
+
+  // Runs the Level 1 (16x16) decision, the "4:1 line" rectangular pair, and
+  // the [_cascadeSizes] cascade (32..256) starting from `startLayout` — which
+  // must be exactly one 1x1-footprint block per cell (the plain bootstrap, or
+  // [decideLevel0]'s per-cell result) — appending every level that changes
+  // anything as its own candidate. The shared `liveGrid` must already reflect
+  // `startLayout`'s own fills when this is called (true right after seeding
+  // for the bootstrap, and right after [decideLevel0] commits for the bespoke
+  // layout), since every level scores against it and evolves it in place.
+  //
+  // Level 1: a true argmin per 16x16 region among stay-split, whole 16x16,
+  // and (when [enableRectangularTransforms]) the 16x8/8x16 half-strip pairs —
+  // see [decideLevel1]'s own doc comment.
+  //
+  // The "4:1 line" pair (wide 8x32, tall 32x8 — the only 4:1 case in the
+  // format) and the generic cascade run *after* Level 1, on its output, via
+  // the sequential pairwise `tryMergeLevel` chain (not yet a joint per-region
+  // argmin; see doc/spec_notes.md's round 18 scope note). A level that merges
+  // nothing is skipped as a candidate but the cascade still tries the next
+  // size up on the unchanged layout — see this function's doc comment for why
+  // "no 32x32 merge" doesn't provably rule out a 64x64 merge helping.
+  void runCascadeFrom(
+      List<_PlacedBlock> startLayout, List<Int32List> startDcInt) {
+    final (layout1, dcInt1, level1Merged) =
+        decideLevel1(startLayout, startDcInt, enableRectangularTransforms);
+    var layout = layout1;
+    var dcInt = dcInt1;
+    if (level1Merged) candidates.add((layout1, dcInt1));
+
     if (enableRectangularTransforms) {
-      final (wide, tall) = _cascadeRectPairs[idx];
-      for (final rtt in [wide, tall]) {
+      for (final tt in [_tt8x32, _tt32x8]) {
         final (next, dcNext, changed) =
-            tryMergeLevel(layout, dcInt, rtt, lambdaBeyond16);
+            tryMergeLevel(layout, dcInt, tt, lambda);
         if (changed) {
           layout = next;
           dcInt = dcNext;
@@ -1920,13 +1892,73 @@ List<(List<_PlacedBlock>, List<Int32List>)> _decideTransformLayout(
         }
       }
     }
-    final (next, dcNext, changed) =
-        tryMergeLevel(layout, dcInt, tt, lambdaBeyond16);
-    if (!changed) continue; // try the next size up on the unchanged layout
-    layout = next;
-    dcInt = dcNext;
-    candidates.add((layout, dcInt));
+
+    for (var idx = 0; idx < _cascadeSizes.length; idx++) {
+      final tt = _cascadeSizes[idx];
+      if (tt.pixelWidth > maxTransformSize) break;
+      if (enableRectangularTransforms) {
+        final (wide, tall) = _cascadeRectPairs[idx];
+        for (final rtt in [wide, tall]) {
+          final (next, dcNext, changed) =
+              tryMergeLevel(layout, dcInt, rtt, lambdaBeyond16);
+          if (changed) {
+            layout = next;
+            dcInt = dcNext;
+            candidates.add((layout, dcInt));
+          }
+        }
+      }
+      final (next, dcNext, changed) =
+          tryMergeLevel(layout, dcInt, tt, lambdaBeyond16);
+      if (!changed) continue; // try the next size up on the unchanged layout
+      layout = next;
+      dcInt = dcNext;
+      candidates.add((layout, dcInt));
+    }
   }
+
+  // Baseline path (always): run the 16x16/rect/size cascade on the plain
+  // all-8x8 bootstrap. This makes the *exact* layout the flags-off
+  // (`enableBespokeTransforms: false`) config would produce an unconditional
+  // member of the candidate pool — so the caller's real-assembly safety net
+  // can never choose a layout worse than baseline, even with bespoke on.
+  //
+  // Round 18 lost this guarantee by running the bespoke Level 0 pass *first*:
+  // when a bespoke type over-selects (its rate estimate underestimating its
+  // own real cost — e.g. Hornuss chosen for ~23k of ~24k cells on one real
+  // page, assembling *larger* than plain 8x8), Level 1's beneficial 16x16
+  // merges were then computed against that cheap-looking bespoke split and
+  // lost, and the plain-8x8 + 16x16 layout flags-off would have found was
+  // never a candidate at all — a real +4% regression vs. baseline on that
+  // page. A per-region *estimate* argmin (unified or not) can't fix this: the
+  // bespoke estimate is what's unreliable, so it keeps winning the estimate
+  // while losing the real bytes. Only a real-assembled baseline candidate in
+  // the pool does. See doc/spec_notes.md's round 19 write-up.
+  //
+  // When bespoke is off this is the only path and reproduces the prior
+  // behavior exactly (bespoke-off output stays bit-identical).
+  runCascadeFrom(bootstrapBlocks, dcIntBootstrap);
+
+  // Bespoke path (only when enabled): additionally offer the per-cell bespoke
+  // Level 0 layout (a true 10-way per-cell argmin — see [decideLevel0]) and
+  // its own 16x16/rect/size cascade as candidates. These win only where
+  // bespoke genuinely assembles smaller (measured on the color chapter:
+  // ~-1.5% at distance 4); where it regresses, the baseline path's candidates
+  // above already cover the pool. The live grid is reset to its bootstrap-
+  // seeded snapshot first so [decideLevel0] scores from the same starting
+  // state the baseline path did, not from the plain cascade's evolved fills.
+  if (enableBespokeTransforms) {
+    resetLiveGrid();
+    final (layout0, dcInt0) = decideLevel0(true);
+    // If no cell actually chose a bespoke type, layout0 is (semantically)
+    // the plain bootstrap and its cascade would just duplicate the baseline
+    // path already run above — skip it.
+    if (layout0.any((b) => b.tt.type != _tt8.type)) {
+      candidates.add((layout0, dcInt0));
+      runCascadeFrom(layout0, dcInt0);
+    }
+  }
+
   return candidates;
 }
 

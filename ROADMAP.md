@@ -899,21 +899,42 @@ output for where the gap actually is.
   improve aggregate wins) was **not met** — a real, disclosed negative
   result, not a hidden one. See doc/spec_notes.md's round 18 entry for
   the full numbers and root-cause analysis.
-- 🔲 **Remaining: a genuinely *unified* joint search, not sequential
-  joint levels.** Round 18's finding reframes this: Level 0 and Level 1
-  are each individually a true argmin now, but running them as sequential
-  layers (Level 0 commits, *then* Level 1 decides on top) is not the same
-  as a genuinely joint decision across both — recovering round 17's
-  serendipitous rect/bespoke interaction would need evaluating {4
-  independent leaf choices} vs. {16x16 whole} vs. {16x8/8x16 pairs} all
-  simultaneously per region, not Level 0 first then Level 1 layered on —
-  a materially bigger change than round 18's scope, before ever
-  extending further to 32/64/128/256. Also still worth weighing against
-  the possibility (flagged in round 17) that the remaining gap to
-  `cjxl -e7` isn't primarily a transform-selection problem at all (e.g.
-  `enableRdHfMult`'s own still-unresolved distance-scaling gap, or a real
-  per-block quantization RD search, might be a bigger lever than
-  searching transform type/size harder).
+- ✅ **Never-worse guarantee restored via candidate pooling, round 19 —
+  and the "unified joint search" reframed as *not* the fix.** Round 18
+  pointed at a genuinely-unified per-region argmin as the way forward.
+  Empirical diagnosis first (per round 18's own lesson) showed it would
+  not have fixed the regression at all: on the flagged Naruto page 017,
+  enabling bespoke makes Level 0 commit an over-selected layout (Hornuss
+  on ~23k of ~24k cells, assembling *larger* than plain 8x8) *before*
+  Level 1 runs, so the plain-8x8 + 16x16 layout baseline finds (a real
+  -3.9% win) is never even a candidate — and the safety net can only fall
+  back to the bootstrap. The root cause is the bespoke rate *estimate*
+  being unreliable (it keeps winning the estimate while losing the real
+  bytes), which no estimate-based per-region argmin fixes — only the
+  whole-image real-assembly safety net can, and it was blind because the
+  winning layout was absent from the pool. Fix (small, robust): `_decide
+  TransformLayout` now runs the flags-off baseline cascade unconditionally
+  into the same candidate pool it already real-assembles and min-selects,
+  alongside the (bit-identical to round 18) bespoke path — so the chosen
+  output is provably never larger than baseline *and* never larger than
+  round 18. Page 017 `+bespoke` goes +3.9% → **exactly baseline (0%)**;
+  the color-chapter win (-1.5%) is preserved; bespoke-off configs stay
+  bit-identical. See doc/spec_notes.md's round 19 entry.
+- 🔲 **Remaining: is transform selection even the biggest lever left?**
+  Round 19 restored the never-worse guarantee but did not, on its own,
+  make the wins large enough to flip `enableBespokeTransforms`/
+  `enableRectangularTransforms` on by default. The open question round 17
+  flagged is now the load-bearing one: the remaining gap to `cjxl -e7`
+  (0.37-0.54x per doc/BENCHMARKS.md) may not be primarily a
+  transform-selection problem at all. Candidates that may be bigger levers
+  than searching transform type/size harder: `enableRdHfMult`'s own
+  still-unresolved distance-scaling gap (start from `acScale^2` scaling,
+  not `refStep^2` — see the hfMult follow-up in doc/spec_notes.md), or a
+  real per-block quantization rate-distortion search. A genuinely-unified
+  transform search is no longer the obvious next step — round 19 showed
+  the transform-selection regressions were a missing-candidate problem, not
+  an insufficiently-joint-estimate problem, so more joint estimation is
+  unlikely to be where the remaining compression lives.
 
 ---
 

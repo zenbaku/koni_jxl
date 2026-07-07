@@ -3075,6 +3075,135 @@ round's numbers make the case for flipping them weaker, not stronger.
 See ROADMAP.md's updated "remaining" bullet for how this reframes the
 next step.
 
+### Lossy (VarDCT) encoder — round 19: the regression was never a sequencing problem — restore never-worse via candidate pooling
+
+Round 18 ended pointing at a "genuinely unified joint decision" (evaluate
+{4 leaves} vs. {16x16 whole} vs. {pairs} all at once per region) as the
+way to recover round 17's serendipitous rect-preempts-bespoke behavior.
+Before building that materially-larger change, this round did what round
+18's own lesson demanded — *diagnose empirically first* — and the
+diagnosis showed the unified per-region argmin would **not** have fixed the
+regression at all. The real mechanism, traced on the exact flagged page
+(Naruto chapter 684 page 017, distance 1.0), via a temporary per-candidate
+assembled-size dump:
+
+```
+baseline (bespoke off):
+  candidate[0] bootstrap (all 8x8) = 106851B
+  candidate[1] Level 1 (16x16 merges) = 102701B   <- chosen (real -3.9% win)
+  FINAL 102701B
+
++bespoke (round 18):
+  candidate[0] bootstrap = 106851B
+  candidate[1] Level 0 (Hornuss on 23386 of ~24k cells!) = 109972B  (worse than bootstrap)
+  (no 16x16 candidate exists at all)
+  FINAL 106851B   <- falls back to bootstrap = +3.9% vs baseline
+```
+
+The regression is not an ordering artifact between Level 0 and Level 1
+(round 18 correctly removed that). It is that **enabling bespoke makes
+Level 0 commit an over-selected bespoke layout `_before_ Level 1 runs**, so
+the plain-8x8 + 16x16 layout baseline produces — worth ~3.9% here — is
+never even a candidate. And the root of the over-selection is that the
+bespoke rate *estimate* is unreliable: Hornuss's estimated cost so
+underprices its own real bytes that Level 0 picks it for essentially the
+whole image, and Level 1's beneficial 16x16 merges then lose to that
+cheap-looking split in the *estimate*, so no 16x16 candidate is ever
+produced on the bespoke layout. **A per-region estimate argmin — unified
+across levels or not — keeps picking the same underpriced bespoke type; it
+is the estimate that is wrong, and only the whole-image real-assembly
+safety net can catch it. But that safety net was blind here, because the
+one layout that would have won (plain-8x8 + 16x16) was absent from the
+pool.** Confirmed the estimate-underselection reading against a page where
+bespoke *does* help (One-Piece color chapter page 001, distance 4: baseline
+285809B, +bespoke 281433B = -1.5%, a genuine mixed 16x16+bespoke win) — so
+the fix must *preserve* those wins, not disable bespoke.
+
+**Fix (small, robust, provably never-worse): pool the baseline candidates
+too.** `_decideTransformLayout` now runs two independent layout paths into
+the one candidate pool the caller already real-assembles and min-selects:
+a **baseline path** (`runCascadeFrom(bootstrap)`, run unconditionally — the
+16x16/rect/size cascade on the plain all-8x8 bootstrap, i.e. exactly what
+`enableBespokeTransforms: false` produces) and, only when bespoke is on, a
+**bespoke path** (`decideLevel0` + its own cascade, bit-identical to round
+18's — the shared live grid is snapshotted after seeding and reset between
+the two paths so `decideLevel0` scores from the same state round 18 gave
+it). The new pool is therefore exactly `{round-18 candidates} ∪ {baseline
+candidates}`, so the real-assembled choice is `min` over that union:
+provably never larger than baseline *and* never larger than round 18. No
+new estimate logic, no per-region unification, no reordering of the bespoke
+decision — just the missing baseline candidates added so the existing
+safety net can see them.
+
+Verified on the exact regressing page: `+bespoke` page 017 goes 106851B →
+**102701B (== baseline exactly)** — the +3.9% regression is gone, the
+16x16-merge candidate is now picked. `+rect+bespoke` there gives 102711B,
+which equals `+rect` alone (also 102711B, a pre-existing ~10B
+`enableRectangularTransforms` artifact documented since round 10 — "never
+worse than plain 8x8, not never worse than square-only") — i.e. the
+guarantee delivered is precisely **bespoke never worse than the same config
+with bespoke off**, which is the correct, meaningful invariant. Wins are
+preserved (One-Piece page 001 still -1.5%: its bespoke candidate is smaller
+and still chosen).
+
+Full real-manga ROI re-sweep (`tool/bench_manga_roi.dart`, same 144 encodes
+round 17/18 used), grand total across both chapters and distances 1.0/4.0,
+compared against both prior rounds:
+
+```
+combo               round 17    round 18    round 19
+baseline               (base)      (base)      (base)
++rect                  -0.28%      -0.20%      -0.20%
++bespoke               -0.22%      -0.20%      -0.42%   <- best of all three
++rect+bespoke          -0.61%      -0.29%      -0.56%
++32                    -0.53%      -0.53%      -0.53%
++32+rect+bespoke       -0.86%      -0.51%      -0.79%
+```
+
+Every bespoke combo improved over round 18, and `+bespoke` alone (-0.42%)
+now beats *both* prior rounds — precisely because it eliminates the page-017
+regression that had dragged round 17's aggregate down (round 17 got that
+page wrong by +4-5% but happened to win elsewhere; round 19 wins elsewhere
+*and* gets page 017 right). `+rect+bespoke`/`+32+rect+bespoke` land just shy
+of round 17 (-0.56% vs -0.61%, -0.79% vs -0.86%) — the residual gap is
+exactly round 17's *accidental* extra recovery (its rectangular pre-pass
+happening to claim page-017 cells before bespoke regressed them), which
+round 19 deliberately does not reproduce because it isn't a robust property.
+The crucial difference from both prior rounds: round 19's numbers come *with*
+a provable never-worse-than-baseline guarantee (page-017 `+bespoke` = exactly
+baseline, verified in the sweep, not just asserted) — round 17 lacked it by
+luck, round 18 broke it. `baseline`/`+rect`/`+32` grand totals are
+bit-for-bit identical to round 17's (10057372 and 10004324 bytes
+respectively), confirming the bespoke-off paths are unchanged.
+
+Encode-time rises modestly over round 18 (the added baseline path is a few
+extra real assemblies per bespoke config, not another Level-0 sweep — that
+expensive pass runs once) — roughly `+bespoke` ~3x, `+rect+bespoke` ~5x,
+`+32+rect+bespoke` ~7x baseline in this sweep, though those figures were
+measured under some concurrent load and the byte columns are the
+load-bearing result. The `+32+rect+bespoke`/`+32` gap on individual pages
+(e.g. page 017 d=1.0: `+32` -5.87% but `+32+rect+bespoke` +0.01%) is the
+pre-existing `enableRectangularTransforms`-interferes-with-square-cascade
+behavior documented since round 10 (rect pairs claim cells a 32x32 merge
+would otherwise have used), not a round-19 regression — it is guaranteed
+never-worse only per the *bespoke* flag, which is what this round fixed.
+
+Bespoke-off configs (`baseline`, `+rect`, `+32`) are bit-for-bit unchanged
+(the baseline path reproduces the prior single path exactly when bespoke is
+off). Encode-time cost of the added baseline path is modest — it is the
+cheap end of the cascade (one 16x16 decision plus a few real assemblies),
+not another Level 0 sweep, which is the expensive part and runs only once.
+All 391 tests green, including the encoder "genuinely wins" and mixed-layout
+gates; `dart analyze` clean; `flutter test` green. `enableBespoke
+Transforms`/`enableRectangularTransforms` stay **off by default** — this
+round restores the never-worse guarantee they always claimed but does not,
+on its own, make the wins large enough to flip that default; the remaining
+question (whether transform selection is even the biggest lever left vs.
+`cjxl -e7`, or whether per-block quantization RD is) is unchanged. What this
+round *does* settle: the "unified joint search" ROADMAP item as literally
+scoped would not have fixed the regression — the problem was a missing
+real-assembled candidate, not an insufficiently-joint estimate.
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,
