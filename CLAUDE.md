@@ -15,11 +15,17 @@ animation and splines).
   `frame/` (frame loop, TOC, LfGlobal, patches, splines), `encode/`
   (headers/entropy/modular writers — every writer mirrors a reader in
   this repo; when touching one, keep them in lockstep), `render/`
-  (blend, filters, noise, upsample, transpose), `color/` (XYB, transfer
-  functions), `util/` (ImageBuffer = row-based planes, math).
+  (blend, filters, noise, upsample, transpose, `dc_image.dart` = shared
+  DC-image assembly for both the streaming preview and `JxlDecoder.decode`'s
+  downscale path), `util/` (ImageBuffer = row-based planes, math, `resample.dart`
+  = target-size resolution + box downsampling).
 - `packages/koni_jxl_flutter` — `JxlImageProvider`, `decodeJxlToUiImage`,
   `decodeJxlAnimation`/`JxlAnimationView`, `decodeJxlProgressive`/
-  `JxlProgressiveImage`; `example/` gallery app.
+  `JxlProgressiveImage`; `example/` gallery app. `decodeJxlToUiImage`/
+  `decodeJxlToUiCodec`/`jxlAwareDecode` take `cacheWidth`/`cacheHeight` for a
+  reduced-resolution decode — `ResizeImage` has no effect on JXL bytes (they
+  never reach the engine's `decode` callback), so a caller wanting a capped
+  decode size must pass it here explicitly instead.
 - `doc/spec_notes.md` — **the deviations ledger.** Every known difference
   vs libjxl or vs jxlatte lives here. Update it whenever behavior
   deviates or a deviation is fixed.

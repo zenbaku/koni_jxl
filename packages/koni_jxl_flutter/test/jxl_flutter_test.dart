@@ -44,6 +44,23 @@ void main() {
       expect(image.height, 16);
       image.dispose();
     });
+
+    test('cacheWidth/cacheHeight request a reduced-resolution decode',
+        () async {
+      final image = await decodeJxlToUiImage(lossySample.readAsBytesSync(),
+          cacheWidth: 100);
+      expect(image.width, lessThanOrEqualTo(100));
+      expect(image.height, lessThan(1536));
+      image.dispose();
+    });
+
+    test('cacheWidth/cacheHeight never upscale', () async {
+      final image = await decodeJxlToUiImage(lossySample.readAsBytesSync(),
+          cacheWidth: 4000, cacheHeight: 4000);
+      expect(image.width, 1024);
+      expect(image.height, 1536);
+      image.dispose();
+    });
   });
 
   group('decodeJxlAnimation', () {
@@ -127,6 +144,17 @@ void main() {
       expect(codec.frameCount, 1);
       final frame = await codec.getNextFrame();
       expect(frame.image.width, 256);
+      frame.image.dispose();
+      codec.dispose();
+    });
+
+    test('cacheWidth/cacheHeight request a reduced-resolution decode',
+        () async {
+      final codec = await jxlAwareDecode(
+          lossySample.readAsBytesSync(), mustNotReachEngine,
+          cacheWidth: 100);
+      final frame = await codec.getNextFrame();
+      expect(frame.image.width, lessThanOrEqualTo(100));
       frame.image.dispose();
       codec.dispose();
     });

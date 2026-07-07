@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.3
+
+### Decoding
+
+- **`JxlDecoder.decode(bytes, {targetWidth, targetHeight})`** — reduced-
+  resolution decode for callers that only need a smaller image (a manga
+  reader's oversized-page safety cap, a thumbnail). For a single-frame
+  VarDCT image with no patches, splines, noise or format-level upsampling,
+  and a target no larger than the format's built-in 1:8-scale DC image,
+  this decodes *only* the DC data — every AC coefficient is skipped
+  entirely — and box-filters that down to the exact target: ~11x faster on
+  a 6000x9000 synthetic test image decoded at a 512px cap (see
+  `tool/bench_downscale.dart`). Every other case (animated, Modular/
+  lossless, patches/splines/noise present, or a target finer than 1:8
+  scale) decodes the image fully and box-downsamples the result —
+  always correct, just without the CPU/memory saving. Output never
+  upscales past native size (matches `ui.ResizeImage`'s contract).
+  `JxlStreamingDecoder.decodePreview()`'s DC-image assembly is now shared
+  with this path (`render/dc_image.dart`), unchanged in behavior.
+
 ## 0.1.2
 
 ### Decoding

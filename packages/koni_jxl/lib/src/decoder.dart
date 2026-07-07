@@ -4,6 +4,7 @@ import 'color/transfer_function.dart';
 import 'exceptions.dart';
 import 'frame/frame.dart';
 import 'frame/frame_flags.dart';
+import 'frame/frame_header.dart';
 import 'frame/splines.dart';
 import 'header/image_header.dart';
 import 'icc/icc_codec.dart';
@@ -12,10 +13,12 @@ import 'io/container.dart';
 import 'jxl_image.dart';
 import 'jxl_limits.dart';
 import 'render/blend.dart';
+import 'render/dc_image.dart';
 import 'render/noise.dart';
 import 'render/transpose.dart';
 import 'render/upsample.dart';
 import 'util/image_buffer.dart';
+import 'util/resample.dart';
 
 /// Decodes JPEG XL images to raw pixels.
 ///
@@ -29,14 +32,140 @@ final class JxlDecoder {
   /// Decodes [bytes] (bare codestream or ISOBMFF container).
   ///
   /// For animated inputs, decodes and returns the first visible frame.
-  static JxlImage decode(Uint8List bytes) =>
-      _DecoderState()._decode(bytes, allFrames: false).frames.first;
+  ///
+  /// [targetWidth]/[targetHeight] request a reduced-resolution result — the
+  /// output never exceeds that box (fit-within, aspect-preserving, never
+  /// upscaled — the same contract as `ui.ResizeImage`). For a single-frame
+  /// lossy (VarDCT) image with no patches, splines, noise or format-level
+  /// upsampling, and a target no larger than the format's built-in 1:8-scale
+  /// DC image, this decodes *only* the DC data — every AC coefficient is
+  /// skipped, which is the bulk of decode time and memory for an oversized
+  /// image — and box-filters that down to the exact target. Every other case
+  /// (animated, Modular/lossless, patches/splines/noise present, or a target
+  /// finer than 1:8 scale) decodes the image fully and then downsamples the
+  /// result: always correct, just without the CPU/memory saving.
+  static JxlImage decode(
+    Uint8List bytes, {
+    int? targetWidth,
+    int? targetHeight,
+  }) {
+    if (targetWidth != null || targetHeight != null) {
+      final dcOnly = _tryDcOnlyDecode(bytes, targetWidth, targetHeight);
+      if (dcOnly != null) return dcOnly;
+    }
+    final full = _DecoderState()._decode(bytes, allFrames: false).frames.first;
+    return _downsampleIfNeeded(full, targetWidth, targetHeight);
+  }
 
   /// Decodes all visible frames of [bytes].
   ///
   /// Still images produce a single frame with duration 0.
   static JxlAnimation decodeAnimation(Uint8List bytes) =>
       _DecoderState()._decode(bytes, allFrames: true);
+
+  /// Attempts the DC-only fast path; returns null (never throws) whenever it
+  /// doesn't apply, so the caller falls back to a normal full decode — that
+  /// full decode is the sole source of truth for real decode errors.
+  static JxlImage? _tryDcOnlyDecode(
+    Uint8List bytes,
+    int? targetWidth,
+    int? targetHeight,
+  ) {
+    try {
+      final demuxed = demuxContainer(bytes);
+      final reader = BitReader(demuxed.codestream);
+      final header = ImageHeader.read(reader, level: demuxed.level);
+      if (header.animation != null || header.extraChannels.isNotEmpty) {
+        return null;
+      }
+
+      Uint8List? iccProfile;
+      if (header.iccEncodedSize != null) {
+        final encoded =
+            IccCodec.readEncodedStream(reader, header.iccEncodedSize!);
+        reader.zeroPadToByte();
+        iccProfile = IccCodec.decompress(encoded);
+      }
+      if (header.previewSize != null) {
+        final preview = Frame(reader, header);
+        preview.readFrameHeader();
+        preview.readToc();
+      }
+
+      final frame = Frame(reader, header);
+      final fh = frame.readFrameHeader();
+      if (!_dcOnlyEligible(fh)) return null;
+      frame.readToc();
+
+      frame.decodeLfOnly();
+      final dcImage = buildDcImage(frame, header, iccProfile, isPreview: false);
+
+      // Only usable when the caller's real target is no finer than the DC
+      // image itself — otherwise this would silently under-deliver detail
+      // that only a full AC decode can provide.
+      final orientedSize = header.orientedSize;
+      final resolved = resolveTargetSize(
+        orientedSize.width,
+        orientedSize.height,
+        targetWidth: targetWidth,
+        targetHeight: targetHeight,
+      );
+      if (resolved.width == orientedSize.width &&
+          resolved.height == orientedSize.height) {
+        return null; // no downscale actually requested
+      }
+      if (resolved.width > dcImage.width || resolved.height > dcImage.height) {
+        return null; // finer than 1:8 — needs real AC data
+      }
+      return _downsampleIfNeeded(dcImage, targetWidth, targetHeight);
+    } on JxlException {
+      return null;
+    } on RangeError {
+      return null;
+    }
+  }
+
+  /// Whether [fh] is a plain single-frame VarDCT frame with none of the
+  /// features (patches/splines/noise/a separate LF frame/format-level
+  /// upsampling) that the DC-only path doesn't account for.
+  static bool _dcOnlyEligible(FrameHeader fh) {
+    const unsupportedFlags = FrameFlags.noise |
+        FrameFlags.patches |
+        FrameFlags.splines |
+        FrameFlags.useLfFrame;
+    return fh.type == FrameFlags.regularFrame &&
+        fh.encoding == FrameFlags.vardct &&
+        fh.isLast &&
+        fh.fullFrame &&
+        fh.upsampling == 1 &&
+        fh.ecUpsampling.every((u) => u == 1) &&
+        fh.flags & unsupportedFlags == 0;
+  }
+
+  /// Downsamples [image] to fit [targetWidth]/[targetHeight] if it doesn't
+  /// already (a no-op, returning [image] itself, when it's already within
+  /// that box — this never upscales).
+  static JxlImage _downsampleIfNeeded(
+    JxlImage image,
+    int? targetWidth,
+    int? targetHeight,
+  ) {
+    final target = resolveTargetSize(
+      image.width,
+      image.height,
+      targetWidth: targetWidth,
+      targetHeight: targetHeight,
+    );
+    if (target.width == image.width && target.height == image.height) {
+      return image;
+    }
+    final resized = [
+      for (final channel in image.channels)
+        boxDownsample(channel, target.width, target.height),
+    ];
+    return JxlImage.scaled(
+        image.header, resized, image.iccProfile, target.width, target.height);
+  }
 }
 
 final class _DecoderState {

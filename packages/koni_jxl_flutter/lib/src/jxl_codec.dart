@@ -11,8 +11,10 @@ import 'package:koni_jxl/koni_jxl.dart';
 // rather than copied), and a plain call on the web — dart2js and dart2wasm
 // have no isolates, and Isolate.run itself throws UnsupportedError there.
 
-(Uint8List, int, int) _decodeRgba(Uint8List bytes) {
-  final image = JxlDecoder.decode(bytes);
+(Uint8List, int, int) _decodeRgba((Uint8List, int?, int?) args) {
+  final (bytes, targetWidth, targetHeight) = args;
+  final image = JxlDecoder.decode(bytes,
+      targetWidth: targetWidth, targetHeight: targetHeight);
   return (image.toRgba8(), image.width, image.height);
 }
 
@@ -21,8 +23,14 @@ import 'package:koni_jxl/koni_jxl.dart';
 /// The CPU-heavy decode runs through [compute] (a background isolate on
 /// native platforms, the calling thread on the web); only the final GPU
 /// upload happens on the calling isolate.
-Future<ui.Image> decodeJxlToUiImage(Uint8List bytes) async {
-  final (pixels, width, height) = await compute(_decodeRgba, bytes);
+///
+/// [cacheWidth]/[cacheHeight] request a reduced-resolution decode — see
+/// `JxlDecoder.decode`'s doc comment for exactly when that skips real work
+/// versus decoding fully and downsampling.
+Future<ui.Image> decodeJxlToUiImage(Uint8List bytes,
+    {int? cacheWidth, int? cacheHeight}) async {
+  final (pixels, width, height) =
+      await compute(_decodeRgba, (bytes, cacheWidth, cacheHeight));
   return _rgbaToUiImage(pixels, width, height);
 }
 
@@ -36,14 +44,19 @@ Future<ui.Image> decodeJxlToUiImage(Uint8List bytes) async {
 /// [ui.Codec.getNextFrame] then hands out per-frame clones, which the image
 /// stream machinery disposes as it consumes them. Disposing the codec
 /// releases the retained frames.
-Future<ui.Codec> decodeJxlToUiCodec(Uint8List bytes) async {
+///
+/// [cacheWidth]/[cacheHeight] only apply to a still (non-animated) image —
+/// see [decodeJxlToUiImage].
+Future<ui.Codec> decodeJxlToUiCodec(Uint8List bytes,
+    {int? cacheWidth, int? cacheHeight}) async {
   // Header-only probe (cheap, no pixel work) to pick the single- vs
   // all-frames decode.
   if (JxlInfo.parse(bytes).isAnimated) {
     final anim = await decodeJxlAnimation(bytes);
     return _JxlUiCodec(anim.frames, anim.frameDurations, anim.numLoops);
   }
-  final image = await decodeJxlToUiImage(bytes);
+  final image = await decodeJxlToUiImage(bytes,
+      cacheWidth: cacheWidth, cacheHeight: cacheHeight);
   return _JxlUiCodec([image], const [Duration.zero], 1);
 }
 
@@ -59,9 +72,22 @@ Future<ui.Codec> decodeJxlToUiCodec(Uint8List bytes) async {
 ///   return jxlAwareDecode(bytes, decode);
 /// }
 /// ```
+///
+/// [cacheWidth]/[cacheHeight] request a reduced-resolution JXL decode (see
+/// [decodeJxlToUiImage]) — pass these instead of wrapping the provider in
+/// `ResizeImage`, which has no effect on JXL bytes: they never reach the
+/// engine's [decode] callback (and its `getTargetSize`) at all. Ignored for
+/// non-JXL bytes, which should use `ResizeImage` as normal.
 Future<ui.Codec> jxlAwareDecode(
-    Uint8List bytes, ImageDecoderCallback decode) async {
-  if (looksLikeJxl(bytes)) return decodeJxlToUiCodec(bytes);
+  Uint8List bytes,
+  ImageDecoderCallback decode, {
+  int? cacheWidth,
+  int? cacheHeight,
+}) async {
+  if (looksLikeJxl(bytes)) {
+    return decodeJxlToUiCodec(bytes,
+        cacheWidth: cacheWidth, cacheHeight: cacheHeight);
+  }
   final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
   return decode(buffer);
 }
@@ -210,7 +236,7 @@ Stream<ui.Image> decodeJxlProgressive(Stream<List<int>> chunks) async* {
         '(${(session.progress * 100).toStringAsFixed(0)}% received)');
   }
   final (pixels, width, height) =
-      await compute(_decodeRgba, buffer.takeBytes());
+      await compute(_decodeRgba, (buffer.takeBytes(), null, null));
   yield await _rgbaToUiImage(pixels, width, height);
 }
 

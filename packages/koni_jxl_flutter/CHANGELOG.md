@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.3
+
+- **`decodeJxlToUiImage`/`decodeJxlToUiCodec`/`jxlAwareDecode`** gained
+  `cacheWidth`/`cacheHeight` parameters, threading through to `koni_jxl`
+  0.1.3's reduced-resolution `JxlDecoder.decode`. This closes a real gap:
+  wrapping a JXL-backed `ImageProvider` in `ResizeImage` has *no effect* on
+  JXL bytes, since they never reach the engine's `decode` callback (and its
+  `getTargetSize`) that `ResizeImage` relies on — `jxlAwareDecode` now
+  needs the target size passed explicitly instead.
+
 ## 0.1.2
 
 - **`JxlPagePrefetcher`** — decodes upcoming pages of a sequential reader

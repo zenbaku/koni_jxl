@@ -17,6 +17,16 @@ final class JxlImage {
         _widthOverride = previewWidth,
         _heightOverride = previewHeight;
 
+  /// A caller-requested reduced-resolution decode (see
+  /// `JxlDecoder.decode`'s `targetWidth`/`targetHeight`) — unlike
+  /// [JxlImage.preview], this is the actual output the caller asked for,
+  /// not a placeholder to be superseded by a later full decode.
+  JxlImage.scaled(
+      this._header, this.channels, this.iccProfile, int width, int height)
+      : isPreview = false,
+        _widthOverride = width,
+        _heightOverride = height;
+
   /// True for reduced-resolution previews from [JxlStreamingDecoder].
   final bool isPreview;
   final int? _widthOverride;
