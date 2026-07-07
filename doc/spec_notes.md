@@ -3344,12 +3344,56 @@ exploit differently, so a real-`manga_samples/` perceptual check (a perceptual
 analogue of `bench_manga_roi.dart`) is the honest prerequisite before any
 default decision.
 
-Still deferred: the real-manga perceptual validation above, and — only if that
-clears — turning the tool-only coarsen-baseline composition into a single
-high-level encoder option with content-adaptive gating. `perceptualMask`/
-`spatialMask` (the distortion terms) are committed as opt-ins; the
-coarsen-baseline lever itself is expressed via the existing `acScale`/`quantLF`
-decoupling (no redundant "coarsen" knob added). All 405 tests green; `dart
+**Real-manga perceptual validation (the honest prerequisite): the lever LOSES
+badly on real manga — default-on is dead, and the synthetic proxy was wrong
+again.** `tool/validate_manga_perceptual.dart` runs the same perceptual RD
+envelope on *real* `manga_samples/*.cbz` pages (decoded to source pixels via
+this package's own `JxlDecoder`, re-encoded heuristic vs. coarsen-mask-spatial,
+scored on ssimulacra2/butteraugli — read-only, nothing derived committed). Four
+pages (2 per chapter):
+
+```
+AGGREGATE — mean save% at matched ssim2 across all real pages
+ ssim2 | n pages | mean save% | verdict
+    85 |       4 |     +24.6% | LOSS
+    87 |       4 |     +13.3% | LOSS
+    89 |       3 |     +10.7% | LOSS
+    91 |       2 |      +7.5% | LOSS
+    93 |       1 |     +14.7% | LOSS
+```
+
+Naruto (B/W screentone/line art) is the worst: **+11% to +33% larger** at
+matched ssim2. One-Piece (digital color) is mostly loss (+10% to +22%) with
+two small wins (-1.3%, -2.4%). This is a **far bigger penalty than the
+synthetic line-art proxy's neutral ±3%** — the DCT32/round-7 pattern exactly
+(synthetic content drastically understated the real-manga cost), and the
+concrete reason the real-content check is non-negotiable before any default
+decision.
+
+**Root cause (a content-model mismatch, not a tuning miss):** masking assumes
+high-frequency energy is *maskable noise*, but manga **screentone is
+high-frequency *essential signal*** — coarsening the AC baseline there destroys
+the content, and the spatial-activity signal actively *mis*-classifies
+screentone as "busy → safe to coarsen." So the lever is structurally
+wrong for this project's dominant content, not merely uncalibrated for it.
+There is no content-adaptive gating that rescues it for manga; it would only
+ever gate manga *out*. Since koni_jxl's primary use case is manga, the
+coarsen-baseline masking lever has **no path to a beneficial default here** —
+it remains a correct, calibrated **opt-in for photographic/non-manga content
+only** (where it is a real -13% to -22% win). This also reinforces that
+whatever remains of the `cjxl -e7` gap *on manga specifically* is not a
+quant-field-masking problem (koni's heuristic, which keeps screentone AC fine,
+already beats cjxl on screentone) — the masking lever helps photo content koni
+was already weakest on, not the manga content it targets.
+
+**Net for the thread:** `perceptualMask`/`spatialMask` (the distortion terms)
+are committed as opt-ins (real photo wins, banding-safe, djxl-gated); the
+coarsen-baseline composition stays tool-only and default-off, now with a
+decisive real-manga negative result on the record. No high-level `perceptual:
+true` option was added — it would only benefit non-manga content and would need
+to gate manga out, which isn't worth the API surface for a manga-focused codec.
+`perceptualMask`/`spatialMask` are expressed atop the existing `acScale`/
+`quantLF` decoupling (no redundant "coarsen" knob). All 405 tests green; `dart
 analyze` clean.
 
 ## Robustness
