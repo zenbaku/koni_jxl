@@ -154,8 +154,12 @@ void main() {
     });
 
     test(
-        'progressive-DC (separate LF frame) lossy image falls back but still '
-        'downscales correctly', () {
+        'progressive-DC (separate LF frame) lossy image takes the DC-only '
+        'path (below 1:8) and downscales correctly', () {
+      // The DC lives in a separate level-1 LF frame; the fast path decodes only
+      // that (small) frame and skips the main frame's AC. As with every case
+      // here, this asserts correctness vs a box-downsample of the full decode —
+      // that the cheap path (not the fallback) served it is a timing detail.
       final bytes = _read('color_cover_d1.0_e5_progdc1.jxl');
       final full = JxlDecoder.decode(bytes);
       final target = (full.width / 16).ceil();

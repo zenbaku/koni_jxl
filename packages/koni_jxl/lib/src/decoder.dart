@@ -94,13 +94,8 @@ final class JxlDecoder {
         preview.readToc();
       }
 
-      final frame = Frame(reader, header);
-      final fh = frame.readFrameHeader();
-      if (!_dcOnlyEligible(fh)) return null;
-      frame.readToc();
-
-      frame.decodeLfOnly();
-      final dcImage = buildDcImage(frame, header, iccProfile, isPreview: false);
+      final dcImage = _dcImageFor(reader, header, iccProfile);
+      if (dcImage == null) return null;
 
       // Only usable when the caller's real target is no finer than the DC
       // image itself — otherwise this would silently under-deliver detail
@@ -127,21 +122,80 @@ final class JxlDecoder {
     }
   }
 
+  /// Builds the 1:8 DC image for the DC-only fast path, or null when this file
+  /// isn't a shape the fast path handles (caller then falls back to a full
+  /// decode). Two shapes are handled, both cheap because JXL keeps DC (LF) and
+  /// AC (HF) in separate bitstream sections:
+  ///
+  /// - a **plain single VarDCT frame**: decode only its LfGlobal + LF groups
+  ///   ([Frame.decodeLfOnly]) and assemble the DC ([buildDcImage]);
+  /// - a **progressive-DC** file, whose DC lives in a separate level-1 LF frame
+  ///   ahead of the main frame: decode that (small) LF frame and assemble its
+  ///   rows ([buildDcImageFromRows]), skipping the main frame's AC entirely.
+  ///   The main frame must itself be a plain full-canvas last VarDCT frame, so
+  ///   its 1:8 DC represents the final image (the same discipline as the plain
+  ///   case, just spread across two frames).
+  static JxlImage? _dcImageFor(
+    BitReader reader,
+    ImageHeader header,
+    Uint8List? iccProfile,
+  ) {
+    final first = Frame(reader, header);
+    final firstFh = first.readFrameHeader();
+    if (firstFh.type == FrameFlags.lfFrame) {
+      if (firstFh.lfLevel != 1 ||
+          firstFh.encoding != FrameFlags.vardct ||
+          firstFh.upsampling != 1) {
+        return null; // multi-level or non-VarDCT DC frame: not handled
+      }
+      first.readToc(); // Toc.read skips the reader past this frame's data
+      final main = Frame(reader, header);
+      final mainFh = main.readFrameHeader();
+      if (mainFh.type != FrameFlags.regularFrame ||
+          mainFh.flags & FrameFlags.useLfFrame == 0 ||
+          !_plainVardctFrame(mainFh, allowLfFrame: true)) {
+        return null;
+      }
+      // The LF frame kept its own section bytes at readToc, so it decodes
+      // independent of where the reader now sits (past the main header).
+      first.decodeFrame();
+      return buildDcImageFromRows(
+        [for (var c = 0; c < 3; c++) first.buffer[c].floatRows],
+        first.paddedFrameSize.height,
+        first.paddedFrameSize.width,
+        first.header.doYCbCr,
+        header,
+        iccProfile,
+        isPreview: false,
+      );
+    }
+    if (!_dcOnlyEligible(firstFh)) return null;
+    first.readToc();
+    first.decodeLfOnly();
+    return buildDcImage(first, header, iccProfile, isPreview: false);
+  }
+
   /// Whether [fh] is a plain single-frame VarDCT frame with none of the
   /// features (patches/splines/noise/a separate LF frame/format-level
   /// upsampling) that the DC-only path doesn't account for.
-  static bool _dcOnlyEligible(FrameHeader fh) {
-    const unsupportedFlags = FrameFlags.noise |
-        FrameFlags.patches |
-        FrameFlags.splines |
-        FrameFlags.useLfFrame;
-    return fh.type == FrameFlags.regularFrame &&
-        fh.encoding == FrameFlags.vardct &&
+  static bool _dcOnlyEligible(FrameHeader fh) =>
+      fh.type == FrameFlags.regularFrame &&
+      _plainVardctFrame(fh, allowLfFrame: false);
+
+  /// The shared "plain VarDCT frame" predicate: last, full-canvas, no
+  /// format-level upsampling, and none of the patches/splines/noise features
+  /// the DC path can't represent. [allowLfFrame] keeps a progressive-DC main
+  /// frame's `useLfFrame` flag from disqualifying it (that flag is expected
+  /// there); the plain single-frame path forbids it.
+  static bool _plainVardctFrame(FrameHeader fh, {required bool allowLfFrame}) {
+    const base = FrameFlags.noise | FrameFlags.patches | FrameFlags.splines;
+    final bad = allowLfFrame ? base : base | FrameFlags.useLfFrame;
+    return fh.encoding == FrameFlags.vardct &&
         fh.isLast &&
         fh.fullFrame &&
         fh.upsampling == 1 &&
         fh.ecUpsampling.every((u) => u == 1) &&
-        fh.flags & unsupportedFlags == 0;
+        fh.flags & bad == 0;
   }
 
   /// Downsamples [image] to fit [targetWidth]/[targetHeight] if it doesn't
