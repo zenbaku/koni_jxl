@@ -307,12 +307,39 @@ void main() {
       info.dispose();
     });
 
+    test('cacheWidth resolves a reduced-resolution image', () async {
+      final provider =
+          JxlImageProvider.memory(sample.readAsBytesSync(), cacheWidth: 64);
+      final completer = Completer<ImageInfo>();
+      final stream = provider.resolve(ImageConfiguration.empty);
+      late ImageStreamListener listener;
+      listener = ImageStreamListener(
+        (info, _) => completer.complete(info),
+        onError: (error, stack) => completer.completeError(error, stack),
+      );
+      stream.addListener(listener);
+      final info = await completer.future;
+      expect(info.image.width, lessThanOrEqualTo(64)); // native is 256
+      stream.removeListener(listener);
+      info.dispose();
+    });
+
     test('equality keys the image cache correctly', () {
       final bytes = sample.readAsBytesSync();
       expect(JxlImageProvider.memory(bytes), JxlImageProvider.memory(bytes));
       expect(JxlImageProvider.asset('a.jxl'), JxlImageProvider.asset('a.jxl'));
       expect(JxlImageProvider.asset('a.jxl'),
           isNot(JxlImageProvider.asset('b.jxl')));
+      // cacheWidth/cacheHeight participate in the cache key: the same file at a
+      // different target size must be a distinct entry.
+      expect(JxlImageProvider.asset('a.jxl', cacheWidth: 100),
+          isNot(JxlImageProvider.asset('a.jxl')));
+      expect(JxlImageProvider.asset('a.jxl', cacheWidth: 100),
+          JxlImageProvider.asset('a.jxl', cacheWidth: 100));
+      expect(JxlImageProvider.asset('a.jxl', cacheWidth: 100),
+          isNot(JxlImageProvider.asset('a.jxl', cacheWidth: 200)));
+      expect(JxlImageProvider.asset('a.jxl', cacheHeight: 100),
+          isNot(JxlImageProvider.asset('a.jxl', cacheWidth: 100)));
     });
   });
 }
