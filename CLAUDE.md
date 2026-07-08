@@ -133,12 +133,23 @@ bounds-checks the context, so most decode-time index bugs surface there.
   Publishing requires the owner's pub.dev account — never publish
   autonomously.
 
-## Remaining known gaps (throw `JxlUnsupportedException`)
+## Remaining known gaps (graceful degradation, not thrown)
 
-Spot-color rendering, JPEG bitstream reconstruction, ICC-driven output
-transforms. None block the manga use case. Float (HDR) sample *decode* is
-now supported (encoding one remains unimplemented, no encoder path ever
-attempted it).
+None block the manga use case, and — despite an earlier phrasing here — these
+do **not** throw `JxlUnsupportedException`; they decode with the feature
+un-applied:
+- **Spot-color rendering** — the spot-color extra channel is decoded but never
+  composited onto the image.
+- **JPEG bitstream reconstruction** — the `jbrd` box is ignored; pixels decode
+  through the normal VarDCT path (byte-exact JPEG re-emission is out of scope).
+- **ICC-driven output transform** — a file whose color is described only by an
+  embedded ICC profile decodes as if tagged sRGB. The raw ICC profile is itself
+  decoded byte-exact (conformance-gated, `icc/icc_codec.dart`) and exposed on
+  `JxlImage.iccProfile` for a caller's own color-management to apply.
+
+The only `JxlUnsupportedException` on the decode path is an unsupported transfer
+function. Float (HDR) sample *decode* is now supported (encoding one remains
+unimplemented, no encoder path ever attempted it).
 Encoder sizing decisions must use exact Huffman code lengths, never
 Shannon entropy (the 1-bit-per-symbol prefix floor dominates skewed
 histograms). Known slow path: EPF pass 0 (epfIterations == 3, rare) is
