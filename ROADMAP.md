@@ -978,10 +978,27 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
   gradient wins by 11% — because the context tree exploits structure the
   zeroth-order entropy can't see. The margin guard keeps the sub-percent (in
   fact zero, on everything tested) size promise.
-- 🔲 **Larger hybrid split exponent for WP.** WP residuals have larger
-  magnitudes, so the fixed `HybridIntegerConfig(4,1,0)` spends many extra
-  bits. A larger split (fewer extra bits, bigger token alphabet) likely
-  helps WP-chosen images; measure and pick per image.
+- ✅ **Per-image hybrid-uint config (was "larger hybrid split exponent for
+  WP") (2026-07-08).** The encoder now tries two hybrid-uint tokenization
+  configs per image — `(4,1,0)` and `(4,2,0)` (`_hybridConfigs`) — at the
+  entropy-coding stage and keeps the smallest actual output, alongside the
+  existing predictor and {plain,LZ77}×{prefix,ANS} choices. Measurement
+  corrected the original premise on two points: (1) the lever is **not** the
+  split exponent (sweeping `se` 3→8 barely moved anything) but
+  `msb_in_token` (1→2 — one more high-order magnitude bit in the
+  entropy-coded token); (2) it helps **screentone/line-art** most, not the
+  "WP-chosen photographic" content the item guessed — real wins are
+  gray_screentone **−3.9%**, screentone_256 −2.4%, gray16_gradient −2.3%,
+  a real Naruto manga page −2.05% (others −0.06% to −0.1%), photos a fraction
+  of a percent; `(4,1,0)` still wins on smooth photo (color_cover) and
+  palette content, so keeping both per-image is **never-worse** (verified:
+  color_cover/palette16 byte-identical). The win is pure tokenization
+  (tree-independent — verified byte-identical with the tree frozen), so it's
+  the cheap entropy-stage loop, not a re-run of tree learning. Cost: one
+  extra histogram build per image (**+6–14%** encode time; still net faster
+  than before the predictor-selection round on the same content). The chosen
+  config is serialized per stream and djxl-gated via the corpus round-trip
+  tests (screentone content now emits `(4,2,0)`). See doc/spec_notes.md.
 - 🔲 **Delta palette.** The decoder supports delta-palette entries; the
   encoder only emits plain palettes. Would help near-flat color art.
 - 🔲 **Per-leaf predictor selection.** The learned tree currently uses one

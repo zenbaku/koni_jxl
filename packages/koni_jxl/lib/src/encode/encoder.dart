@@ -137,7 +137,25 @@ final class JxlEncoder {
           config: config ?? VardctL0Config.fromDistance(distance));
 }
 
+/// The default hybrid-uint tokenization config, also used to train the
+/// context tree (the tree's split ranking is insensitive to which candidate
+/// config below is ultimately chosen — verified: fixing tree training here
+/// while sweeping the entropy config gives byte-identical output).
 const _config = HybridIntegerConfig(4, 1, 0);
+
+/// Candidate hybrid-uint configs tried per image at the entropy-coding stage;
+/// the smallest actual output wins (like the predictor / entropy-mode choice).
+/// The config only changes how residuals at/above the split point (2^4 packed,
+/// i.e. |residual| >= 8) are tokenized — it's a no-op for small-residual
+/// content, so trying `(4, 2, 0)` is free there and a real win where it
+/// helps (screentone/manga -2% to -4%, some gradients/photos a fraction of a
+/// percent; `(4, 1, 0)` still wins on smooth-photo and palette content, hence
+/// keeping both and choosing per image). Both are decoder-legal and the
+/// chosen config is serialized into each entropy stream's header.
+const _hybridConfigs = [
+  HybridIntegerConfig(4, 1, 0),
+  HybridIntegerConfig(4, 2, 0),
+];
 
 int _packSigned(int v) => v >= 0 ? v << 1 : (-v << 1) - 1;
 
@@ -482,26 +500,34 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       for (var s = 0; s < sectionValues.length; s++)
         lz77Compress(sectionContexts[s], sectionValues[s]),
     ];
-    final lzCodes = EntropyCodes.buildLz77(numContexts, sectionOps, _config);
     final allContexts = <int>[];
     final allValues = <int>[];
     for (var s = 0; s < sectionValues.length; s++) {
       allContexts.addAll(sectionContexts[s]);
       allValues.addAll(sectionValues[s]);
     }
-    final plainCodes =
-        EntropyCodes.build(numContexts, allContexts, allValues, _config);
-    // Four candidates: {plain, LZ77} x {prefix, ANS}. ANS spends fractional
-    // bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs. Unifying
-    // them lets an image get both wins when the estimator says so.
-    final plainEst = plainCodes.estimatedBits();
-    final lzEst = lzCodes.estimatedBits();
-    final plainAnsEst =
-        plainCodes.ansViable ? plainCodes.ansEstimatedBits() : double.infinity;
-    final lzAnsEst =
-        lzCodes.ansViable ? lzCodes.ansEstimatedBits() : double.infinity;
-    final best = [plainEst, lzEst, plainAnsEst, lzAnsEst]
-        .reduce((a, b) => a < b ? a : b);
+    // For each candidate hybrid-uint config, build the {plain, LZ77} x
+    // {prefix, ANS} entropy codes and their size estimates. ANS spends
+    // fractional bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs;
+    // the config governs how at/above-split residuals tokenize. The residual
+    // values (and their LZ77 matches, which are on values, not tokens) are
+    // config-independent, so only the tokenization/histogram build repeats.
+    final candidates = <(EntropyCodes, bool, bool, double)>[];
+    for (final cfg in _hybridConfigs) {
+      final lzCodes = EntropyCodes.buildLz77(numContexts, sectionOps, cfg);
+      final plainCodes =
+          EntropyCodes.build(numContexts, allContexts, allValues, cfg);
+      candidates.add((plainCodes, false, false, plainCodes.estimatedBits()));
+      candidates.add((lzCodes, false, true, lzCodes.estimatedBits()));
+      if (plainCodes.ansViable) {
+        candidates
+            .add((plainCodes, true, false, plainCodes.ansEstimatedBits()));
+      }
+      if (lzCodes.ansViable) {
+        candidates.add((lzCodes, true, true, lzCodes.ansEstimatedBits()));
+      }
+    }
+    final best = candidates.map((c) => c.$4).reduce((a, b) => a < b ? a : b);
 
     // Assembles the full codestream for one entropy mode. Cheap enough to run
     // for each close candidate and keep the smallest actual output — estimates
@@ -584,13 +610,8 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
 
     // Candidates within 3% of the best estimate get assembled for real; the
     // smallest actual output wins. This captures near-tie wins (e.g. unified
-    // ANS+LZ77 beating LZ77 by a fraction of a percent) that estimates miss.
-    final candidates = <(EntropyCodes, bool, bool, double)>[
-      (plainCodes, false, false, plainEst),
-      (lzCodes, false, true, lzEst),
-      if (plainCodes.ansViable) (plainCodes, true, false, plainAnsEst),
-      if (lzCodes.ansViable) (lzCodes, true, true, lzAnsEst),
-    ];
+    // ANS+LZ77 beating LZ77 by a fraction of a percent, or a config that
+    // estimates as a hair worse but assembles smaller) that estimates miss.
     final threshold = best * 1.03;
     Uint8List? bestBytes;
     var bestMode = '';
@@ -599,10 +620,14 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       final bytes = assemble(codes, ans, lz);
       if (bestBytes == null || bytes.length < bestBytes.length) {
         bestBytes = bytes;
-        bestMode = '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}';
+        final se = codes.config.splitExponent;
+        final mb = codes.config.msbInToken;
+        final lb = codes.config.lsbInToken;
+        bestMode = '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}'
+            '/h$se$mb$lb';
       }
     }
-    final finalBytes = bestBytes ?? assemble(plainCodes, false, false);
+    final finalBytes = bestBytes ?? assemble(candidates.first.$1, false, false);
     return (finalBytes, '${useWp ? "wp" : "grad"}/$bestMode');
   }
 

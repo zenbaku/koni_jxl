@@ -349,6 +349,42 @@ per-image proxy-vs-actual comparison), both correcting the original plan:
   training set's own ~0.2% sampling noise, so a gap that large reflects a
   real difference rather than noise.
 
+### Lossless encoder — per-image hybrid-uint config selection
+
+The encoder tries two hybrid-uint tokenization configs per image at the
+entropy-coding stage — `(4,1,0)` and `(4,2,0)` (`_hybridConfigs`) — and keeps
+the smallest actual output, layered under the existing predictor and
+{plain,LZ77}×{prefix,ANS} choices. `(4,2,0)` differs only in `msb_in_token`
+(2 instead of 1): one more high-order magnitude bit of each at/above-split
+residual goes into the entropy-coded token instead of the raw extra bits.
+
+Findings, all from measuring before implementing (the roadmap item guessed
+this was about the split *exponent* and about WP/photographic content — both
+wrong):
+
+- **The lever is `msb_in_token`, not `split_exponent`.** Sweeping the split
+  exponent 3→8 (msb fixed at 1) barely moved output on any content; bumping
+  msb 1→2 did. Larger msb (3, 4) or dropping it to 0 was worse.
+- **It helps screentone / line art most, not photographic content.** Real
+  wins: `gray_screentone` −3.9%, `screentone_256` −2.4%, `gray16_gradient`
+  −2.3%, a real Naruto manga page −2.05% (three other pages −0.06% to
+  −0.09%); natural photos (`bike`/`cafe`/`opsin`) only a fraction of a
+  percent. `(4,1,0)` still wins on smooth photo (`color_cover`) and palette
+  content — so keeping both and choosing per image is **never-worse** (those
+  two stay byte-identical).
+- **The win is pure tokenization, tree-independent.** Freezing the context
+  tree's training on `(4,1,0)` while coding with `(4,2,0)` gives byte-
+  identical output to changing both — so the tree is trained once on `(4,1,0)`
+  and only the entropy-stage tokenization/histogram build repeats per config
+  (the residual values, and their LZ77 matches which are on values not
+  tokens, are config-independent). Cost is one extra histogram build per
+  image, ~6–14% encode time.
+
+The chosen config is serialized into each entropy stream's header (the
+decoder reads it back), and is djxl-gated through the corpus round-trip tests
+— `gray_screentone`/`screentone_256` now emit `(4,2,0)` and still decode
+bit-exact through both this decoder and djxl.
+
 ### Lossy (VarDCT) encoder — L0
 
 `JxlEncoder.encodeLossy` (`lib/src/encode/vardct/`) implements the L0
