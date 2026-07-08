@@ -136,6 +136,56 @@ frame) deviates from djxl at rmse ~21.9 / max 77 — identically in jxlatte
 alpha-weighted patch blending; tracked for a fix against libjxl's
 dec_patch_dictionary. `patches_lossless` (additive patches) is bit-exact.
 
+## Chained multi-layer frame blend modes (`blendmodes`) — a libjxl-version deviation, not a bug
+
+The `blendmodes` conformance testcase is a 12-bit Modular RGB+Alpha
+(non-premultiplied) image of 5 full-frame layers chaining every blend mode
+against the accumulated reference slot 1:
+`Replace → Blend → Add → Mul → MulAdd` (frame headers: modes 0/2/1/4/3,
+`src=1`, `saveRef=1`, `beforeCT=false`, `clamp=false` throughout). koni
+decodes it at rmse **15.76 / max 92** vs the authoritative `ref.png`
+(R 12.35, G 20.49, B 13.13; alpha bit-exact).
+
+**This was investigated in full (2026-07-08) and is confirmed NOT a koni
+bug — it is a libjxl-version discrepancy that koni faithfully inherits:**
+
+- **koni ≈ jxlatte ≈ djxl 0.11.2, all within 8-bit rounding (±1).** Direct
+  comparison of koni's output to djxl 0.11.2's own decode of the same file:
+  max diff ≤ 1 on every channel (R/G/B/A rmse 0.44/0.24/0.44/0.32). koni is
+  in fact *closer* to `ref.png` on alpha (rmse 0.0) than djxl is (0.32).
+- **djxl 0.11.2 itself FAILS this conformance case.** Its own deviation from
+  `ref.png` is essentially identical to koni's (R 12.35, G 20.53, B 13.18).
+  The `test.json` threshold is `rms_error 0.004` (float); djxl's error is
+  ~0.062. So libjxl 0.11.2 does not pass `blendmodes`, and koni tracks it.
+- **Every per-mode blend formula was verified against current libjxl source**
+  (`lib/jxl/alpha.cc`, `lib/jxl/blending.cc`): non-premult kBlend
+  numerator/denominator, kAdd, kMul, and kAlphaWeightedAdd (kMulAdd) all
+  match koni's `render/blend.dart` exactly. libjxl blends every extra channel
+  (including alpha) uniformly; koni/jxlatte special-case the alpha channel in
+  MulAdd ("preserve old"), but this only touches the *final* frame's alpha
+  (F4 is last) and the final alpha is bit-exact vs `ref.png` anyway — a red
+  herring for the RGB deviation.
+- **The RGB deviation is a genuine chained-blend semantic difference, not
+  rounding or clamping.** The green error is localized entirely to `x < 400`
+  (where frame 2's Add sets −300, pushing darks out of range) and only on
+  unsaturated pixels; green is bit-exact for `x ≥ 400`. Two clamp hypotheses
+  from the earlier characterization were tested empirically and **ruled out**
+  — clamping the intermediate reference to `[0,1]`, and to `[0,∞)`
+  (lower-bound only), each make the deviation *worse* (ch1 20.5 → 32.5 and
+  21.6 respectively). libjxl carries full-range intermediate values.
+
+**Decision (matches the project's "gate against djxl" discipline and the
+`patches` precedent): koni is correct relative to the reference decoder we
+gate against; do not diverge from djxl to chase `ref.png`.** `blendmodes` is
+gated in the `vardct conformance vs djxl` group (koni vs djxl, rmse < 2 /
+max < 48), which passes — this locks in that koni tracks libjxl on this case.
+It is deliberately *not* in the `conformance vs ref.png` group. Matching
+`ref.png` would require reverse-engineering spec-correct chained-blend
+semantics that even libjxl `main` appears not to implement, with no local
+reference decoder to gate against, at the risk of the passing `animation_*`
+cases — out of scope unless a future libjxl release is shown to match the
+reference.
+
 ## Output color pipeline
 
 XYB images are inverted to linear RGB with the image's primaries, then

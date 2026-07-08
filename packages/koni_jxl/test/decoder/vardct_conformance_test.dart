@@ -12,9 +12,16 @@ import '../util/pnm.dart';
 /// M5 gate: VarDCT/lossy conformance testcases decode within tolerance of
 /// djxl. Still excluded (tracked for later): upsampling (M6), noise (M6),
 /// animation_* (multi-frame, gated in animation_test), cmyk_layers (CMYK →
-/// RGB needs a LUT-ICC CMS), lossless_pfm (float samples), blendmodes
-/// (extra-channel/layer blend modes), patches (alpha-blended VarDCT patches;
-/// jxlatte deviates identically — see doc/spec_notes.md).
+/// RGB needs a LUT-ICC CMS), lossless_pfm (float samples), patches
+/// (alpha-blended VarDCT patches; jxlatte deviates identically — see
+/// doc/spec_notes.md).
+///
+/// `blendmodes` is gated here against djxl rather than in the ref.png group
+/// on purpose: koni matches djxl 0.11.2 and jxlatte to within 8-bit rounding
+/// (±1) on this chained Replace→Blend→Add→Mul→MulAdd bitstream, but djxl
+/// *itself* deviates from the authoritative `ref.png` by rmse ~15.8 — i.e.
+/// libjxl 0.11.2 does not pass this conformance case, and koni faithfully
+/// tracks it. See doc/spec_notes.md ("Chained multi-layer blend modes").
 ///
 /// A second group below gates a broad set of cases against the authoritative
 /// `ref.png`. For *some* ICC profiles djxl writes *linear* pixels to PNM
@@ -37,6 +44,9 @@ const cases = [
   'alpha_premultiplied',
   'noise',
   'upsampling',
+  // koni tracks djxl here even though djxl deviates from ref.png (see doc
+  // comment above and doc/spec_notes.md).
+  'blendmodes',
 ];
 
 void main() {

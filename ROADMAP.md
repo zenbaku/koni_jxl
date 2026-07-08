@@ -1017,17 +1017,25 @@ feature un-applied rather than throwing — the only decode-path
   (subsampled) spot channels are skipped (none in the corpus).
 - 🔲 **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
   a JPEG-transcoded `.jxl` (needs the jbrd box + JPEG serialization).
-- 🔲 **Chained multi-layer blend modes (`blendmodes` conformance case) —
-  characterized, next session.** koni supports all blend modes and animation
-  blending is bit-exact, but the `blendmodes` case (5 frames chaining
-  Replace→Blend→Add→Mult→MulAdd, each against the accumulated reference;
-  Modular 12-bit, non-premultiplied alpha) deviates rmse 15.76 / max 92 vs
-  `ref.png` with a smooth, content-correlated error (alpha is correct).
-  Hypothesis: a clamping / intermediate-domain subtlety between chained
-  arithmetic blends (e.g. an unclamped Add overflowing >1 before a later
-  Mult). Needs libjxl's per-mode clamp/domain semantics pinned before
-  patching — a guess-patch would risk the passing `animation_*` cases. See
-  doc/spec_notes.md's memory notes for the full characterization.
+- ✅ **Chained multi-layer blend modes (`blendmodes` conformance case) —
+  investigated; NOT a koni bug, it's a libjxl-version deviation koni tracks
+  faithfully (2026-07-08).** The `blendmodes` case (5 frames chaining
+  Replace→Blend→Add→Mul→MulAdd against the accumulated reference; Modular
+  12-bit, non-premultiplied alpha) deviates rmse 15.76 / max 92 vs `ref.png`
+  — but so does **djxl 0.11.2 itself** (nearly identical error), and koni
+  matches djxl 0.11.2 and jxlatte to within 8-bit rounding (±1) on every
+  channel (alpha bit-exact). Every per-mode formula was verified against
+  current libjxl `alpha.cc`/`blending.cc`; both intermediate-clamp
+  hypotheses were tested and ruled out (they make it worse). So libjxl 0.11.2
+  does not pass this conformance case and koni correctly tracks it.
+  **Decision (per the "gate against djxl" discipline and the `patches`
+  precedent): keep koni matching djxl, don't diverge to chase `ref.png`.**
+  Now gated in the `vardct conformance vs djxl` group (koni vs djxl passes);
+  deliberately excluded from the ref.png group. See doc/spec_notes.md
+  ("Chained multi-layer frame blend modes"). Matching `ref.png` would mean
+  reverse-engineering spec-correct semantics even libjxl `main` seems not to
+  implement, with no local reference decoder to gate against — out of scope
+  unless a future libjxl release is shown to match the reference.
 - 🔲 **CMYK output.** `cmyk_layers` decodes the CMYK channels but converting
   to RGB needs its LUT/CLUT ICC profile (a 557 KB device-link profile) — a
   real CMS task; matrix/TRC RGB ICC profiles are handled, LUT/CLUT are not.
