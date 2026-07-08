@@ -10,21 +10,23 @@ import '../util/png.dart';
 import '../util/pnm.dart';
 
 /// M5 gate: VarDCT/lossy conformance testcases decode within tolerance of
-/// djxl. Excluded (skip list, tracked for later):
-/// cafe + bench_oriented_brg (YCbCr/jbrd), upsampling (M6), noise (M6),
-/// animation_* (multi-frame, gated in animation_test), cmyk_layers (CMYK),
-/// lossless_pfm (float samples), blendmodes (extra-channel blending),
-/// patches (alpha-blended VarDCT patches; jxlatte deviates identically —
-/// see doc/spec_notes.md).
+/// djxl. Still excluded (tracked for later): upsampling (M6), noise (M6),
+/// animation_* (multi-frame, gated in animation_test), cmyk_layers (CMYK →
+/// RGB needs a LUT-ICC CMS), lossless_pfm (float samples), blendmodes
+/// (extra-channel/layer blend modes), patches (alpha-blended VarDCT patches;
+/// jxlatte deviates identically — see doc/spec_notes.md).
 ///
-/// The ICC/spot cases (`grayscale`, `grayscale_public_university`,
-/// `patches_lossless`, `progressive`, `spot`) are gated separately below
-/// against the authoritative `ref.png`, NOT against djxl's PNM output: djxl
-/// writes *linear* pixels to PNM for these ICC profiles, so the djxl-proxy
-/// comparison used for the enum-colour cases is the wrong reference here (it
-/// was why these were long skipped). `spot` additionally exercises spot-colour
-/// compositing. See color/icc_transform.dart, decoder `_compositeSpotColors`,
-/// and doc/spec_notes.md.
+/// A second group below gates a broad set of cases against the authoritative
+/// `ref.png`. For *some* ICC profiles djxl writes *linear* pixels to PNM
+/// (verified for `grayscale`'s printer profile and `progressive`'s gamma-2.22
+/// display profile — the reason those were long skipped), so ref.png is the
+/// safe reference for every ICC-tagged case even where djxl happens to agree
+/// (`cafe`, `bench_oriented_brg`, `patches_lossless`). The group covers the ICC
+/// output transform (`grayscale*`, `patches_lossless`, `progressive`, `cafe`,
+/// `bench_oriented_brg`), spot-colour compositing (`spot`), and a set that
+/// already decoded correctly but had no conformance gate (`delta_palette`,
+/// `sunset_logo`, `alpha_triangles`, `lz77_flower`). See color/
+/// icc_transform.dart, decoder `_compositeSpotColors`, and doc/spec_notes.md.
 final conformanceDir = Directory('../../third_party/conformance/testcases');
 
 const cases = [
@@ -34,8 +36,6 @@ const cases = [
   'alpha_nonpremultiplied',
   'alpha_premultiplied',
   'noise',
-  'cafe',
-  'bench_oriented_brg',
   'upsampling',
 ];
 
@@ -89,7 +89,7 @@ void main() {
   // above for why not djxl). progressive exercises the real matrix/TRC output
   // transform (XYB + non-sRGB TRC); the others already decode correctly and
   // were only ever failing the wrong (djxl-PNM) reference.
-  group('ICC/spot conformance vs ref.png', () {
+  group('conformance vs ref.png', () {
     if (!haveConformance) return;
     for (final tc in [
       'grayscale',
@@ -97,6 +97,12 @@ void main() {
       'patches_lossless',
       'progressive',
       'spot',
+      'cafe',
+      'bench_oriented_brg',
+      'delta_palette',
+      'sunset_logo',
+      'alpha_triangles',
+      'lz77_flower',
     ]) {
       test(tc, () {
         final dir = '${conformanceDir.path}/$tc';

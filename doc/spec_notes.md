@@ -155,18 +155,23 @@ starting belief — "ICC files decode wrong; needs a CMS" — was mostly wrong.
 Measuring koni's decode against the authoritative conformance `ref.png`
 (not djxl's PNM output) showed **3 of 4 ICC conformance cases already decode
 correctly**: `grayscale` (rmse 0.32), `grayscale_public_university` (0.003),
-`patches_lossless` (0.000). They had been *skipped* only because
+`patches_lossless` (0.000). The two grayscale cases had been *skipped* because
 `vardct_conformance_test.dart` compared against djxl's PNM output, and **djxl
-writes *linear* pixels to PNM for these profiles** (verified: djxl-PNM ==
-`sRGB_to_linear(ref.png)`), so the djxl proxy was the wrong reference. Only
-`progressive` (XYB + a non-sRGB display profile) had a real deviation (rmse
-12.6 vs ref.png). It was characterised as TRC-only (per-channel, identical
-across R/G/B, no channel mixing → sRGB primaries), and the exact fix
+writes *linear* pixels to PNM for the non-sRGB profiles** — verified for
+`grayscale`'s printer profile and `progressive`'s gamma-2.22 display profile
+(djxl-PNM == `sRGB_to_linear(ref.png)`) — so the djxl proxy was the wrong
+reference there. (For identity/sRGB ICC profiles — `patches_lossless`, `cafe`,
+`bench_oriented_brg` — djxl agrees with ref.png; those pass either way, but the
+ref.png group is the safe reference for all ICC cases.) Only `progressive`
+(XYB + a non-sRGB display profile) had a real *decode* deviation (rmse 12.6 vs
+ref.png). It was characterised as TRC-only (per-channel, identical across
+R/G/B, no channel mixing → sRGB primaries), and the exact fix
 `ref == invTRC_profile(sRGB_to_linear(koni))` was **verified numerically at
 sampled points before any code was written** (the profile's `rTRC` is a
 parametric `para` funcType-3 gamma≈2.22 curve). After implementing, all four
 cases pass against `ref.png` at rmse<2/max<48 (`progressive` 12.6 → 0.082),
-now gated in a dedicated `ICC-tagged conformance vs ref.png` group; the
+now gated in a `conformance vs ref.png` group (also covering `spot`, `cafe`,
+`bench_oriented_brg`, and several already-correct-but-ungated cases); the
 enum-colour cases are unaffected (the transform only fires on
 `useIccProfile`). The colorant-matrix path (for genuinely non-sRGB primaries —
 no conformance case exercises it) is covered by `test/color/
