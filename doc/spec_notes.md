@@ -302,12 +302,52 @@ beating LZ77-prefix by ~0.1% on a color page). With the per-image learned
 context tree (the biggest single lever, matching cjxl's e2->e3 jump where
 learned trees and the weighted predictor turn on), real manga pages now
 land near cjxl -e3: a B/W page at ~98% of cjxl -e3, a color page at ~81%.
-The encoder tries both predictors (clamped gradient and self-correcting
-weighted) and both property sets, keeping the smallest actual output; the
-weighted predictor's property 15 (max-error) is included in its tree
-candidates, which is what makes WP win on color/tonal content (one piece
-color page -4%, B/W page flips to WP).
-All output is bit-exact through this decoder and djxl.
+The encoder considers both predictors (clamped gradient and self-correcting
+weighted) and both property sets; the weighted predictor's property 15
+(max-error) is included in its tree candidates, which is what makes WP win on
+color/tonal content (one piece color page -4%, B/W page flips to WP). Rather
+than run both pipelines fully and keep the smaller, it now decides between
+them from the learned trees' training entropy — see "Predictor selection"
+below. All output is bit-exact through this decoder and djxl.
+
+### Lossless encoder — predictor selection from learned-tree training entropy
+
+The encoder used to run *both* predictor pipelines end to end (Pass A →
+learn tree → Pass B → entropy coding → assembly) and keep the smaller
+output — roughly 2× the necessary work. It now runs only Pass A + tree
+learning for both predictors, then decides which to finish from
+`ContextTree.trainingBits` (new): the total zeroth-order entropy the learned
+tree's leaves achieve on the strided training set, summed leaf by leaf. When
+one predictor's training entropy is clearly lower (≥ `_kPredictorMargin` =
+2%), only that predictor's Pass B + entropy coding + assembly runs; the
+loser's is skipped. Near ties (within 2%) finish both and keep the genuinely
+smaller output, so a mispredicted tie cannot regress size.
+
+Measured, bit-identical output across the whole corpus and the photographic
+conformance images (`bike`/`cafe` skip gradient, `bicycles`/all corpus skip
+weighted, `opsin_inverse`/`noise` finish both); encode time −26% on
+`color_cover`, −17% on `gray_screentone` (git-stash A/B, AOT, median of 3).
+
+Two findings from measuring first (the phase-timing breakdown and a
+per-image proxy-vs-actual comparison), both correcting the original plan:
+
+- **It's ~15–27%, not "roughly halves."** `learnTree` is the single most
+  expensive phase (≈0.8–0.9 s of a ≈5.6 s `color_cover` encode, per
+  predictor) and must run for *both* to decide reliably, so it cannot be
+  skipped. What's skipped is the loser's Pass B + entropy coding + assembly.
+- **A cheaper pre-tree proxy would reach ~50% but is unreliable.** A
+  zeroth-order raw-bits estimate over the residual stream (token entropy +
+  hybrid-uint extra bits, no context tree) *would* let the loser's
+  `learnTree` be skipped too — but it was measured to mispredict badly: on
+  `color_cover` it picks the weighted predictor, which the tree-modelled
+  result shows losing to gradient by 11%. The context tree exploits spatial
+  structure the zeroth-order entropy is blind to, so any reliable decision
+  needs the tree. `trainingBits` was correct on every test image except one
+  genuine near-tie (`noise`, a 0.07% training-entropy gap, +1.4% if
+  mispicked) — exactly the case the 2% margin guard sends down the
+  finish-both path. The margin (2%) is comfortably above the ~300k-sample
+  training set's own ~0.2% sampling noise, so a gap that large reflects a
+  real difference rather than noise.
 
 ### Lossy (VarDCT) encoder — L0
 

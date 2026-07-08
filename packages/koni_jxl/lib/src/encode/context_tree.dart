@@ -83,8 +83,8 @@ final class _Node {
 
 /// A learned tree ready to serialize and to assign contexts with.
 final class ContextTree {
-  ContextTree._(
-      this._root, this.numContexts, this._nodesInOrder, this.properties);
+  ContextTree._(this._root, this.numContexts, this._nodesInOrder,
+      this.properties, this.trainingBits);
 
   final _Node _root;
   final int numContexts;
@@ -92,6 +92,13 @@ final class ContextTree {
 
   /// The decoder property ids this tree splits on (index order).
   final List<int> properties;
+
+  /// Total zeroth-order entropy (bits) this tree's leaves achieve on the
+  /// strided training set — the sum over leaves of each leaf's token-histogram
+  /// entropy. A predictor-independent, context-modelled cost signal available
+  /// the moment the tree is learned (before Pass B / entropy coding); used to
+  /// compare the gradient vs weighted-predictor pipelines cheaply.
+  final double trainingBits;
 
   /// Number of distinct contexts (tree leaves).
   int get contexts => numContexts;
@@ -222,6 +229,20 @@ ContextTree learnContextTree(
     leaves++;
   }
 
+  // Training entropy: sum of each leaf's token-histogram entropy. `frontier`
+  // holds exactly the leaves (split nodes were removed as they split).
+  var trainingBits = 0.0;
+  final leafHist = List<int>.filled(alpha, 0);
+  for (final leaf in frontier) {
+    for (final s in leaf.samples) {
+      leafHist[tokens[s]]++;
+    }
+    trainingBits += _countsEntropy(leafHist, leaf.samples.length);
+    for (final s in leaf.samples) {
+      leafHist[tokens[s]] = 0;
+    }
+  }
+
   final ordered = <_Node>[];
   var nextContext = 0;
   final queue = <_Node>[root];
@@ -235,7 +256,7 @@ ContextTree learnContextTree(
       queue.add(node.right!);
     }
   }
-  return ContextTree._(root, nextContext, ordered, properties);
+  return ContextTree._(root, nextContext, ordered, properties, trainingBits);
 }
 
 /// Serializes the tree in the decoder's MA-tree format: a 6-context entropy

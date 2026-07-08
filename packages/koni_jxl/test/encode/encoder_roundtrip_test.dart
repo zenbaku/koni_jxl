@@ -195,4 +195,40 @@ void main() {
     _check(100, 100, hasAlpha: true);
     _check(300, 300, hasAlpha: true);
   });
+
+  // Photographic content, where the weighted predictor wins or ties the
+  // gradient predictor — the golden corpus is entirely gradient-winning, so
+  // this is the only test that exercises the encoder's weighted-predictor
+  // Pass B / finish path and its trainingBits-based predictor selection's
+  // "finish both, keep smaller" near-tie branch. Decoded from a lossy
+  // conformance image (real photo statistics) and re-encoded losslessly.
+  test('photographic content round-trips (weighted-predictor path)', () {
+    final input =
+        File('../../third_party/conformance/testcases/opsin_inverse/input.jxl');
+    if (!input.existsSync()) {
+      markTestSkipped('conformance corpus not present');
+      return;
+    }
+    final src = JxlDecoder.decode(input.readAsBytesSync());
+    final w = src.width, h = src.height;
+    final rgba = src.toRgba8();
+    final pixels = Uint8List(w * h * 3);
+    for (var i = 0; i < w * h; i++) {
+      pixels[i * 3] = rgba[i * 4];
+      pixels[i * 3 + 1] = rgba[i * 4 + 1];
+      pixels[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    final encoded = JxlEncoder.encodeLossless(pixels, width: w, height: h);
+    final image = JxlDecoder.decode(encoded);
+    expect(image.width, w);
+    expect(image.height, h);
+    for (var c = 0; c < 3; c++) {
+      final ours = channelAsInts(image.channels[c], 255);
+      for (var i = 0; i < w * h; i++) {
+        if (ours[i] != pixels[i * 3 + c]) {
+          fail('weighted-predictor round-trip mismatch at px $i channel $c');
+        }
+      }
+    }
+  }, timeout: const Timeout(Duration(minutes: 2)));
 }

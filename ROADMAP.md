@@ -958,11 +958,26 @@ output for where the gap actually is.
 
 Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
 
-- 🔲 **Predictor-selection heuristic.** The encoder runs both predictor
-  pipelines (gradient and weighted) fully and keeps the smaller — ~2×
-  encode time. Compare the two learned trees' training entropy first and
-  run only the winner's full pipeline (Pass B + assembly). Roughly halves
-  encode time for a sub-percent size risk.
+- ✅ **Predictor-selection heuristic (2026-07-08).** The encoder used to run
+  both predictor pipelines (gradient and weighted) fully and keep the smaller.
+  Now `_encodeModular` runs only Pass A + tree-learning for both, compares the
+  two learned trees' training entropy (new `ContextTree.trainingBits`), and —
+  when one tree is clearly lower (≥ 2%, `_kPredictorMargin`) — runs only that
+  predictor's Pass B + entropy coding + assembly, skipping the loser's. Near
+  ties (within 2%, where the training subset's own sampling noise dominates)
+  finish both and keep the genuinely smaller output, so a mispredicted tie
+  can never regress size. **Measured, bit-identical output across the entire
+  corpus + photographic conformance images** (zero size change everywhere);
+  encode time **−26%** on `color_cover`, **−17%** on `gray_screentone`
+  (git-stash A/B, AOT, median of 3). Two corrections to the original plan,
+  both from measurement (see doc/spec_notes.md): (1) it's ~15–27%, not
+  "roughly halves" — `learnTree` is the single most expensive phase and must
+  run for both to decide reliably; (2) a pre-tree zeroth-order residual-entropy
+  proxy (which *would* let the loser's `learnTree` be skipped, reaching ~50%)
+  was measured to mispredict badly — it picks WP on `color_cover` where
+  gradient wins by 11% — because the context tree exploits structure the
+  zeroth-order entropy can't see. The margin guard keeps the sub-percent (in
+  fact zero, on everything tested) size promise.
 - 🔲 **Larger hybrid split exponent for WP.** WP residuals have larger
   magnitudes, so the fixed `HybridIntegerConfig(4,1,0)` spends many extra
   bits. A larger split (fewer extra bits, bigger token alphabet) likely

@@ -92,43 +92,43 @@ benchmark.
 ```
 === alpha_page_d0_e7.pam (512x768, 4ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl     1344      100.0%     1897
-  cjxl -e1     2290       58.7%       19
-  cjxl -e3      845      159.1%       54
+  koni_jxl     1344      100.0%     1760
+  cjxl -e1     2290       58.7%       27
+  cjxl -e3      845      159.1%       55
   cjxl -e7      797      168.6%      149
-  cjxl -e9      644      208.7%      421
+  cjxl -e9      644      208.7%      414
 
 === color_cover_d0_e7.ppm (1024x1536, 3ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl   545659      100.0%     5340
-  cjxl -e1   945349       57.7%       22
-  cjxl -e3   675291       80.8%      201
-  cjxl -e7   195510      279.1%     1580
-  cjxl -e9    55319      986.4%    10739
+  koni_jxl   545659      100.0%     3955
+  cjxl -e1   945349       57.7%       23
+  cjxl -e3   675291       80.8%      200
+  cjxl -e7   195510      279.1%     1608
+  cjxl -e9    55319      986.4%    10862
 
 === gray16_gradient_d0_e7.pgm (768x1100, 1ch, 16-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl      860      100.0%     1445
+  koni_jxl      860      100.0%     1354
   cjxl -e1   637119        0.1%       16
-  cjxl -e3   111108        0.8%       44
-  cjxl -e7    98123        0.9%      149
-  cjxl -e9    15861        5.4%     3706
+  cjxl -e3   111108        0.8%       45
+  cjxl -e7    98123        0.9%      152
+  cjxl -e9    15861        5.4%     3721
 
 === gray_screentone_d0_e7.pgm (1536x2200, 1ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl    19598      100.0%     3077
-  cjxl -e1   270467        7.2%       31
-  cjxl -e3  1134149        1.7%      139
-  cjxl -e7    40488       48.4%      479
-  cjxl -e9    22348       87.7%     3019
+  koni_jxl    19598      100.0%     2665
+  cjxl -e1   270467        7.2%       33
+  cjxl -e3  1134149        1.7%      145
+  cjxl -e7    40488       48.4%      488
+  cjxl -e9    22348       87.7%     3072
 
 === palette16_d0_e7.ppm (512x512, 3ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl      932      100.0%     1287
-  cjxl -e1     1434       65.0%       15
-  cjxl -e3     2154       43.3%       41
-  cjxl -e7      800      116.5%       97
-  cjxl -e9      741      125.8%      317
+  koni_jxl      932      100.0%     1243
+  cjxl -e1     1434       65.0%       16
+  cjxl -e3     2154       43.3%       42
+  cjxl -e7      800      116.5%       99
+  cjxl -e9      741      125.8%      372
 ```
 
 Takeaways:
@@ -155,7 +155,7 @@ Takeaways:
 - `alpha_page` and `palette16` sit in between: smaller than `cjxl -e1`,
   larger than `-e3` and up.
 - **Surprise: AOT is slower than JIT for `encode-ms` here.** A same-machine
-  `dart run` of this tool gives `color_cover` 3.6 s, not the 5.3 s shown
+  `dart run` of this tool gives `color_cover` 2.6 s, not the 4.0 s shown
   above — the reverse of the decode table, where AOT won. Each encode is
   one long cold call, not a warmed-up loop, which likely explains it: its
   hot inner loops probably run long enough within that single call for

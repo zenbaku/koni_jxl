@@ -270,6 +270,16 @@ List<int>? _detectPalette(List<Int32List> planes, int maxColors) {
   return colors;
 }
 
+/// Minimum relative gap in learned-tree training entropy for one predictor to
+/// be declared the clear winner (so the loser's Pass B + entropy coding +
+/// assembly is skipped). 2% is comfortably above the strided training set's
+/// own sampling noise (~0.2% for the ~300k-sample cap), so a gap this large
+/// reflects a real difference, not noise; smaller gaps fall through to the
+/// "finish both, keep smaller" path. Empirically, every corpus/photographic
+/// image with a gap ≥ this picked the same predictor its full-pipeline byte
+/// count did.
+const _kPredictorMargin = 1.02;
+
 Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   const groupDim = 256;
   final width = setup.width;
@@ -324,7 +334,20 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // Builds the smallest codestream for one predictor (5 = clamped gradient,
   // 6 = self-correcting weighted). WP wins on photographic/tonal content,
   // gradient on line art; the encoder tries both and keeps the smaller.
-  (Uint8List, String) bestForPredictor(bool useWp) {
+  // Pass A + tree learning for one predictor (5 = clamped gradient, 6 =
+  // self-correcting weighted). Split out from the rest so the two predictors'
+  // learned trees can be compared (via [ContextTree.trainingBits]) before the
+  // expensive Pass B + entropy-coding + assembly runs — see the decision
+  // below `prep`/`finish`.
+  ({
+    int predictor,
+    List<int> properties,
+    ContextTree tree,
+    List<List<int>> groupValues,
+    List<List<int>>? groupMaxErr,
+    List<int> metaValues,
+    List<int>? metaMaxErr,
+  }) prep(bool useWp) {
     final predictor = useWp ? 6 : 5;
     final properties = useWp ? wpProperties : gradProperties;
     final strideState = [0];
@@ -380,11 +403,42 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       }
     }
 
-    // Learn the context tree, then Pass B: assign each pixel a context.
     final tree = learnContextTree(Int32List.fromList(trainProps),
         Int32List.fromList(trainTokens), properties);
-    final numContexts = tree.contexts;
+    return (
+      predictor: predictor,
+      properties: properties,
+      tree: tree,
+      groupValues: groupValues,
+      groupMaxErr: groupMaxErr,
+      metaValues: metaValues,
+      metaMaxErr: metaMaxErr,
+    );
+  }
 
+  // Pass B + entropy coding + assembly for one prepared predictor: builds the
+  // smallest codestream (WP wins on photographic/tonal content, gradient on
+  // line art).
+  (Uint8List, String) finish(
+      bool useWp,
+      ({
+        int predictor,
+        List<int> properties,
+        ContextTree tree,
+        List<List<int>> groupValues,
+        List<List<int>>? groupMaxErr,
+        List<int> metaValues,
+        List<int>? metaMaxErr,
+      }) p) {
+    final predictor = p.predictor;
+    final tree = p.tree;
+    final numContexts = tree.contexts;
+    final groupValues = p.groupValues;
+    final groupMaxErr = p.groupMaxErr;
+    final metaValues = p.metaValues;
+    final metaMaxErr = p.metaMaxErr;
+
+    // Pass B: assign each pixel a context by walking the learned tree.
     final metaContexts = <int>[];
     if (pal != null) {
       _tileContexts(pal, palette!.length, 0, 0, palette.length, 3, tree,
@@ -548,21 +602,45 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
         bestMode = '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}';
       }
     }
-    return (
-      bestBytes ?? assemble(plainCodes, false, false),
-      '${useWp ? "wp" : "grad"}/$bestMode'
-    );
+    final finalBytes = bestBytes ?? assemble(plainCodes, false, false);
+    return (finalBytes, '${useWp ? "wp" : "grad"}/$bestMode');
   }
 
-  // Try both predictors; keep the smaller actual output.
-  final (gradBytes, gradMode) = bestForPredictor(false);
-  final (wpBytes, wpMode) = bestForPredictor(true);
-  final wpWins = wpBytes.length < gradBytes.length;
+  // Predictor selection. Both predictors' Pass A + tree learning always run
+  // (learnTree is the single most expensive phase, and its output — the
+  // learned tree's training entropy — is the cheapest reliable signal of
+  // which predictor will compress better; a pre-tree residual-entropy proxy
+  // was measured to mispredict badly, e.g. picking WP where gradient wins by
+  // 11%). When one tree's training entropy is clearly lower, only that
+  // predictor's Pass B + entropy coding + assembly runs, saving ~15-27% of
+  // encode time at no size cost. Near-ties (`_kPredictorMargin`) finish both
+  // and keep the genuinely smaller output, so a mispredicted tie — where the
+  // trees are within the training set's own sampling noise — can never regress
+  // size.
+  final gradPrep = prep(false);
+  final wpPrep = prep(true);
+  final gBits = gradPrep.tree.trainingBits;
+  final wBits = wpPrep.tree.trainingBits;
+
+  final Uint8List chosen;
+  final String debug;
+  if (gBits * _kPredictorMargin < wBits || wBits * _kPredictorMargin < gBits) {
+    final useWp = wBits < gBits;
+    final (bytes, mode) = finish(useWp, useWp ? wpPrep : gradPrep);
+    chosen = bytes;
+    debug = 'chose=$mode (skip loser; trainBits '
+        'g=${gBits.round()} w=${wBits.round()})';
+  } else {
+    final (gradBytes, gradMode) = finish(false, gradPrep);
+    final (wpBytes, wpMode) = finish(true, wpPrep);
+    final wpWins = wpBytes.length < gradBytes.length;
+    chosen = wpWins ? wpBytes : gradBytes;
+    debug = 'chose=${wpWins ? wpMode : gradMode} (near-tie, tried both; '
+        'grad=${gradBytes.length} wp=${wpBytes.length})';
+  }
   if (const bool.fromEnvironment('jxl.encdebug')) {
     // ignore: avoid_print
-    print('palette=${palette?.length} rct=$useRct '
-        'chose=${wpWins ? wpMode : gradMode} '
-        'grad=${gradBytes.length} ($gradMode) wp=${wpBytes.length} ($wpMode)');
+    print('palette=${palette?.length} rct=$useRct $debug');
   }
-  return wpWins ? wpBytes : gradBytes;
+  return chosen;
 }
