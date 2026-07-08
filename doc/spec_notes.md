@@ -474,6 +474,43 @@ approach, and the clear-winner path correctly skips the loser tree entirely
 type where neither single tree's structure isolates predictor-preference
 regions — none surfaced in this corpus.
 
+### Lossless encoder — deeper LZ77 matcher (gated, never-worse)
+
+The LZ77 matcher was a greedy hash-chain with depth 24. On highly repetitive
+content — regular screentone/halftone, a core manga content type and exactly
+where the LZ77 entropy mode wins — many positions collide on one hash bucket and
+the best matches sit far down the chain, so a shallow search left ~45% on the
+table. A second `Lz77Effort.deep` matcher searches depth 256 with lazy matching
+(one-step lookahead) and a nice-length (512) early exit; the early exit and the
+standard "candidate must match at offset `bestLen`" skip keep the deep search
+affordable even on long chains.
+
+**Why it's gated rather than just made deeper.** A greedy parse's *entropy-coded*
+size is non-monotonic in matcher effort: forcing longer matches at more varied
+distances can worsen the distance histogram. Measured, the deep matcher is
+−46.5% on `gray_screentone` and −16% on `screentone_256` but +31% on
+`gray16_gradient` (a synthetic 16-bit ramp whose residuals are long zero runs).
+So the deep parse is *not* universally smaller. The fix is this project's
+standard "try both, keep smaller": `Lz77Effort.shallow` reproduces the old
+matcher exactly (depth 24, break at length 4096, no lookahead) and stays a
+candidate, so the final size is `min(plain, shallow-lz, deep-lz) ≤
+min(plain, shallow-lz)` — **provably never-worse** than before (`gray16_gradient`
+stays byte-for-byte 840; `gray_screentone` takes the deep 7602).
+
+**The deep matcher only runs when LZ77 is already the mode to beat** — gated on
+`best shallow-LZ estimate < best plain estimate`. Diverse content (photos, the
+JPEG-transcoded manga pages) codes plainly, so it never pays for the deep
+search: measured encode time +1.6% on `color_cover`, +1.7% on a Naruto page
+(deep gated out), +3% on `gray_screentone` (deep runs, nice-length bounds it).
+Decode is untouched (any valid factorization decodes identically — the win is
+purely a smaller codestream, verified bit-exact through this decoder and djxl).
+
+The matcher effort is threaded through the per-leaf mixed-stream `only`-mode
+assembly too (the mode selector carries a `deep` bit), so a screentone image
+whose baseline is deep-LZ refines in deep-LZ. A cost-based *optimal* parse
+(LZMA/zopfli-style, weighing each match's real entropy cost) remains the only
+larger lever left here; lazy + deep + gated-never-worse captures most of it.
+
 ### Lossy (VarDCT) encoder — L0
 
 `JxlEncoder.encodeLossy` (`lib/src/encode/vardct/`) implements the L0

@@ -606,30 +606,39 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // baseline's already-chosen mode (the flips only nudge a few residuals, so
   // re-searching every {config}x{plain,LZ77}x{prefix,ANS} candidate would
   // roughly double assembly time for no measured size gain).
-  (Uint8List, String, int, bool, bool) assembleStream(
+  (Uint8List, String, int, bool, bool, bool) assembleStream(
     ContextTree tree,
     int predictor,
     List<List<int>> sectionContexts,
     List<List<int>> sectionValues,
     List<int>? leafPredictors, {
-    (int, bool, bool)? only,
+    (int, bool, bool, bool)? only,
   }) {
     final numContexts = tree.contexts;
-    // LZ77 (an expensive hash-chain pass) is only computed when a candidate
-    // actually needs it — skipped entirely for a plain-mode `only` assembly.
-    late final sectionOps = [
+    // LZ77 is an expensive hash-chain pass, so each effort is computed lazily
+    // and only when a candidate needs it: the shallow (never-worse baseline)
+    // matcher whenever any LZ77 candidate is built, the deep matcher only when
+    // LZ77 is already beating the plain code (see the gate below), and neither
+    // for a plain-mode `only` assembly.
+    late final sectionOpsShallow = [
       for (var s = 0; s < sectionValues.length; s++)
         lz77Compress(sectionContexts[s], sectionValues[s]),
     ];
+    late final sectionOpsDeep = [
+      for (var s = 0; s < sectionValues.length; s++)
+        lz77Compress(sectionContexts[s], sectionValues[s],
+            effort: Lz77Effort.deep),
+    ];
 
-    Uint8List assemble(EntropyCodes codes, bool ans, bool lz) {
+    Uint8List assemble(
+        EntropyCodes codes, bool ans, bool lz, List<Lz77Ops> ops) {
       void writeSectionPayload(BitWriter w, int s) {
         if (ans && lz) {
-          codes.encodeAnsLz77Section(w, sectionOps[s]);
+          codes.encodeAnsLz77Section(w, ops[s]);
         } else if (ans) {
           codes.encodeAnsSection(w, sectionContexts[s], sectionValues[s]);
         } else if (lz) {
-          codes.writeOps(w, sectionOps[s]);
+          codes.writeOps(w, ops[s]);
         } else {
           for (var i = 0; i < sectionValues[s].length; i++) {
             codes.writeToken(w, sectionContexts[s][i], sectionValues[s][i]);
@@ -698,8 +707,8 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       return out.toBytes();
     }
 
-    String modeStr(HybridIntegerConfig cfg, bool lz, bool ans) =>
-        '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}'
+    String modeStr(HybridIntegerConfig cfg, bool lz, bool ans, bool deep) =>
+        '${lz ? (deep ? "lzd" : "lz") : "plain"}+${ans ? "ans" : "prefix"}'
         '/h${cfg.splitExponent}${cfg.msbInToken}${cfg.lsbInToken}';
 
     List<int> flatContexts() {
@@ -719,12 +728,20 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     }
 
     if (only != null) {
-      final (cfgI, lz, ans) = only;
+      final (cfgI, lz, ans, deep) = only;
       final cfg = _hybridConfigs[cfgI];
+      final ops = deep ? sectionOpsDeep : sectionOpsShallow;
       final codes = lz
-          ? EntropyCodes.buildLz77(numContexts, sectionOps, cfg)
+          ? EntropyCodes.buildLz77(numContexts, ops, cfg)
           : EntropyCodes.build(numContexts, flatContexts(), flatValues(), cfg);
-      return (assemble(codes, ans, lz), modeStr(cfg, lz, ans), cfgI, lz, ans);
+      return (
+        assemble(codes, ans, lz, ops),
+        modeStr(cfg, lz, ans, deep),
+        cfgI,
+        lz,
+        ans,
+        deep
+      );
     }
 
     final allContexts = flatContexts();
@@ -732,25 +749,54 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     // For each candidate hybrid-uint config, build the {plain, LZ77} x
     // {prefix, ANS} entropy codes and their size estimates. ANS spends
     // fractional bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs;
-    // the config governs how at/above-split residuals tokenize.
-    final candidates = <(EntropyCodes, bool, bool, int, double)>[];
+    // the config governs how at/above-split residuals tokenize. The LZ77 here
+    // uses the shallow (never-worse baseline) matcher; the deep matcher is added
+    // below only when it is worth the search.
+    final candidates = <(EntropyCodes, bool, bool, int, bool, double)>[];
+    var bestPlain = double.infinity;
+    var bestShallowLz = double.infinity;
     for (var ci = 0; ci < _hybridConfigs.length; ci++) {
       final cfg = _hybridConfigs[ci];
-      final lzCodes = EntropyCodes.buildLz77(numContexts, sectionOps, cfg);
+      final lzCodes =
+          EntropyCodes.buildLz77(numContexts, sectionOpsShallow, cfg);
       final plainCodes =
           EntropyCodes.build(numContexts, allContexts, allValues, cfg);
-      candidates
-          .add((plainCodes, false, false, ci, plainCodes.estimatedBits()));
-      candidates.add((lzCodes, false, true, ci, lzCodes.estimatedBits()));
+      final plainEst = plainCodes.estimatedBits();
+      final lzEst = lzCodes.estimatedBits();
+      if (plainEst < bestPlain) bestPlain = plainEst;
+      if (lzEst < bestShallowLz) bestShallowLz = lzEst;
+      candidates.add((plainCodes, false, false, ci, false, plainEst));
+      candidates.add((lzCodes, false, true, ci, false, lzEst));
       if (plainCodes.ansViable) {
-        candidates
-            .add((plainCodes, true, false, ci, plainCodes.ansEstimatedBits()));
+        final e = plainCodes.ansEstimatedBits();
+        if (e < bestPlain) bestPlain = e;
+        candidates.add((plainCodes, true, false, ci, false, e));
       }
       if (lzCodes.ansViable) {
-        candidates.add((lzCodes, true, true, ci, lzCodes.ansEstimatedBits()));
+        final e = lzCodes.ansEstimatedBits();
+        if (e < bestShallowLz) bestShallowLz = e;
+        candidates.add((lzCodes, true, true, ci, false, e));
       }
     }
-    final best = candidates.map((c) => c.$5).reduce((a, b) => a < b ? a : b);
+    // Deep matcher only when LZ77 is already the mode to beat: a greedy parse's
+    // coded size is non-monotonic in matcher effort, so the deep parse can be
+    // larger than the shallow one (e.g. on a synthetic gradient's zero runs) —
+    // keeping the shallow candidates makes the pair never-worse, and gating on
+    // "LZ77 beats plain" spares plainly-coded content (photos) the deep search.
+    if (bestShallowLz < bestPlain) {
+      for (var ci = 0; ci < _hybridConfigs.length; ci++) {
+        final cfg = _hybridConfigs[ci];
+        final lzCodes =
+            EntropyCodes.buildLz77(numContexts, sectionOpsDeep, cfg);
+        candidates
+            .add((lzCodes, false, true, ci, true, lzCodes.estimatedBits()));
+        if (lzCodes.ansViable) {
+          candidates
+              .add((lzCodes, true, true, ci, true, lzCodes.ansEstimatedBits()));
+        }
+      }
+    }
+    final best = candidates.map((c) => c.$6).reduce((a, b) => a < b ? a : b);
 
     // Candidates within 3% of the best estimate get assembled for real; the
     // smallest actual output wins. This captures near-tie wins (e.g. unified
@@ -758,36 +804,48 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     final threshold = best * 1.03;
     Uint8List? bestBytes;
     var bestMode = '';
-    var bestCfg = 0, bestLz = false, bestAns = false;
-    for (final (codes, ans, lz, ci, est) in candidates) {
+    var bestCfg = 0, bestLz = false, bestAns = false, bestDeep = false;
+    for (final (codes, ans, lz, ci, deep, est) in candidates) {
       if (est > threshold) continue;
-      final bytes = assemble(codes, ans, lz);
+      final bytes =
+          assemble(codes, ans, lz, deep ? sectionOpsDeep : sectionOpsShallow);
       if (bestBytes == null || bytes.length < bestBytes.length) {
         bestBytes = bytes;
-        bestMode = modeStr(codes.config, lz, ans);
+        bestMode = modeStr(codes.config, lz, ans, deep);
         bestCfg = ci;
         bestLz = lz;
         bestAns = ans;
+        bestDeep = deep;
       }
     }
     if (bestBytes == null) {
-      final (codes, ans, lz, ci, _) = candidates.first;
-      bestBytes = assemble(codes, ans, lz);
-      bestMode = modeStr(codes.config, lz, ans);
+      final (codes, ans, lz, ci, deep, _) = candidates.first;
+      bestBytes =
+          assemble(codes, ans, lz, deep ? sectionOpsDeep : sectionOpsShallow);
+      bestMode = modeStr(codes.config, lz, ans, deep);
       bestCfg = ci;
       bestLz = lz;
       bestAns = ans;
+      bestDeep = deep;
     }
-    return (bestBytes, bestMode, bestCfg, bestLz, bestAns);
+    return (bestBytes, bestMode, bestCfg, bestLz, bestAns, bestDeep);
   }
 
   // Single-predictor baseline for one prep; also returns its winning entropy
   // mode so per-leaf refinement can re-use it.
-  (Uint8List, String, (int, bool, bool)) baselineOf(
+  (Uint8List, String, (int, bool, bool, bool)) baselineOf(
       _Prep p, List<List<int>> sectionContexts) {
-    final (bytes, mode, cfg, lz, ans) = assembleStream(p.tree, p.predictor,
-        sectionContexts, mkSections(p.metaValues, p.groupValues), null);
-    return (bytes, '${p.predictor == 6 ? "wp" : "grad"}/$mode', (cfg, lz, ans));
+    final (bytes, mode, cfg, lz, ans, deep) = assembleStream(
+        p.tree,
+        p.predictor,
+        sectionContexts,
+        mkSections(p.metaValues, p.groupValues),
+        null);
+    return (
+      bytes,
+      '${p.predictor == 6 ? "wp" : "grad"}/$mode',
+      (cfg, lz, ans, deep)
+    );
   }
 
   // Per-leaf predictor selection: refine the chosen tree by letting each leaf
@@ -799,7 +857,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // single-predictor baseline and the per-leaf-mixed stream (strictly
   // never-worse).
   (Uint8List, String) refineOf(_Prep p, _Prep alt, _PassB ctx,
-      Uint8List baseBytes, String baseLabel, (int, bool, bool) baseSel) {
+      Uint8List baseBytes, String baseLabel, (int, bool, bool, bool) baseSel) {
     final leafPred = _selectLeafPredictors(
         p.tree.contexts,
         p.predictor,
@@ -824,7 +882,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
         _mixValues(ctx.groupContexts[g], p.groupValues[g], alt.groupValues[g],
             leafPred, p.predictor),
     ];
-    final (mixBytes, mixMode, _, _, _) = assembleStream(p.tree, p.predictor,
+    final (mixBytes, mixMode, _, _, _, _) = assembleStream(p.tree, p.predictor,
         ctx.sectionContexts, mkSections(mixedMeta, mixedGroups), leafPred,
         only: baseSel);
     if (mixBytes.length < baseBytes.length) {

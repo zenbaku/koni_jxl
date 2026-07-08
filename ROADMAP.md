@@ -1020,9 +1020,17 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
   smaller) showed the winning predictor's own tree already beats the
   property-15-carrying loser tree on every clear-winner image, so co-designing
   the two is unlikely to pay off. See doc/spec_notes.md.
-- 🔲 **Better LZ77 matcher.** The current greedy hash-chain is basic;
-  lazy matching / longer chains would help the (rare) repetitive cases
-  where LZ77 already wins.
+- ✅ **Better LZ77 matcher (2026-07-08).** Added a deep matcher (chain depth
+  256, lazy one-step lookahead, nice-length early exit) alongside the original
+  depth-24 greedy one. A greedy parse's coded size is non-monotonic in matcher
+  effort, so the deep parse isn't universally smaller (−46.5% on
+  `gray_screentone` / −16% on `screentone_256`, but +31% on a synthetic
+  gradient); keeping the old matcher as a candidate makes it **provably
+  never-worse** (`min(plain, shallow-lz, deep-lz)`), and the deep search is
+  gated on "LZ77 already beats plain" so plainly-coded content (photos, the
+  JPEG-transcoded manga pages) never pays for it (encode time +1.6–3%). Decode
+  untouched. See doc/spec_notes.md. Remaining: a cost-based *optimal* parse
+  (LZMA/zopfli-style) is the only larger LZ77 lever left.
 
 ---
 

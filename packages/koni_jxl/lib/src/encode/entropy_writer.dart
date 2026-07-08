@@ -350,13 +350,47 @@ const lz77MinSymbol = 224;
 const lz77MinLength = 3;
 const lz77LengthConfig = HybridIntegerConfig(4, 0, 0);
 
-/// Greedy hash-chain LZ77 over the token-value sequence of one section.
+/// LZ77 matcher effort. [shallow] is the long-standing greedy hash-chain
+/// (depth 24, no lookahead) kept as a never-worse baseline candidate. [deep]
+/// searches far deeper with lazy matching (one-step lookahead) and a
+/// nice-length early exit — a big win on highly repetitive content (regular
+/// screentone/halftone, a core manga type and where LZ77 wins) but, because a
+/// greedy parse's entropy-coded cost is non-monotonic in these knobs, *not*
+/// universally smaller than [shallow] (it can lose on e.g. a synthetic gradient
+/// whose residuals are long zero runs). The encoder assembles both and keeps
+/// the smaller, so the pair is never-worse; [deep] is only tried when LZ77 is
+/// already beating the plain code (see the caller), so diverse content that
+/// codes plainly never pays for it.
+enum Lz77Effort {
+  // shallow reproduces the long-standing matcher exactly (depth 24, break once
+  // a match reaches 4096, no lookahead) so that keeping it as a candidate makes
+  // the output provably never-worse than before the deep matcher existed:
+  // final size = min(plain, shallow-lz, deep-lz) <= min(plain, shallow-lz).
+  shallow(chainDepth: 24, niceLength: 4096, lazy: false),
+  deep(chainDepth: 256, niceLength: 512, lazy: true);
+
+  const Lz77Effort(
+      {required this.chainDepth, required this.niceLength, required this.lazy});
+
+  final int chainDepth;
+  final int niceLength;
+  final bool lazy;
+}
+
+/// Hash-chain LZ77 over the token-value sequence of one section at [effort].
 /// Distances are in value positions (the decoder's window semantics).
-Lz77Ops lz77Compress(List<int> contexts, List<int> values) {
+///
+/// Any valid factorization decodes to the same values, so correctness is
+/// effort-independent (the encoder round-trip / corpus gates verify it); only
+/// the coded size differs, and the caller keeps the smaller of the candidates.
+Lz77Ops lz77Compress(List<int> contexts, List<int> values,
+    {Lz77Effort effort = Lz77Effort.shallow}) {
   final ops = Lz77Ops();
   final n = values.length;
   const hashBits = 15;
-  const chainDepth = 24;
+  final chainDepth = effort.chainDepth;
+  final niceLength = effort.niceLength;
+  final lazy = effort.lazy;
   final chains = List<int>.filled(1 << hashBits, -1);
   final prev = List<int>.filled(n < 1 ? 1 : n, -1);
 
@@ -374,48 +408,80 @@ Lz77Ops lz77Compress(List<int> contexts, List<int> values) {
     chains[h] = i;
   }
 
-  var i = 0;
-  while (i < n) {
+  // Best (length, distance) for a match starting at [i], packed as
+  // `(len << 24) | dist` to avoid a record/list allocation in this hot loop
+  // (dist < 2^20 always fits the low 24 bits); 0 means no usable match.
+  int findMatch(int i) {
+    if (i + lz77MinLength > n || i + 2 >= n) return 0;
+    final maxLen = n - i;
     var bestLen = 0;
     var bestDist = 0;
-    if (i + lz77MinLength <= n && i + 2 < n) {
-      var cand = chains[hash(i)];
-      var depth = 0;
-      while (cand >= 0 && depth < chainDepth) {
-        final dist = i - cand;
-        if (dist > (1 << 20) - 1) break;
+    var cand = chains[hash(i)];
+    var depth = 0;
+    while (cand >= 0 && depth < chainDepth) {
+      final dist = i - cand;
+      if (dist > (1 << 20) - 1) break;
+      // Only attempt the full compare when this candidate can beat bestLen —
+      // its value at offset bestLen must already match. This standard
+      // hash-chain shortcut is what makes a deep search affordable.
+      if (bestLen == 0 || values[cand + bestLen] == values[i + bestLen]) {
         var len = 0;
-        final maxLen = n - i;
         while (len < maxLen && values[cand + len] == values[i + len]) {
           len++;
         }
         if (len > bestLen) {
           bestLen = len;
           bestDist = dist;
-          if (len >= 4096) break; // long enough
+          // Stop at a maximal match (nothing can beat matching to the buffer
+          // end) or a good-enough one. Reaching maxLen also keeps the
+          // `bestLen`-offset shortcut above in range: on any iteration that
+          // continues, bestLen < maxLen, so `i + bestLen < n`.
+          if (len == maxLen || len >= niceLength) break;
         }
-        cand = prev[cand];
-        depth++;
       }
+      cand = prev[cand];
+      depth++;
     }
-    if (bestLen >= lz77MinLength) {
+    return bestLen == 0 ? 0 : (bestLen << 24) | bestDist;
+  }
+
+  void emitLiteral(int i) {
+    ops.kinds.add(0);
+    ops.ctxs.add(contexts[i]);
+    ops.a.add(values[i]);
+    ops.b.add(0);
+  }
+
+  var i = 0;
+  var pending = findMatch(0); // best match starting at the current position
+  while (i < n) {
+    final mLen = pending >> 24;
+    if (mLen >= lz77MinLength) {
+      insert(i);
+      // Lazy: if i+1 starts a strictly longer match, emit a literal here and
+      // take that one instead.
+      final next = lazy && i + 1 < n ? findMatch(i + 1) : 0;
+      if ((next >> 24) > mLen) {
+        emitLiteral(i);
+        i++;
+        pending = next;
+        continue;
+      }
       ops.kinds.add(1);
       ops.ctxs.add(contexts[i]);
-      ops.a.add(bestLen);
-      ops.b.add(bestDist);
-      final end = i + bestLen;
-      while (i < end) {
-        insert(i);
-        i++;
+      ops.a.add(mLen);
+      ops.b.add(pending & 0xFFFFFF);
+      final end = i + mLen;
+      for (var j = i + 1; j < end; j++) {
+        insert(j);
       }
+      i = end;
     } else {
-      ops.kinds.add(0);
-      ops.ctxs.add(contexts[i]);
-      ops.a.add(values[i]);
-      ops.b.add(0);
+      emitLiteral(i);
       insert(i);
       i++;
     }
+    pending = i < n ? findMatch(i) : 0;
   }
   return ops;
 }

@@ -116,11 +116,11 @@ encoder     bytes   vs koni_jxl  encode-ms
 
 === gray_screentone_d0_e7.pgm (1536x2200, 1ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl    14198      100.0%     2942
-  cjxl -e1   270467        5.2%       32
-  cjxl -e3  1134149        1.3%      137
-  cjxl -e7    40488       35.1%      475
-  cjxl -e9    22348       63.5%     3031
+  koni_jxl     7602      100.0%     3031
+  cjxl -e1   270467        2.8%       36
+  cjxl -e3  1134149        0.7%      137
+  cjxl -e7    40488       18.8%      470
+  cjxl -e9    22348       34.0%     3021
 
 === palette16_d0_e7.ppm (512x512, 3ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
@@ -134,12 +134,13 @@ encoder     bytes   vs koni_jxl  encode-ms
 Takeaways:
 
 - **On manga-style content (`gray_screentone`), this encoder beats every
-  `cjxl` effort level, including `-e9`**: 35% of `cjxl -e7`'s size and 64%
-  of `cjxl -e9`'s (libjxl's slowest, most-optimized mode). The per-image
-  hybrid-uint config choice shaved ~3.9% off this content, and per-leaf
-  predictor selection (letting the screentone leaves use the weighted
-  predictor while the line-art majority stays gradient) a further −24.6% —
-  both in doc/spec_notes.md.
+  `cjxl` effort level, including `-e9`**: 19% of `cjxl -e7`'s size and 34%
+  of `cjxl -e9`'s (libjxl's slowest, most-optimized mode). Three lossless
+  rounds compound here (all in doc/spec_notes.md): the per-image hybrid-uint
+  config choice (~3.9%), per-leaf predictor selection — letting the screentone
+  leaves use the weighted predictor while the line-art majority stays gradient
+  (−24.6%) — and a deeper, gated LZ77 matcher (−46.5%, the largest single
+  lever, since LZ77 is the winning mode for this repetitive content).
   `cjxl -e3` is not a meaningful comparison point for this image — `cjxl`'s
   own effort levels are **not monotonic in size** on this synthetic
   halftone pattern (verified independently: `-e1` 270 KB, `-e2` 507 KB,
