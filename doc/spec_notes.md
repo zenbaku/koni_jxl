@@ -450,11 +450,29 @@ The heuristic uses Shannon entropy to *build* the candidate, which the
 CLAUDE.md rule says never to use for a *sizing* decision — but the sizing
 decision here (mixed vs baseline) is made on exact assembled bytes; the
 per-leaf entropy only ranks two residual distributions over the same pixel set,
-where the 1-bit prefix floor biases both sides equally. A fully joint
-min-predictor tree *builder* (letting the tree split on property 15 while
-scoring each node by its best-of-both-predictors cost, the way cjxl does)
-remains the next step if a bigger win is wanted; this round refines a tree
-learned for a single predictor rather than co-designing the two.
+where the 1-bit prefix floor biases both sides equally.
+
+**Scoped and rejected: the fully joint min-predictor tree *builder*.** The
+obvious next step is letting the tree itself split on property 15 (WP
+max-error) while scoring each node by its best-of-both-predictors cost, then
+assigning each leaf its argmin predictor — the way cjxl builds trees. Before
+that (large, risky) `learnContextTree` rewrite, a cheap proxy measured its
+ceiling: refine BOTH trees in the clear-winner case (not just the winner) and
+keep the smaller. The WP tree is learned on the property set that *includes*
+property 15, so if a property-15-aware structure helped, the refined WP tree
+would beat the refined gradient tree on grad-favoring content. It does not — on
+every clear-winner corpus/photo/manga image the *winning* predictor's refined
+tree wins outright (`gray_screentone` grad-refined 14198 vs wp-refined 14376;
+`color_cover` 544919 vs 592123; `bicycles` 604763 vs 614768; `op_001`
+wp-refined 1350261 vs grad-refined 1393319). The winning predictor's own tree
+structure is already the better substrate for mixing — refining a few leaves
+captures the pockets, and property 15 adds nothing there because the gradient
+properties already isolate the WP-favoring regions well enough. So the joint
+builder is unlikely to beat this round's refine-the-single-predictor-tree
+approach, and the clear-winner path correctly skips the loser tree entirely
+(refining it would only cost encode time). If revisited, it needs a content
+type where neither single tree's structure isolates predictor-preference
+regions — none surfaced in this corpus.
 
 ### Lossy (VarDCT) encoder — L0
 

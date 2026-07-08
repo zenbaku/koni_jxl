@@ -1014,10 +1014,12 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
   real manga pages −0.3% to −1.3%, photographic −0.02% to −0.26%; no-flip
   content stays byte-identical. Encode-time cost +10% to +33% (assembles a
   second candidate stream; the mixed stream reuses the baseline's winning
-  entropy mode to halve that). A fully joint min-predictor tree *builder*
+  entropy mode to halve that). The fully joint min-predictor tree *builder*
   (splitting on property 15 while scoring nodes by best-of-both cost, as cjxl
-  does) remains open — this round refines a single-predictor-learned tree. See
-  doc/spec_notes.md.
+  does) was **scoped and rejected**: a cheap proxy (refine both trees, keep
+  smaller) showed the winning predictor's own tree already beats the
+  property-15-carrying loser tree on every clear-winner image, so co-designing
+  the two is unlikely to pay off. See doc/spec_notes.md.
 - 🔲 **Better LZ77 matcher.** The current greedy hash-chain is basic;
   lazy matching / longer chains would help the (rare) repetitive cases
   where LZ77 already wins.
