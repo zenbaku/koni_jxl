@@ -7,6 +7,7 @@ import 'frame/frame.dart';
 import 'frame/frame_flags.dart';
 import 'frame/frame_header.dart';
 import 'frame/splines.dart';
+import 'header/extra_channel.dart';
 import 'header/image_header.dart';
 import 'icc/icc_codec.dart';
 import 'io/bit_reader.dart';
@@ -379,11 +380,63 @@ final class _DecoderState {
         }
       }
     }
+    _compositeSpotColors(planes);
     final oriented = [
       for (final plane in planes)
         transposeBuffer(plane!, imageHeader.orientation),
     ];
     return JxlImage.internal(imageHeader, oriented, iccProfile);
+  }
+
+  /// Composites spot-colour extra channels onto the colour channels:
+  /// `out = mix * spotRGB + (1 - mix) * out`, `mix = spotValue * solidity`, in
+  /// extra-channel order (each spot channel's own `red`/`green`/`blue`/
+  /// `solidity` from the header). Runs on the final output-encoded values
+  /// (device 0..1) — verified against the `spot` conformance case, which is
+  /// Modular so this is the signal/device domain the spot colours are defined
+  /// in. (For an XYB image this therefore blends in the output-encoded domain,
+  /// not linear light; no conformance case exercises XYB + spot colour.)
+  /// Channels stored subsampled (`dimShift > 0`) are skipped — none of the
+  /// conformance spot channels use it, and blending a size-mismatched plane
+  /// would be worse than leaving it un-applied.
+  void _compositeSpotColors(List<ImageBuffer?> planes) {
+    final colors = imageHeader.colorChannelCount;
+    if (colors < 3) return; // spot colour is defined against RGB
+    for (var i = 0; i < imageHeader.extraChannels.length; i++) {
+      final ec = imageHeader.extraChannels[i];
+      if (ec.type != ExtraChannelType.spotColor) continue;
+      final spot = planes[colors + i];
+      final r = planes[0]!, g = planes[1]!, b = planes[2]!;
+      if (spot == null || spot.width != r.width || spot.height != r.height) {
+        continue;
+      }
+      final srgb = [ec.red, ec.green, ec.blue];
+      final solidity = ec.solidity;
+      final spotMax = ec.bitDepth.maxValue.toDouble();
+      final colorMax = imageHeader.bitDepth.maxValue;
+      final colorMaxF = colorMax.toDouble();
+      final cp = [r, g, b];
+      for (var y = 0; y < r.height; y++) {
+        for (var x = 0; x < r.width; x++) {
+          final sv =
+              spot.isInt ? spot.intRows[y][x] / spotMax : spot.floatRows[y][x];
+          final mix = sv * solidity;
+          if (mix == 0) continue;
+          for (var c = 0; c < 3; c++) {
+            final plane = cp[c];
+            if (plane.isInt) {
+              final base = plane.intRows[y][x] / colorMaxF;
+              final v = mix * srgb[c] + (1 - mix) * base;
+              plane.intRows[y][x] =
+                  (v * colorMaxF + 0.5).floor().clamp(0, colorMax);
+            } else {
+              final base = plane.floatRows[y][x];
+              plane.floatRows[y][x] = mix * srgb[c] + (1 - mix) * base;
+            }
+          }
+        }
+      }
+    }
   }
 
   /// Applies the XYB inverse (into linear RGB with the image's primaries)

@@ -176,6 +176,21 @@ need CLUT interpolation + rendering intents), and a wide-gamut (AdobeRGB/P3)
 conformance reference to promote the matrix path from unit-tested to
 conformance-verified.
 
+**Spot colour.** Spot-colour extra channels are composited onto the colour
+channels (`decoder._compositeSpotColors`): `out = mix·spotRGB + (1−mix)·out`,
+`mix = spotChannelValue · solidity`, applied in extra-channel order using each
+channel's own `red`/`green`/`blue`/`solidity` from the header. Verified against
+the `spot` conformance case (two spot channels; rmse 115.9 → 0.43 vs `ref.png`,
+the residual being rounding) — the blend formula and its **device-domain**
+(output-encoded, not linear) operation were both confirmed empirically from the
+8-bit reference values before implementing (at one pixel: base (20,70,255) +
+magenta spot (0.902,0,0.941) at mix≈0.78 reproduces ref (184,15,244) on all
+three channels). The `spot` case is Modular, so the device domain is the signal
+domain the spot colours are defined in; XYB + spot (no conformance case)
+therefore blends in the output-encoded domain rather than linear light.
+Subsampled (`dimShift > 0`) spot channels are skipped rather than blended at a
+mismatched size (none in the corpus use it).
+
 ## Progressive (LF frames)
 
 LF frames (progressive DC, `cjxl --progressive_dc=N`) decode through the

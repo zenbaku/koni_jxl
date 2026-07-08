@@ -138,8 +138,10 @@ bounds-checks the context, so most decode-time index bugs surface there.
 None block the manga use case, and — despite an earlier phrasing here — these
 do **not** throw `JxlUnsupportedException`; they decode with the feature
 un-applied:
-- **Spot-color rendering** — the spot-color extra channel is decoded but never
-  composited onto the image.
+- **Spot-color rendering** — DONE: spot-colour extra channels are composited
+  onto the image (`decoder._compositeSpotColors`, `out = mix·spotRGB +
+  (1−mix)·out`), conformance-gated against `ref.png` (the `spot` case). Only
+  `dimShift > 0` (subsampled) spot channels are skipped (none in the corpus).
 - **JPEG bitstream reconstruction** — the `jbrd` box is ignored; pixels decode
   through the normal VarDCT path (byte-exact JPEG re-emission is out of scope).
 - **ICC-driven output transform** — matrix/TRC RGB ICC profiles ARE now applied

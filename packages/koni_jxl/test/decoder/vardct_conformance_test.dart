@@ -13,16 +13,18 @@ import '../util/pnm.dart';
 /// djxl. Excluded (skip list, tracked for later):
 /// cafe + bench_oriented_brg (YCbCr/jbrd), upsampling (M6), noise (M6),
 /// animation_* (multi-frame, gated in animation_test), cmyk_layers (CMYK),
-/// spot (spot-color rendering), lossless_pfm (float samples), blendmodes
-/// (extra-channel blending), patches (alpha-blended VarDCT patches; jxlatte
-/// deviates identically — see doc/spec_notes.md).
+/// lossless_pfm (float samples), blendmodes (extra-channel blending),
+/// patches (alpha-blended VarDCT patches; jxlatte deviates identically —
+/// see doc/spec_notes.md).
 ///
-/// The ICC-tagged cases (`grayscale`, `grayscale_public_university`,
-/// `patches_lossless`, `progressive`) are gated separately below against the
-/// authoritative `ref.png`, NOT against djxl's PNM output: djxl writes *linear*
-/// pixels to PNM for these profiles, so the djxl-proxy comparison used for the
-/// enum-colour cases is the wrong reference here (it was why these were long
-/// skipped). See color/icc_transform.dart and doc/spec_notes.md.
+/// The ICC/spot cases (`grayscale`, `grayscale_public_university`,
+/// `patches_lossless`, `progressive`, `spot`) are gated separately below
+/// against the authoritative `ref.png`, NOT against djxl's PNM output: djxl
+/// writes *linear* pixels to PNM for these ICC profiles, so the djxl-proxy
+/// comparison used for the enum-colour cases is the wrong reference here (it
+/// was why these were long skipped). `spot` additionally exercises spot-colour
+/// compositing. See color/icc_transform.dart, decoder `_compositeSpotColors`,
+/// and doc/spec_notes.md.
 final conformanceDir = Directory('../../third_party/conformance/testcases');
 
 const cases = [
@@ -87,13 +89,14 @@ void main() {
   // above for why not djxl). progressive exercises the real matrix/TRC output
   // transform (XYB + non-sRGB TRC); the others already decode correctly and
   // were only ever failing the wrong (djxl-PNM) reference.
-  group('ICC-tagged conformance vs ref.png', () {
+  group('ICC/spot conformance vs ref.png', () {
     if (!haveConformance) return;
     for (final tc in [
       'grayscale',
       'grayscale_public_university',
       'patches_lossless',
       'progressive',
+      'spot',
     ]) {
       test(tc, () {
         final dir = '${conformanceDir.path}/$tc';

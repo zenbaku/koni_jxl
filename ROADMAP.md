@@ -1004,7 +1004,15 @@ None block the manga use case; listed for completeness.
   wide-gamut case in the corpus). **Still out of scope:** LUT/CLUT (`A2B*`/
   `mAB `) profiles — they fall back to sRGB (rare for images; would need CLUT
   interpolation + rendering intents).
-- 🔲 **Spot-color rendering.** Spot-color extra channels.
+- ✅ **Spot-color rendering (2026-07-07).** Spot-colour extra channels are
+  now composited onto the colour channels (`decoder._compositeSpotColors`:
+  `out = mix·spotRGB + (1−mix)·out`, `mix = spotValue · solidity`, in
+  extra-channel order), verified against the `spot` conformance case
+  (rmse 115.9 → 0.43 vs `ref.png`; now gated in the `ICC/spot conformance vs
+  ref.png` group). Blend runs on the final output-encoded (device) values —
+  the domain spot colours are defined in for the Modular `spot` case; XYB +
+  spot (no conformance coverage) blends in the same domain. `dimShift > 0`
+  (subsampled) spot channels are skipped (none in the corpus).
 - 🔲 **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
   a JPEG-transcoded `.jxl` (needs the jbrd box + JPEG serialization).
 - ✅ **Float (HDR) sample formats — decode.** Modular-mode float samples
