@@ -273,6 +273,51 @@ default cjxl output may interleave LF sections per 2048-row stripe
 (observed: an e7 encode with its second LF group at 95% of the file).
 Modular images have no DC image and stream straight to complete.
 
+## Downscaled decode
+
+`JxlDecoder.decode(bytes, targetWidth:, targetHeight:)` returns a
+reduced-resolution result: fit-within-box, aspect-preserving, never upscaled
+(the `ui.ResizeImage` contract). It has a **DC-only fast path**
+(`_tryDcOnlyDecode` / `_dcImageFor`) that is cheap for a real structural
+reason: JXL keeps the DC (LF) coefficients in **separate bitstream sections**
+from the AC (HF) data, so the DC — the format's built-in 1:8-scale image — can
+be produced by decoding only the LF sections and skipping every AC section
+(`Frame.decodeLfOnly`), which is the bulk of decode time and memory. When the
+requested target is no finer than that 1:8 image, the fast path box-filters the
+DC down to the exact size; otherwise (target finer than 1:8) it falls back to a
+full decode, because there is no equally-cheap path — **1/2 and 1/4 need HF
+data**, so the ROADMAP's original `decodeScaled(1/2, 1/4)` framing doesn't map
+onto JXL; the natural cheap scale is 1:8 and coarser.
+
+Two shapes hit the fast path (`_dcImageFor`): a **plain single VarDCT frame**
+(`decodeLfOnly` + `buildDcImage`), and a **progressive-DC** file whose DC is a
+separate level-1 LF frame ahead of the main frame — decode that small frame and
+assemble its rows (`buildDcImageFromRows`, shared with the streaming preview),
+skipping the main frame's AC. `Toc.read` already skips the reader past a frame's
+data, so after reading the LF frame's TOC the main frame's header can be read to
+confirm it's a plain full-canvas last VarDCT frame before committing. Both
+shapes share `_plainVardctFrame` (last, full-canvas, no format upsampling, none
+of patches/splines/noise); `allowLfFrame` lets a progressive-DC main frame keep
+its expected `useLfFrame` flag. Measured: a 1/16 target on the corpus
+progressive-DC files decodes 2.7× (color_cover) to 6.8× (gray_screentone)
+faster than a full decode, where it previously paid the full cost.
+
+**Correctness discipline:** the downscale gate
+(`test/decoder/downscale_test.dart`) asserts every result matches a box-
+downsample of the full decode within an RMSE tolerance, regardless of which
+path served it — so the fast path staying within tolerance of the true result
+is enforced, while "which path ran" is a timing detail (checked with
+`tool/profile_decode.dart`). The Flutter side threads this through: the free
+`decodeJxl*` functions and now `JxlImageProvider` take `cacheWidth`/
+`cacheHeight` (folded into the provider's cache key).
+
+**Not cheap (correct via the full-decode fallback):** Modular/lossless has no
+DC concept at all — only the Squeeze transform has a latent low-resolution form
+(the `vshift/hshift >= 3` replacement channels already surfaced in
+`_decodeLfGroups`), which is not wired into any downscale path; plus extra
+channels/alpha (assembled as opaque in the DC image), animation, and
+patches/splines. These are coverage gaps, not correctness gaps.
+
 ## Encoder
 
 The lossless encoder emits: explicit image metadata (the all-default

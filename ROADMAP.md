@@ -1116,5 +1116,22 @@ feature un-applied rather than throwing — the only decode-path
 - 🔲 **Isolate parallelism.** Evaluated and deferred (shared-nothing →
   re-parse or bulk copies; poor ROI at current single-thread speeds).
   Revisit if very large images or batch decoding become a use case.
-- 🔲 **Downscaled decode.** A `decodeScaled(1/2, 1/4)` API (cheaper than
-  decode-then-resize) for library grid/thumbnail views.
+- ✅ **Downscaled decode — done for the cheap-able cases (2026-07-08).**
+  `JxlDecoder.decode(bytes, targetWidth:, targetHeight:)` (fit-within-box,
+  aspect-preserving, never-upscale — the `ui.ResizeImage` contract) with a
+  **DC-only fast path**: for a VarDCT image and a target no finer than the
+  format's built-in 1:8 DC image, it decodes *only* the LF/DC bitstream
+  sections (skipping all AC entropy decode, the bulk of the cost) and
+  box-filters down; everything else decodes fully then downsamples (always
+  correct). This session extended the fast path to **progressive-DC** files
+  (DC in a separate level-1 LF frame) — 2.7×–6.8× faster than a full decode on
+  the corpus's progressive files — and exposed **`cacheWidth`/`cacheHeight` on
+  `JxlImageProvider`** so idiomatic thumbnail grids get the reduced-resolution
+  decode (previously only the free `decodeJxl*` functions did).
+  **The original `decodeScaled(1/2, 1/4)` framing doesn't fit JXL:** 1/2 and
+  1/4 need HF data (AC lives in separate sections from DC), so there is no
+  DC-only-style shortcut for them — the natural cheap scale is 1:8 and coarser.
+  Remaining un-cheap cases (all correct via the full-decode fallback):
+  **Modular/lossless** (no DC concept — only the Squeeze transform has a latent
+  low-res form, unwired), extra channels/alpha, animation, patches/splines.
+  See doc/spec_notes.md's "Downscaled decode" for the coverage map.
