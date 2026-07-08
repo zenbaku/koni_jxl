@@ -1001,9 +1001,23 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
   tests (screentone content now emits `(4,2,0)`). See doc/spec_notes.md.
 - 🔲 **Delta palette.** The decoder supports delta-palette entries; the
   encoder only emits plain palettes. Would help near-flat color art.
-- 🔲 **Per-leaf predictor selection.** The learned tree currently uses one
-  predictor for all leaves. Letting each leaf pick gradient vs WP (vs
-  others) is closer to what cjxl does and stacks with property 15.
+- ✅ **Per-leaf predictor selection (2026-07-08).** The learned tree used one
+  predictor for all leaves; now each leaf independently keeps the image's
+  predictor or switches to the other (gradient ↔ weighted) wherever that codes
+  the leaf's own pixels smaller. Never-worse (the single-predictor baseline is
+  also assembled and the smaller actual bytes kept; a leaf only flips on a
+  strict improvement). Bit-exact through this decoder and djxl on genuinely
+  mixed trees — the decoder needed zero changes (the MA-tree format already
+  carries a predictor per leaf, and WP error state is kept live for every pixel
+  whenever any leaf is WP). Real wins: `gray_screentone` **−24.6%** (regular
+  screentone leaves flip to WP while the line-art majority stays gradient),
+  real manga pages −0.3% to −1.3%, photographic −0.02% to −0.26%; no-flip
+  content stays byte-identical. Encode-time cost +10% to +33% (assembles a
+  second candidate stream; the mixed stream reuses the baseline's winning
+  entropy mode to halve that). A fully joint min-predictor tree *builder*
+  (splitting on property 15 while scoring nodes by best-of-both cost, as cjxl
+  does) remains open — this round refines a single-predictor-learned tree. See
+  doc/spec_notes.md.
 - 🔲 **Better LZ77 matcher.** The current greedy hash-chain is basic;
   lazy matching / longer chains would help the (rare) repetitive cases
   where LZ77 already wins.

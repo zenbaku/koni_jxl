@@ -231,4 +231,64 @@ void main() {
       }
     }
   }, timeout: const Timeout(Duration(minutes: 2)));
+
+  // Per-leaf predictor selection: the top half is periodic texture (the
+  // self-correcting weighted predictor wins) and the bottom half is smooth
+  // gradients broken by edges (the clamped-gradient predictor wins), so the one
+  // learned tree carries BOTH predictors across its leaves (measured: ~15
+  // gradient leaves beside ~49 weighted-predictor leaves). This locks in that a
+  // mixed-predictor tree round-trips bit-exact through our decoder and djxl —
+  // the corpus's gray_screentone also produces a mixed tree, but that gate
+  // auto-skips without the corpus, whereas this synthetic case always runs.
+  // (The test only asserts round-trip correctness, so it stays valid even if a
+  // platform's sin/round yields content that happens not to mix.)
+  test('mixed per-leaf predictors round-trip', () {
+    const w = 384, h = 384;
+    final pixels = Uint8List(w * h);
+    final rng = math.Random(11);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        final int v;
+        if (y < h ~/ 2) {
+          final base =
+              128 + (80 * math.sin(x * 1.7) * math.cos(y * 1.3)).round();
+          v = (base + rng.nextInt(9) - 4).clamp(0, 255);
+        } else {
+          final band = x ~/ 48;
+          v = ((x * 2 + y * 3 + band * 20) + rng.nextInt(5) - 2).clamp(0, 255) &
+              255;
+        }
+        pixels[y * w + x] = v;
+      }
+    }
+    final encoded =
+        JxlEncoder.encodeLossless(pixels, width: w, height: h, grayscale: true);
+    final image = JxlDecoder.decode(encoded);
+    final ours = channelAsInts(image.channels[0], 255);
+    for (var i = 0; i < w * h; i++) {
+      if (ours[i] != pixels[i]) {
+        fail('mixed-predictor round-trip mismatch at px $i');
+      }
+    }
+    if (_haveDjxl) {
+      final dir = Directory.systemTemp.createTempSync('koni_enc');
+      try {
+        final jxlPath = '${dir.path}/t.jxl';
+        final outPath = '${dir.path}/t.pgm';
+        File(jxlPath).writeAsBytesSync(encoded);
+        final r =
+            Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+        expect(r.exitCode, 0, reason: 'djxl: ${r.stderr}');
+        final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+        final theirs = ref.intPlanes![0];
+        for (var i = 0; i < w * h; i++) {
+          if (theirs[i] != pixels[i]) {
+            fail('djxl mixed-predictor mismatch at px $i');
+          }
+        }
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }
+  });
 }

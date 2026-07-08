@@ -92,52 +92,54 @@ benchmark.
 ```
 === alpha_page_d0_e7.pam (512x768, 4ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl     1313      100.0%     1749
-  cjxl -e1     2290       57.3%       20
-  cjxl -e3      845      155.4%       54
+  koni_jxl     1313      100.0%     1778
+  cjxl -e1     2290       57.3%       19
+  cjxl -e3      845      155.4%       53
   cjxl -e7      797      164.7%      148
-  cjxl -e9      644      203.9%      407
+  cjxl -e9      644      203.9%      408
 
 === color_cover_d0_e7.ppm (1024x1536, 3ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl   545659      100.0%     4433
-  cjxl -e1   945349       57.7%       22
-  cjxl -e3   675291       80.8%      197
-  cjxl -e7   195510      279.1%     1582
-  cjxl -e9    55319      986.4%    10707
+  koni_jxl   544919      100.0%     5284
+  cjxl -e1   945349       57.6%       22
+  cjxl -e3   675291       80.7%      195
+  cjxl -e7   195510      278.7%     1575
+  cjxl -e9    55319      985.0%    10709
 
 === gray16_gradient_d0_e7.pgm (768x1100, 1ch, 16-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl      840      100.0%     1373
-  cjxl -e1   637119        0.1%       17
+  koni_jxl      840      100.0%     1443
+  cjxl -e1   637119        0.1%       16
   cjxl -e3   111108        0.8%       44
   cjxl -e7    98123        0.9%      148
-  cjxl -e9    15861        5.3%     3690
+  cjxl -e9    15861        5.3%     3685
 
 === gray_screentone_d0_e7.pgm (1536x2200, 1ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl    18838      100.0%     2693
-  cjxl -e1   270467        7.0%       31
-  cjxl -e3  1134149        1.7%      139
-  cjxl -e7    40488       46.5%      480
-  cjxl -e9    22348       84.3%     3041
+  koni_jxl    14198      100.0%     2942
+  cjxl -e1   270467        5.2%       32
+  cjxl -e3  1134149        1.3%      137
+  cjxl -e7    40488       35.1%      475
+  cjxl -e9    22348       63.5%     3031
 
 === palette16_d0_e7.ppm (512x512, 3ch, 8-bit) ===
 encoder     bytes   vs koni_jxl  encode-ms
-  koni_jxl      932      100.0%     1228
-  cjxl -e1     1434       65.0%       16
-  cjxl -e3     2154       43.3%       40
-  cjxl -e7      800      116.5%       97
-  cjxl -e9      741      125.8%      317
+  koni_jxl      931      100.0%     1275
+  cjxl -e1     1434       64.9%       16
+  cjxl -e3     2154       43.2%       40
+  cjxl -e7      800      116.4%       98
+  cjxl -e9      741      125.6%      315
 ```
 
 Takeaways:
 
 - **On manga-style content (`gray_screentone`), this encoder beats every
-  `cjxl` effort level, including `-e9`**: 47% of `cjxl -e7`'s size and 84%
+  `cjxl` effort level, including `-e9`**: 35% of `cjxl -e7`'s size and 64%
   of `cjxl -e9`'s (libjxl's slowest, most-optimized mode). The per-image
-  hybrid-uint config choice (see doc/spec_notes.md) shaved a further ~3.9%
-  off this specific content.
+  hybrid-uint config choice shaved ~3.9% off this content, and per-leaf
+  predictor selection (letting the screentone leaves use the weighted
+  predictor while the line-art majority stays gradient) a further −24.6% —
+  both in doc/spec_notes.md.
   `cjxl -e3` is not a meaningful comparison point for this image — `cjxl`'s
   own effort levels are **not monotonic in size** on this synthetic
   halftone pattern (verified independently: `-e1` 270 KB, `-e2` 507 KB,

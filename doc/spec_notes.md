@@ -385,6 +385,77 @@ decoder reads it back), and is djxl-gated through the corpus round-trip tests
 — `gray_screentone`/`screentone_256` now emit `(4,2,0)` and still decode
 bit-exact through both this decoder and djxl.
 
+### Lossless encoder — per-leaf predictor selection
+
+The learned MA tree used to code every leaf with the same predictor (the one
+chosen for the whole image by `trainingBits`). It now refines that tree
+**per leaf**: each leaf independently keeps the image's predictor or switches
+to the other (gradient ↔ weighted) wherever that codes the leaf's own pixels
+smaller. `serializeContextTree` gained an optional per-leaf predictor list;
+the MA-tree format already carries a predictor id per leaf, so no new
+bitstream surface — the decoder needed **zero** changes.
+
+Why this is bit-exact even with gradient and WP leaves side by side: the
+decoder keeps the weighted-predictor error state live for **every** pixel
+whenever *any* leaf is WP (`MaTree.usesWeightedPredictor`), and that state
+evolves only from the already-decoded pixel values, independent of which
+predictor coded each pixel. So a gradient leaf beside a WP leaf reconstructs
+exactly — verified end-to-end through both this decoder and djxl on genuinely
+mixed trees (e.g. `opsin_inverse` at 12 gradient / 52 WP leaves).
+
+How the decision is made (`_selectLeafPredictors`): both predictors' residuals
+are already computed in Pass A (the trainingBits comparison needs both trees),
+so no new residual pass. Per leaf, the encoder tokenises that leaf's own pixels
+under each predictor and picks the smaller (zeroth-order token-histogram
+entropy + hybrid-uint extra bits — the same cost model as `trainingBits`).
+This only *constructs* a candidate; the single-predictor baseline is also
+assembled and the smaller **actual bytes** kept, so a per-leaf misprediction
+can never regress size (a leaf only flips on a strict improvement, so a
+no-flip image stays byte-identical to the single-predictor output).
+
+Measured (bit-exact through this decoder and djxl throughout), size as
+% change vs the single-predictor encoder:
+
+- **Screentone / line art — the headline.** `gray_screentone` **−24.6%**
+  (18838→14198 B): globally gradient wins the line-art majority, but the two
+  leaves covering the regular screentone flip to WP, whose self-correcting
+  feedback locks onto the periodic pattern. `screentone_256` and
+  `gray16_gradient` are byte-identical (no leaf flips).
+- **Real manga (decoded then re-encoded lossless):** Naruto pages −0.85%,
+  −0.80%, **−1.27%** (page 017); One-Piece colour pages −0.33%, −0.08%.
+- **Photographic:** `color_cover` −0.14%, `opsin_inverse` −0.26%, `noise`
+  −0.02%, `bicycles` −0.17%; `palette16` −0.1%.
+
+Two decisions worth recording, both from measuring:
+
+- **Near-ties refine BOTH trees, not just the raw-baseline winner.** The
+  smaller single-predictor baseline is *not* a reliable proxy for which tree
+  refines smaller: on Naruto page 017 raw WP beats raw gradient (151263 <
+  152446 B), yet the *refined* gradient tree (149349) beats the refined WP
+  tree (150882). Refining only the raw winner gave up that −1.0%, so the
+  near-tie path refines both and keeps the smaller — manga hits this path.
+- **The mixed stream is assembled in the baseline's own winning entropy mode,
+  not re-searched.** The flips nudge only a few leaves' residual magnitudes, so
+  the best `{config}×{plain,LZ77}×{prefix,ANS}` mode is stable; re-running the
+  full candidate search for the mixed stream roughly doubled its assembly time
+  for no measured size gain (only `bicycles` differs, by 3 B / 0.0005%). This
+  `only`-mode assembly (and, for plain modes, skipping the LZ77 hash-chain
+  entirely) roughly halved the round's encode-time cost: naruto_001 went from
+  +62% to +33%, color_cover +42%→+19%, gray_screentone +24%→+10% (AOT, best of
+  3) vs the single-predictor encoder. The cost is inherent — per-leaf mixing
+  assembles a second candidate stream — but decode (the manga-reader hot path)
+  is untouched.
+
+The heuristic uses Shannon entropy to *build* the candidate, which the
+CLAUDE.md rule says never to use for a *sizing* decision — but the sizing
+decision here (mixed vs baseline) is made on exact assembled bytes; the
+per-leaf entropy only ranks two residual distributions over the same pixel set,
+where the 1-bit prefix floor biases both sides equally. A fully joint
+min-predictor tree *builder* (letting the tree split on property 15 while
+scoring each node by its best-of-both-predictors cost, the way cjxl does)
+remains the next step if a bigger win is wanted; this round refines a tree
+learned for a single predictor rather than co-designing the two.
+
 ### Lossy (VarDCT) encoder — L0
 
 `JxlEncoder.encodeLossy` (`lib/src/encode/vardct/`) implements the L0

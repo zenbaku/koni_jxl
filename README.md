@@ -122,8 +122,11 @@ threshold) through **both** this package's decoder and djxl.
 **Lossless**: picks per image between LZ77, palette (≤256 colors) and
 YCoCg RCT by exact coded-size estimates. It learns a per-image context
 tree (the biggest lever for lossless size), a modular transform (palette
-/ YCoCg RCT), and the smallest of four entropy modes ({plain, LZ77} x
-{prefix, ANS}). Real manga pages reportedly land near or below `cjxl -e3`,
+/ YCoCg RCT), a per-leaf gradient-vs-weighted predictor choice (each tree
+leaf uses whichever codes its own pixels smaller — e.g. screentone leaves
+go weighted while line art stays gradient), and the smallest of four
+entropy modes ({plain, LZ77} x {prefix, ANS}). Real manga pages reportedly
+land near or below `cjxl -e3`,
 at ~0.3-1 s/page single-threaded — pre-existing figures, not
 independently reverified for this pass (`manga_samples/` only has
 JPEG-transcoded pages, a harder and slower case than a clean scan; see

@@ -262,14 +262,20 @@ ContextTree learnContextTree(
 /// Serializes the tree in the decoder's MA-tree format: a 6-context entropy
 /// stream carrying, per node in BFS order, (property+1, value) for inner
 /// nodes and (0, predictor, offset, mulLog, mulBits) for leaves. [predictor]
-/// is the decoder predictor id every leaf uses (5 = clamped gradient,
-/// 6 = self-correcting weighted).
-void serializeContextTree(BitWriter w, ContextTree tree, int predictor) {
+/// is the decoder predictor id a leaf uses (5 = clamped gradient,
+/// 6 = self-correcting weighted) unless [leafPredictors] is given, in which
+/// case each leaf uses `leafPredictors[leaf.context]` (per-leaf predictor
+/// selection). The decoder reads a predictor per leaf and maintains WP state
+/// for every pixel whenever any leaf is WP, so gradient and WP leaves may
+/// coexist in one tree.
+void serializeContextTree(BitWriter w, ContextTree tree, int predictor,
+    [List<int>? leafPredictors]) {
   final tokens = EntropyWriter(6);
   for (final node in tree._nodesInOrder) {
     if (node.propIndex < 0) {
       tokens.write(1, 0); // property + 1 == 0 -> leaf
-      tokens.write(2, predictor);
+      tokens.write(
+          2, leafPredictors != null ? leafPredictors[node.context] : predictor);
       tokens.write(3, 0); // offset
       tokens.write(4, 0); // mul_log
       tokens.write(5, 0); // mul_bits

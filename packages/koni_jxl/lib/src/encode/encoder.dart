@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../entropy/hybrid_uint.dart';
@@ -298,6 +299,134 @@ List<int>? _detectPalette(List<Int32List> planes, int maxColors) {
 /// count did.
 const _kPredictorMargin = 1.02;
 
+/// Everything Pass A + tree learning produces for one predictor, kept around so
+/// the two predictors' trees can be compared cheaply (via
+/// [ContextTree.trainingBits]) before the expensive Pass B + entropy coding,
+/// and so the loser's per-pixel residuals stay available for per-leaf predictor
+/// selection (the winning tree's leaves may switch to the loser's predictor).
+typedef _Prep = ({
+  int predictor,
+  List<int> properties,
+  ContextTree tree,
+  List<List<int>> groupValues,
+  List<List<int>>? groupMaxErr,
+  List<int> metaValues,
+  List<int>? metaMaxErr,
+});
+
+/// Pass B output for one prep: the per-region leaf contexts (reused to build
+/// the mixed value stream) plus the same contexts already grouped into
+/// entropy-coding sections.
+typedef _PassB = ({
+  List<int> metaContexts,
+  List<List<int>> groupContexts,
+  List<List<int>> sectionContexts,
+});
+
+double _histEntropy(Int32List hist, int off, int width, int total) {
+  if (total == 0) return 0;
+  var bits = 0.0;
+  final lt = total.toDouble();
+  for (var t = 0; t < width; t++) {
+    final c = hist[off + t];
+    if (c > 0) bits += c * (math.log(lt / c) * 1.4426950408889634);
+  }
+  return bits;
+}
+
+/// Chooses, per tree leaf, whether to keep [primaryPredictor]'s residuals or
+/// switch to [altPredictor]'s — whichever tokenises that leaf's own pixels to
+/// fewer bits (zeroth-order token entropy over the leaf's histogram, plus the
+/// hybrid-uint extra bits, mirroring [ContextTree.trainingBits]). This only
+/// constructs a candidate; the caller assembles both the mixed and the
+/// single-predictor streams and keeps the smaller actual bytes, so a per-leaf
+/// misprediction never regresses size. [primaryValues]/[altValues] are the two
+/// predictors' packed-signed residuals, aligned index-for-index with the
+/// contexts (same Pass A iteration order).
+List<int> _selectLeafPredictors(
+  int numContexts,
+  int primaryPredictor,
+  int altPredictor,
+  List<int> metaContexts,
+  List<List<int>> groupContexts,
+  List<int> primaryMeta,
+  List<List<int>> primaryGroups,
+  List<int> altMeta,
+  List<List<int>> altGroups,
+) {
+  var maxTok = 0;
+  void scan(int v) {
+    final t = tokenizeHybrid(_config, v).$1;
+    if (t > maxTok) maxTok = t;
+  }
+
+  for (var i = 0; i < primaryMeta.length; i++) {
+    scan(primaryMeta[i]);
+    scan(altMeta[i]);
+  }
+  for (var g = 0; g < primaryGroups.length; g++) {
+    final pg = primaryGroups[g];
+    final ag = altGroups[g];
+    for (var i = 0; i < pg.length; i++) {
+      scan(pg[i]);
+      scan(ag[i]);
+    }
+  }
+
+  final w = maxTok + 1;
+  final pHist = Int32List(numContexts * w);
+  final aHist = Int32List(numContexts * w);
+  final pExtra = Float64List(numContexts);
+  final aExtra = Float64List(numContexts);
+  final counts = Int32List(numContexts);
+
+  void acc(int c, int pv, int av) {
+    final (pt, pn, _) = tokenizeHybrid(_config, pv);
+    final (at, an, _) = tokenizeHybrid(_config, av);
+    pHist[c * w + pt]++;
+    aHist[c * w + at]++;
+    pExtra[c] += pn;
+    aExtra[c] += an;
+    counts[c]++;
+  }
+
+  for (var i = 0; i < metaContexts.length; i++) {
+    acc(metaContexts[i], primaryMeta[i], altMeta[i]);
+  }
+  for (var g = 0; g < groupContexts.length; g++) {
+    final gc = groupContexts[g];
+    final pg = primaryGroups[g];
+    final ag = altGroups[g];
+    for (var i = 0; i < gc.length; i++) {
+      acc(gc[i], pg[i], ag[i]);
+    }
+  }
+
+  final leafPred = List<int>.filled(numContexts, primaryPredictor);
+  for (var c = 0; c < numContexts; c++) {
+    final total = counts[c];
+    if (total == 0) continue;
+    final pBits = _histEntropy(pHist, c * w, w, total) + pExtra[c];
+    final aBits = _histEntropy(aHist, c * w, w, total) + aExtra[c];
+    // Strict improvement only, so a numerical tie keeps the primary predictor
+    // (and thus stays byte-identical to the single-predictor baseline).
+    if (aBits < pBits) leafPred[c] = altPredictor;
+  }
+  return leafPred;
+}
+
+/// Builds the per-pixel residual stream for a per-leaf predictor assignment:
+/// each pixel emits [primary]'s residual when its leaf kept [primaryPredictor],
+/// else [alt]'s. All three lists are aligned index-for-index.
+List<int> _mixValues(List<int> contexts, List<int> primary, List<int> alt,
+    List<int> leafPred, int primaryPredictor) {
+  final out = List<int>.filled(contexts.length, 0);
+  for (var i = 0; i < contexts.length; i++) {
+    out[i] = leafPred[contexts[i]] == primaryPredictor ? primary[i] : alt[i];
+  }
+  return out;
+}
+
 Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   const groupDim = 256;
   final width = setup.width;
@@ -357,15 +486,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // learned trees can be compared (via [ContextTree.trainingBits]) before the
   // expensive Pass B + entropy-coding + assembly runs — see the decision
   // below `prep`/`finish`.
-  ({
-    int predictor,
-    List<int> properties,
-    ContextTree tree,
-    List<List<int>> groupValues,
-    List<List<int>>? groupMaxErr,
-    List<int> metaValues,
-    List<int>? metaMaxErr,
-  }) prep(bool useWp) {
+  _Prep prep(bool useWp) {
     final predictor = useWp ? 6 : 5;
     final properties = useWp ? wpProperties : gradProperties;
     final strideState = [0];
@@ -434,33 +555,29 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
     );
   }
 
-  // Pass B + entropy coding + assembly for one prepared predictor: builds the
-  // smallest codestream (WP wins on photographic/tonal content, gradient on
-  // line art).
-  (Uint8List, String) finish(
-      bool useWp,
-      ({
-        int predictor,
-        List<int> properties,
-        ContextTree tree,
-        List<List<int>> groupValues,
-        List<List<int>>? groupMaxErr,
-        List<int> metaValues,
-        List<int>? metaMaxErr,
-      }) p) {
-    final predictor = p.predictor;
-    final tree = p.tree;
-    final numContexts = tree.contexts;
-    final groupValues = p.groupValues;
-    final groupMaxErr = p.groupMaxErr;
-    final metaValues = p.metaValues;
-    final metaMaxErr = p.metaMaxErr;
+  // Sections: the LfGlobal section carries the meta channel (and, for small
+  // images, all pixel channels); otherwise one section per group. LZ77 windows
+  // are per section. Contexts and values share this layout.
+  List<List<int>> mkSections(List<int> meta, List<List<int>> groups) => [
+        [
+          ...meta,
+          if (globalChannels)
+            for (var g = 0; g < numGroups; g++) ...groups[g],
+        ],
+        if (!globalChannels)
+          for (var g = 0; g < numGroups; g++) groups[g],
+      ];
 
-    // Pass B: assign each pixel a context by walking the learned tree.
+  // Pass B: assign every pixel a context by walking the learned tree. Contexts
+  // are predictor-independent (they depend only on the tree and each pixel's
+  // causal neighbourhood), so they are computed once per prep and reused for
+  // both the single-predictor baseline and the per-leaf-mixed value stream.
+  _PassB passB(_Prep p) {
+    final tree = p.tree;
     final metaContexts = <int>[];
     if (pal != null) {
       _tileContexts(pal, palette!.length, 0, 0, palette.length, 3, tree,
-          metaContexts, metaMaxErr);
+          metaContexts, p.metaMaxErr);
     }
     final groupContexts = List<List<int>>.generate(numGroups, (_) => []);
     for (var g = 0; g < numGroups; g++) {
@@ -470,68 +587,41 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       final th = (height - oy).clamp(0, groupDim);
       for (final plane in planes) {
         _tileContexts(plane, width, ox, oy, tw, th, tree, groupContexts[g],
-            groupMaxErr?[g]);
+            p.groupMaxErr?[g]);
       }
     }
+    return (
+      metaContexts: metaContexts,
+      groupContexts: groupContexts,
+      sectionContexts: mkSections(metaContexts, groupContexts),
+    );
+  }
 
-    // Section token sequences: the LfGlobal section carries the meta channel
-    // (and, for small images, all pixel channels); otherwise one section per
-    // group. LZ77 windows are per section.
-    final sectionContexts = <List<int>>[
-      [
-        ...metaContexts,
-        if (globalChannels)
-          for (var g = 0; g < numGroups; g++) ...groupContexts[g],
-      ],
-      if (!globalChannels)
-        for (var g = 0; g < numGroups; g++) groupContexts[g],
-    ];
-    final sectionValues = <List<int>>[
-      [
-        ...metaValues,
-        if (globalChannels)
-          for (var g = 0; g < numGroups; g++) ...groupValues[g],
-      ],
-      if (!globalChannels)
-        for (var g = 0; g < numGroups; g++) groupValues[g],
-    ];
-
-    final sectionOps = [
+  // Entropy-codes and assembles the smallest real codestream for one
+  // context/value partition and (optional) per-leaf predictor assignment,
+  // serializing [tree] with [predictor] (or [leafPredictors] if given).
+  // Returns the bytes, a mode label, and the winning entropy mode selector
+  // (config index, LZ77, ANS). With [only] set, it skips the candidate search
+  // and assembles exactly that one mode — used to code the mixed stream in the
+  // baseline's already-chosen mode (the flips only nudge a few residuals, so
+  // re-searching every {config}x{plain,LZ77}x{prefix,ANS} candidate would
+  // roughly double assembly time for no measured size gain).
+  (Uint8List, String, int, bool, bool) assembleStream(
+    ContextTree tree,
+    int predictor,
+    List<List<int>> sectionContexts,
+    List<List<int>> sectionValues,
+    List<int>? leafPredictors, {
+    (int, bool, bool)? only,
+  }) {
+    final numContexts = tree.contexts;
+    // LZ77 (an expensive hash-chain pass) is only computed when a candidate
+    // actually needs it — skipped entirely for a plain-mode `only` assembly.
+    late final sectionOps = [
       for (var s = 0; s < sectionValues.length; s++)
         lz77Compress(sectionContexts[s], sectionValues[s]),
     ];
-    final allContexts = <int>[];
-    final allValues = <int>[];
-    for (var s = 0; s < sectionValues.length; s++) {
-      allContexts.addAll(sectionContexts[s]);
-      allValues.addAll(sectionValues[s]);
-    }
-    // For each candidate hybrid-uint config, build the {plain, LZ77} x
-    // {prefix, ANS} entropy codes and their size estimates. ANS spends
-    // fractional bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs;
-    // the config governs how at/above-split residuals tokenize. The residual
-    // values (and their LZ77 matches, which are on values, not tokens) are
-    // config-independent, so only the tokenization/histogram build repeats.
-    final candidates = <(EntropyCodes, bool, bool, double)>[];
-    for (final cfg in _hybridConfigs) {
-      final lzCodes = EntropyCodes.buildLz77(numContexts, sectionOps, cfg);
-      final plainCodes =
-          EntropyCodes.build(numContexts, allContexts, allValues, cfg);
-      candidates.add((plainCodes, false, false, plainCodes.estimatedBits()));
-      candidates.add((lzCodes, false, true, lzCodes.estimatedBits()));
-      if (plainCodes.ansViable) {
-        candidates
-            .add((plainCodes, true, false, plainCodes.ansEstimatedBits()));
-      }
-      if (lzCodes.ansViable) {
-        candidates.add((lzCodes, true, true, lzCodes.ansEstimatedBits()));
-      }
-    }
-    final best = candidates.map((c) => c.$4).reduce((a, b) => a < b ? a : b);
 
-    // Assembles the full codestream for one entropy mode. Cheap enough to run
-    // for each close candidate and keep the smallest actual output — estimates
-    // can't resolve sub-percent differences between near-tied modes.
     Uint8List assemble(EntropyCodes codes, bool ans, bool lz) {
       void writeSectionPayload(BitWriter w, int s) {
         if (ans && lz) {
@@ -550,7 +640,7 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       final lfGlobal = BitWriter();
       lfGlobal.writeBool(true); // default lfDequant
       lfGlobal.writeBool(true); // has_global_tree
-      serializeContextTree(lfGlobal, tree, predictor);
+      serializeContextTree(lfGlobal, tree, predictor, leafPredictors);
       if (ans) {
         codes.writeAnsHeader(lfGlobal);
       } else {
@@ -608,27 +698,143 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
       return out.toBytes();
     }
 
+    String modeStr(HybridIntegerConfig cfg, bool lz, bool ans) =>
+        '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}'
+        '/h${cfg.splitExponent}${cfg.msbInToken}${cfg.lsbInToken}';
+
+    List<int> flatContexts() {
+      final all = <int>[];
+      for (final s in sectionContexts) {
+        all.addAll(s);
+      }
+      return all;
+    }
+
+    List<int> flatValues() {
+      final all = <int>[];
+      for (final s in sectionValues) {
+        all.addAll(s);
+      }
+      return all;
+    }
+
+    if (only != null) {
+      final (cfgI, lz, ans) = only;
+      final cfg = _hybridConfigs[cfgI];
+      final codes = lz
+          ? EntropyCodes.buildLz77(numContexts, sectionOps, cfg)
+          : EntropyCodes.build(numContexts, flatContexts(), flatValues(), cfg);
+      return (assemble(codes, ans, lz), modeStr(cfg, lz, ans), cfgI, lz, ans);
+    }
+
+    final allContexts = flatContexts();
+    final allValues = flatValues();
+    // For each candidate hybrid-uint config, build the {plain, LZ77} x
+    // {prefix, ANS} entropy codes and their size estimates. ANS spends
+    // fractional bits (no 1-bit-per-symbol floor); LZ77 copies repeated runs;
+    // the config governs how at/above-split residuals tokenize.
+    final candidates = <(EntropyCodes, bool, bool, int, double)>[];
+    for (var ci = 0; ci < _hybridConfigs.length; ci++) {
+      final cfg = _hybridConfigs[ci];
+      final lzCodes = EntropyCodes.buildLz77(numContexts, sectionOps, cfg);
+      final plainCodes =
+          EntropyCodes.build(numContexts, allContexts, allValues, cfg);
+      candidates
+          .add((plainCodes, false, false, ci, plainCodes.estimatedBits()));
+      candidates.add((lzCodes, false, true, ci, lzCodes.estimatedBits()));
+      if (plainCodes.ansViable) {
+        candidates
+            .add((plainCodes, true, false, ci, plainCodes.ansEstimatedBits()));
+      }
+      if (lzCodes.ansViable) {
+        candidates.add((lzCodes, true, true, ci, lzCodes.ansEstimatedBits()));
+      }
+    }
+    final best = candidates.map((c) => c.$5).reduce((a, b) => a < b ? a : b);
+
     // Candidates within 3% of the best estimate get assembled for real; the
     // smallest actual output wins. This captures near-tie wins (e.g. unified
-    // ANS+LZ77 beating LZ77 by a fraction of a percent, or a config that
-    // estimates as a hair worse but assembles smaller) that estimates miss.
+    // ANS+LZ77 beating LZ77 by a fraction of a percent) that estimates miss.
     final threshold = best * 1.03;
     Uint8List? bestBytes;
     var bestMode = '';
-    for (final (codes, ans, lz, est) in candidates) {
+    var bestCfg = 0, bestLz = false, bestAns = false;
+    for (final (codes, ans, lz, ci, est) in candidates) {
       if (est > threshold) continue;
       final bytes = assemble(codes, ans, lz);
       if (bestBytes == null || bytes.length < bestBytes.length) {
         bestBytes = bytes;
-        final se = codes.config.splitExponent;
-        final mb = codes.config.msbInToken;
-        final lb = codes.config.lsbInToken;
-        bestMode = '${lz ? "lz" : "plain"}+${ans ? "ans" : "prefix"}'
-            '/h$se$mb$lb';
+        bestMode = modeStr(codes.config, lz, ans);
+        bestCfg = ci;
+        bestLz = lz;
+        bestAns = ans;
       }
     }
-    final finalBytes = bestBytes ?? assemble(candidates.first.$1, false, false);
-    return (finalBytes, '${useWp ? "wp" : "grad"}/$bestMode');
+    if (bestBytes == null) {
+      final (codes, ans, lz, ci, _) = candidates.first;
+      bestBytes = assemble(codes, ans, lz);
+      bestMode = modeStr(codes.config, lz, ans);
+      bestCfg = ci;
+      bestLz = lz;
+      bestAns = ans;
+    }
+    return (bestBytes, bestMode, bestCfg, bestLz, bestAns);
+  }
+
+  // Single-predictor baseline for one prep; also returns its winning entropy
+  // mode so per-leaf refinement can re-use it.
+  (Uint8List, String, (int, bool, bool)) baselineOf(
+      _Prep p, List<List<int>> sectionContexts) {
+    final (bytes, mode, cfg, lz, ans) = assembleStream(p.tree, p.predictor,
+        sectionContexts, mkSections(p.metaValues, p.groupValues), null);
+    return (bytes, '${p.predictor == 6 ? "wp" : "grad"}/$mode', (cfg, lz, ans));
+  }
+
+  // Per-leaf predictor selection: refine the chosen tree by letting each leaf
+  // switch to the alternate [alt]'s predictor wherever that codes its pixels
+  // smaller (the residuals for both predictors were computed in Pass A and are
+  // aligned index-for-index). The decoder reads a predictor per leaf and keeps
+  // WP state live for every pixel whenever any leaf is WP, so a gradient leaf
+  // beside a WP leaf reconstructs bit-exactly. Returns the smaller of the
+  // single-predictor baseline and the per-leaf-mixed stream (strictly
+  // never-worse).
+  (Uint8List, String) refineOf(_Prep p, _Prep alt, _PassB ctx,
+      Uint8List baseBytes, String baseLabel, (int, bool, bool) baseSel) {
+    final leafPred = _selectLeafPredictors(
+        p.tree.contexts,
+        p.predictor,
+        alt.predictor,
+        ctx.metaContexts,
+        ctx.groupContexts,
+        p.metaValues,
+        p.groupValues,
+        alt.metaValues,
+        alt.groupValues);
+    var flips = 0;
+    for (final lp in leafPred) {
+      if (lp != p.predictor) flips++;
+    }
+    // No leaf switched -> the mixed stream is byte-identical to the baseline.
+    if (flips == 0) return (baseBytes, baseLabel);
+
+    final mixedMeta = _mixValues(
+        ctx.metaContexts, p.metaValues, alt.metaValues, leafPred, p.predictor);
+    final mixedGroups = [
+      for (var g = 0; g < numGroups; g++)
+        _mixValues(ctx.groupContexts[g], p.groupValues[g], alt.groupValues[g],
+            leafPred, p.predictor),
+    ];
+    final (mixBytes, mixMode, _, _, _) = assembleStream(p.tree, p.predictor,
+        ctx.sectionContexts, mkSections(mixedMeta, mixedGroups), leafPred,
+        only: baseSel);
+    if (mixBytes.length < baseBytes.length) {
+      final wpLeaves = leafPred.where((x) => x == 6).length;
+      return (
+        mixBytes,
+        'leaf(g${leafPred.length - wpLeaves}/w$wpLeaves)/$mixMode'
+      );
+    }
+    return (baseBytes, baseLabel);
   }
 
   // Predictor selection. Both predictors' Pass A + tree learning always run
@@ -637,11 +843,11 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   // which predictor will compress better; a pre-tree residual-entropy proxy
   // was measured to mispredict badly, e.g. picking WP where gradient wins by
   // 11%). When one tree's training entropy is clearly lower, only that
-  // predictor's Pass B + entropy coding + assembly runs, saving ~15-27% of
-  // encode time at no size cost. Near-ties (`_kPredictorMargin`) finish both
-  // and keep the genuinely smaller output, so a mispredicted tie — where the
-  // trees are within the training set's own sampling noise — can never regress
-  // size.
+  // predictor's Pass B + entropy coding + assembly runs; near-ties
+  // (`_kPredictorMargin`) assemble both baselines and keep the smaller. On top
+  // of the chosen predictor, per-leaf selection refines that one tree, letting
+  // individual leaves switch to the other predictor where it codes their pixels
+  // smaller.
   final gradPrep = prep(false);
   final wpPrep = prep(true);
   final gBits = gradPrep.tree.trainingBits;
@@ -651,16 +857,32 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   final String debug;
   if (gBits * _kPredictorMargin < wBits || wBits * _kPredictorMargin < gBits) {
     final useWp = wBits < gBits;
-    final (bytes, mode) = finish(useWp, useWp ? wpPrep : gradPrep);
+    final win = useWp ? wpPrep : gradPrep;
+    final lose = useWp ? gradPrep : wpPrep;
+    final ctx = passB(win);
+    final (bb, bl, sel) = baselineOf(win, ctx.sectionContexts);
+    final (bytes, mode) = refineOf(win, lose, ctx, bb, bl, sel);
     chosen = bytes;
-    debug = 'chose=$mode (skip loser; trainBits '
+    debug = 'chose=$mode (skip loser tree; trainBits '
         'g=${gBits.round()} w=${wBits.round()})';
   } else {
-    final (gradBytes, gradMode) = finish(false, gradPrep);
-    final (wpBytes, wpMode) = finish(true, wpPrep);
+    // Near-tie: per-leaf-refine BOTH trees and keep the smaller. The raw
+    // single-predictor baselines don't reliably predict which tree refines
+    // smaller (a tree whose raw baseline loses can win after per-leaf mixing —
+    // e.g. a manga page where raw WP beats raw gradient but the refined
+    // gradient tree beats the refined WP tree), and each refinement's mixed
+    // stream is assembled in just its baseline's winning mode, so refining both
+    // is cheap.
+    final gctx = passB(gradPrep);
+    final (gbb, gbl, gsel) = baselineOf(gradPrep, gctx.sectionContexts);
+    final (gradBytes, gradMode) =
+        refineOf(gradPrep, wpPrep, gctx, gbb, gbl, gsel);
+    final wctx = passB(wpPrep);
+    final (wbb, wbl, wsel) = baselineOf(wpPrep, wctx.sectionContexts);
+    final (wpBytes, wpMode) = refineOf(wpPrep, gradPrep, wctx, wbb, wbl, wsel);
     final wpWins = wpBytes.length < gradBytes.length;
     chosen = wpWins ? wpBytes : gradBytes;
-    debug = 'chose=${wpWins ? wpMode : gradMode} (near-tie, tried both; '
+    debug = 'chose=${wpWins ? wpMode : gradMode} (near-tie, refined both; '
         'grad=${gradBytes.length} wp=${wpBytes.length})';
   }
   if (const bool.fromEnvironment('jxl.encdebug')) {
