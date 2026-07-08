@@ -65,9 +65,11 @@ Supported today:
 - ✅ Grayscale, RGB, palette (incl. delta palette), alpha, 8/16-bit
 - ✅ All modular predictors incl. the self-correcting weighted predictor
 - ✅ RCT, palette, and squeeze (responsive) transforms
-- ✅ Patches, reference frames, all blend modes
+- ✅ Patches, reference frames, blend modes
+- ✅ Spot-color rendering (extra-channel compositing)
 - ✅ ISOBMFF container and bare codestreams; EXIF orientation
-- ✅ Embedded ICC profiles (decoded and exposed)
+- ✅ Embedded ICC profiles — decoded, exposed, **and applied** as an output
+  color transform for matrix/TRC RGB profiles (conformance-verified)
 - ✅ Animation: all frames with durations and loop count
   (`JxlDecoder.decodeAnimation`, `JxlAnimationView` widget) — the
   newtons_cradle conformance animation is bit-exact on all 36 frames
@@ -78,11 +80,15 @@ Supported today:
   1:8 preview (blurry-then-sharp progressive display);
   `JxlProgressiveImage` renders an http byte stream directly
 
-Not yet (decoding throws `JxlUnsupportedException` with the feature name):
+Not yet / partial (these degrade gracefully — only an unsupported transfer
+function throws `JxlUnsupportedException`):
 
-- ⏳ Spot-color rendering, extra-channel blend modes
-- ⏳ JPEG bitstream reconstruction
-- ⏳ Float (HDR) sample formats; ICC-driven output color transforms
+- ⏳ JPEG bitstream reconstruction (`jbrd` box ignored; pixels decode via the
+  normal path)
+- ⏳ CMYK output; LUT/CLUT ICC profiles (fall back to sRGB)
+- ⏳ Float (HDR) sample *encoding* (decoding is supported)
+- ⚠️ A known chained multi-layer blend-mode deviation (the `blendmodes`
+  conformance case; animation blending is fine)
 
 Performance (Apple Silicon, AOT, single-threaded): a 1536×2200 lossless
 manga-style (screentone/line-art) page decodes in ~60 ms (effort 1

@@ -47,7 +47,10 @@ playback, background-isolate encode), use
 - Streaming decode with a 1:8 DC preview
   (`JxlStreamingDecoder`) for blurry-then-sharp display
 - Grayscale/RGB, palette, alpha, 8/16-bit, EXIF orientation
-- Embedded ICC profiles; header-only `JxlInfo.parse`
+- Spot-color rendering (extra-channel compositing)
+- Embedded ICC profiles — decoded, exposed on `JxlImage.iccProfile`, and
+  applied as an output transform for matrix/TRC RGB profiles; header-only
+  `JxlInfo.parse`
 
 **Encoding — lossless** (bit-exact)
 
@@ -93,11 +96,15 @@ playback, background-isolate encode), use
 malformed input (mutation-fuzz verified); `JxlLimits` caps
 header-driven allocations.
 
-Not yet supported (decoding throws `JxlUnsupportedException` with a
-stable feature id): spot-color rendering, JPEG bitstream reconstruction,
-and ICC-driven output transforms (files whose color is described only by
-an embedded ICC profile decode as sRGB). Modular-mode float (HDR) sample
-*decoding* is supported; encoding one is not.
+Not yet / partial (these degrade gracefully rather than throwing — the
+only decode-path `JxlUnsupportedException` is an unsupported transfer
+function): JPEG bitstream reconstruction (the `jbrd` box is ignored;
+pixels decode through the normal path), CMYK output, and LUT/CLUT ICC
+profiles (which fall back to sRGB — matrix/TRC RGB ICC profiles *are*
+applied). A known chained multi-layer blend-mode deviation remains (the
+`blendmodes` conformance case; animation blending is unaffected).
+Modular-mode float (HDR) sample *decoding* is supported; encoding one is
+not.
 
 ## Performance
 

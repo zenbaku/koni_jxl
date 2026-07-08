@@ -978,9 +978,11 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
 
 ---
 
-## Decoder gaps (documented, throw `JxlUnsupportedException`)
+## Decoder gaps (documented — degrade gracefully, do not throw)
 
-None block the manga use case; listed for completeness.
+None block the manga use case; listed for completeness. These decode with the
+feature un-applied rather than throwing — the only decode-path
+`JxlUnsupportedException` is an unsupported transfer function.
 
 - ✅ **ICC-driven output transform — done for matrix/TRC RGB profiles
   (2026-07-07).** `color/icc_transform.dart` applies a matrix/TRC RGB ICC
@@ -1015,6 +1017,20 @@ None block the manga use case; listed for completeness.
   (subsampled) spot channels are skipped (none in the corpus).
 - 🔲 **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
   a JPEG-transcoded `.jxl` (needs the jbrd box + JPEG serialization).
+- 🔲 **Chained multi-layer blend modes (`blendmodes` conformance case) —
+  characterized, next session.** koni supports all blend modes and animation
+  blending is bit-exact, but the `blendmodes` case (5 frames chaining
+  Replace→Blend→Add→Mult→MulAdd, each against the accumulated reference;
+  Modular 12-bit, non-premultiplied alpha) deviates rmse 15.76 / max 92 vs
+  `ref.png` with a smooth, content-correlated error (alpha is correct).
+  Hypothesis: a clamping / intermediate-domain subtlety between chained
+  arithmetic blends (e.g. an unclamped Add overflowing >1 before a later
+  Mult). Needs libjxl's per-mode clamp/domain semantics pinned before
+  patching — a guess-patch would risk the passing `animation_*` cases. See
+  doc/spec_notes.md's memory notes for the full characterization.
+- 🔲 **CMYK output.** `cmyk_layers` decodes the CMYK channels but converting
+  to RGB needs its LUT/CLUT ICC profile (a 557 KB device-link profile) — a
+  real CMS task; matrix/TRC RGB ICC profiles are handled, LUT/CLUT are not.
 - ✅ **Float (HDR) sample formats — decode.** Modular-mode float samples
   (`lossless_pfm` conformance testcase) now decode bit-exact. Root cause
   was a class of premature 32-bit truncation in prediction arithmetic —
