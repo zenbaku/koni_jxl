@@ -6,19 +6,23 @@ import 'package:koni_jxl/koni_jxl.dart';
 import 'package:test/test.dart';
 
 import '../util/compare.dart';
+import '../util/png.dart';
 import '../util/pnm.dart';
 
 /// M5 gate: VarDCT/lossy conformance testcases decode within tolerance of
 /// djxl. Excluded (skip list, tracked for later):
 /// cafe + bench_oriented_brg (YCbCr/jbrd), upsampling (M6), noise (M6),
-/// progressive (ICC-only output transform; LF frames themselves decode
-/// and are gated by the corpus progdc files), animation_* (multi-frame,
-/// gated in animation_test), cmyk_layers (CMYK),
-/// spot (spot-color rendering), grayscale + grayscale_public_university
-/// (output tagged by ICC profile only; we decode as sRGB),
-/// lossless_pfm (float samples), blendmodes (extra-channel blending),
-/// patches (alpha-blended VarDCT patches; jxlatte deviates identically —
-/// see doc/spec_notes.md).
+/// animation_* (multi-frame, gated in animation_test), cmyk_layers (CMYK),
+/// spot (spot-color rendering), lossless_pfm (float samples), blendmodes
+/// (extra-channel blending), patches (alpha-blended VarDCT patches; jxlatte
+/// deviates identically — see doc/spec_notes.md).
+///
+/// The ICC-tagged cases (`grayscale`, `grayscale_public_university`,
+/// `patches_lossless`, `progressive`) are gated separately below against the
+/// authoritative `ref.png`, NOT against djxl's PNM output: djxl writes *linear*
+/// pixels to PNM for these profiles, so the djxl-proxy comparison used for the
+/// enum-colour cases is the wrong reference here (it was why these were long
+/// skipped). See color/icc_transform.dart and doc/spec_notes.md.
 final conformanceDir = Directory('../../third_party/conformance/testcases');
 
 const cases = [
@@ -78,6 +82,50 @@ void main() {
       });
     }
   }, skip: haveConformance && haveDjxl ? null : 'corpus or djxl unavailable');
+
+  // ICC-tagged cases, compared to the authoritative ref.png (see group doc
+  // above for why not djxl). progressive exercises the real matrix/TRC output
+  // transform (XYB + non-sRGB TRC); the others already decode correctly and
+  // were only ever failing the wrong (djxl-PNM) reference.
+  group('ICC-tagged conformance vs ref.png', () {
+    if (!haveConformance) return;
+    for (final tc in [
+      'grayscale',
+      'grayscale_public_university',
+      'patches_lossless',
+      'progressive',
+    ]) {
+      test(tc, () {
+        final dir = '${conformanceDir.path}/$tc';
+        final refFile = File('$dir/ref.png');
+        if (!refFile.existsSync()) {
+          markTestSkipped('$tc: no ref.png');
+          return;
+        }
+        final image =
+            JxlDecoder.decode(File('$dir/input.jxl').readAsBytesSync());
+        final ref = PngImage.parse(refFile.readAsBytesSync());
+        expect(image.width, ref.width);
+        expect(image.height, ref.height);
+        final rgba = image.toRgba8();
+        var sumSq = 0.0;
+        var maxDiff = 0;
+        var n = 0;
+        for (var p = 0; p < ref.width * ref.height; p++) {
+          for (var c = 0; c < ref.colorChannels; c++) {
+            final d = rgba[p * 4 + c] - ref.planes[c][p];
+            sumSq += d * d;
+            if (d.abs() > maxDiff) maxDiff = d.abs();
+            n++;
+          }
+        }
+        final rmse = math.sqrt(sumSq / n);
+        expect(rmse, lessThan(2.0),
+            reason: '$tc rmse $rmse (max diff $maxDiff)');
+        expect(maxDiff, lessThan(48), reason: '$tc max diff $maxDiff');
+      }, timeout: const Timeout(Duration(minutes: 3)));
+    }
+  }, skip: haveConformance ? null : 'conformance corpus not present');
 
   test('progressive (LF frames) decodes to full size', () {
     final input = File('${conformanceDir.path}/progressive/input.jxl');

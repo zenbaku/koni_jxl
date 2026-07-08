@@ -982,51 +982,28 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
 
 None block the manga use case; listed for completeness.
 
-- 🔲 **ICC-driven output transform (scoped 2026-07-07).** XYB/enum-transfer
-  output is done; a file whose color is described only by an embedded ICC
-  profile currently decodes as if tagged sRGB (the raw profile is decoded
-  byte-exact and exposed on `JxlImage.iccProfile`, but never *applied*). Note
-  this is graceful degradation, **not** a throw.
+- ✅ **ICC-driven output transform — done for matrix/TRC RGB profiles
+  (2026-07-07).** `color/icc_transform.dart` applies a matrix/TRC RGB ICC
+  profile as a real output transform (`device = invTRC_profile(M · linear)`),
+  wired into `_finalizeCanvas` behind `useIccProfile` so enum/XYB output is
+  byte-unchanged. Gated in a dedicated `ICC-tagged conformance vs ref.png`
+  group; `progressive` goes from rmse 12.6 → **0.082** vs the authoritative
+  reference.
 
-  **Scope decision — matrix/TRC profiles only, not a general CMS.** Verified
-  (by decoding each via `IccCodec` and dumping tags) that **all four**
-  conformance ICC-bearing cases — `progressive`, `progressive_5`,
-  `patches_lossless`, `spot` — are `mntr`/RGB/XYZ-PCS **matrix-TRC** profiles
-  (`rXYZ`/`gXYZ`/`bXYZ` colorants + `rTRC`/`gTRC`/`bTRC` curves + `wtpt` +
-  `chad`), with **no `A2B*`/`mAB `/LUT tags at all**. So the common
-  display-profile path covers 100% of real cases; a full lcms2-style CLUT/
-  multi-intent CMS (huge, ~zero image ROI) is explicitly out of scope. LUT-
-  based profiles keep degrading to sRGB (or get a new specific
-  `JxlUnsupportedException('icc-lut-profile')`).
-
-  **Pipeline** (new `color/icc_transform.dart`, pure Dart, no deps):
-  1. Parse the ICC profile already in hand: header + tag table, then the
-     `XYZType` (`rXYZ`/`gXYZ`/`bXYZ`, `wtpt`), `s15Fixed16` `chad` matrix, and
-     the TRC tags (both `curv` — identity/gamma/sampled LUT — and parametric
-     `para` types 0-4). Bound every count/offset against the profile length
-     (robustness contract: only `JxlException` on malformed profiles).
-  2. Build source→PCS: linearize channel via its TRC (invert the curve;
-     sampled `curv` → interpolated inverse table), then × the 3×3 colorant
-     matrix → XYZ (D50 PCS; colorants are already D50-adapted, `chad` records
-     it).
-  3. Build PCS→target(sRGB): XYZ(D50) → Bradford D50→D65 → inverse-sRGB
-     primaries matrix → linear sRGB → sRGB TRC. (Relative-colorimetric intent
-     only — the sole intent that matters for display profiles.)
-  4. Compose 2+3 into one per-pixel closure; wire into the output stage where
-     `useIccProfile` is currently ignored (render path / `_finalizeCanvas`),
-     gated so enum/XYB output is byte-unchanged.
-
-  **Acceptance:** `progressive` + `progressive_5` conformance cases decode
-  within the standard threshold (they're the documented tone-curve deviation
-  today); a matrix/TRC round-trip unit test (sRGB-described input → identity
-  within ±1); `spot`/`patches_lossless` pixels unchanged-or-closer to djxl.
-  **Effort:** ~1 focused session (~300-500 lines: ICC struct parser + the
-  fixed matrix/curve math + wiring + tests). **Risk:** low-moderate — the math
-  is standard and bounded, the parser is the fiddly part (tag-type variants),
-  and it's fully isolated behind `useIccProfile` so it cannot regress the
-  enum/XYB path. **Value caveat:** completeness + 2 conformance cases; **zero
-  manga value** (manga is enum/XYB), so this stays deferred behind anything
-  with real ROI — the scoping here just means it's ready to pick up.
+  **The bulk of this "gap" turned out to be a test-methodology bug, not
+  missing functionality.** Comparing koni against the conformance `ref.png`
+  (instead of djxl's PNM, which writes *linear* pixels for these profiles —
+  the reason these cases had been skipped) showed **3 of 4 ICC cases already
+  decoded correctly** (`grayscale`, `grayscale_public_university`,
+  `patches_lossless`). Only `progressive` (XYB + non-sRGB display profile)
+  needed a real transform, and it was TRC-only (sRGB primaries + a `para`
+  gamma≈2.22 curve) — derived and verified numerically before coding. See
+  doc/spec_notes.md's "Output color pipeline" for the full write-up. The
+  colorant-matrix path (non-sRGB primaries) is unit-tested
+  (`test/color/icc_transform_test.dart`) but not conformance-verified (no
+  wide-gamut case in the corpus). **Still out of scope:** LUT/CLUT (`A2B*`/
+  `mAB `) profiles — they fall back to sRGB (rare for images; would need CLUT
+  interpolation + rendering intents).
 - 🔲 **Spot-color rendering.** Spot-color extra channels.
 - 🔲 **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
   a JPEG-transcoded `.jxl` (needs the jbrd box + JPEG serialization).

@@ -142,10 +142,11 @@ un-applied:
   composited onto the image.
 - **JPEG bitstream reconstruction** — the `jbrd` box is ignored; pixels decode
   through the normal VarDCT path (byte-exact JPEG re-emission is out of scope).
-- **ICC-driven output transform** — a file whose color is described only by an
-  embedded ICC profile decodes as if tagged sRGB. The raw ICC profile is itself
-  decoded byte-exact (conformance-gated, `icc/icc_codec.dart`) and exposed on
-  `JxlImage.iccProfile` for a caller's own color-management to apply.
+- **ICC-driven output transform** — matrix/TRC RGB ICC profiles ARE now applied
+  as a real output transform (`color/icc_transform.dart`, conformance-gated
+  against `ref.png` incl. the `progressive` case). Grayscale/CMYK/LUT-CLUT
+  profiles still fall back to sRGB. The raw ICC profile is decoded byte-exact
+  (`icc/icc_codec.dart`) and exposed on `JxlImage.iccProfile` regardless.
 
 The only `JxlUnsupportedException` on the decode path is an unsupported transfer
 function. Float (HDR) sample *decode* is now supported (encoding one remains

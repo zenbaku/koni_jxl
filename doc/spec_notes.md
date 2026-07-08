@@ -139,10 +139,42 @@ dec_patch_dictionary. `patches_lossless` (additive patches) is bit-exact.
 ## Output color pipeline
 
 XYB images are inverted to linear RGB with the image's primaries, then
-encoded with the header's *enum* transfer function. Files whose color is
-only described by an embedded ICC profile (`want_icc`) are decoded as if
-tagged sRGB; a full ICC-driven output transform is out of scope for v1
-(the raw ICC profile is exposed on `JxlImage.iccProfile`).
+encoded for output. For an enum-colour file that is the header's transfer
+function. For a file whose colour is described by an embedded **matrix/TRC
+RGB** ICC profile, the profile is applied as a real output transform
+(`color/icc_transform.dart`): `device = invTRC_profile(M · linear)`, where
+`M` maps sRGB-primary linear to the profile's primary linear (built from the
+profile's `rXYZ`/`gXYZ`/`bXYZ` colorants vs. the standard sRGB D50 colorants)
+and `invTRC` is the inverse of each channel's `curv`/`para` TRC (precomputed
+as a 1024-entry LUT). Grayscale, CMYK, and LUT/CLUT (`A2B*`/`mAB `) profiles
+fall back to the sRGB path (`tryParse` returns null). The raw ICC profile is
+also exposed on `JxlImage.iccProfile` regardless.
+
+**How this was scoped (a corrected assumption worth recording).** The
+starting belief — "ICC files decode wrong; needs a CMS" — was mostly wrong.
+Measuring koni's decode against the authoritative conformance `ref.png`
+(not djxl's PNM output) showed **3 of 4 ICC conformance cases already decode
+correctly**: `grayscale` (rmse 0.32), `grayscale_public_university` (0.003),
+`patches_lossless` (0.000). They had been *skipped* only because
+`vardct_conformance_test.dart` compared against djxl's PNM output, and **djxl
+writes *linear* pixels to PNM for these profiles** (verified: djxl-PNM ==
+`sRGB_to_linear(ref.png)`), so the djxl proxy was the wrong reference. Only
+`progressive` (XYB + a non-sRGB display profile) had a real deviation (rmse
+12.6 vs ref.png). It was characterised as TRC-only (per-channel, identical
+across R/G/B, no channel mixing → sRGB primaries), and the exact fix
+`ref == invTRC_profile(sRGB_to_linear(koni))` was **verified numerically at
+sampled points before any code was written** (the profile's `rTRC` is a
+parametric `para` funcType-3 gamma≈2.22 curve). After implementing, all four
+cases pass against `ref.png` at rmse<2/max<48 (`progressive` 12.6 → 0.082),
+now gated in a dedicated `ICC-tagged conformance vs ref.png` group; the
+enum-colour cases are unaffected (the transform only fires on
+`useIccProfile`). The colorant-matrix path (for genuinely non-sRGB primaries —
+no conformance case exercises it) is covered by `test/color/
+icc_transform_test.dart` (a synthetic profile with 2×sRGB colorants → `M =
+0.5·I`). **Remaining out of scope:** LUT/CLUT profiles (rare for images; would
+need CLUT interpolation + rendering intents), and a wide-gamut (AdobeRGB/P3)
+conformance reference to promote the matrix path from unit-tested to
+conformance-verified.
 
 ## Progressive (LF frames)
 
@@ -151,10 +183,10 @@ normal frame machinery: an LF frame's pixels are stored per lf-level and
 become the referencing frame's dequantized LF coefficients directly (the
 LF context indices stay zero, matching the reference decoders). Synthetic
 progressive_dc corpus files gate this within the normal lossy thresholds.
-The `progressive` conformance testcase decodes correctly but differs from
-djxl by a smooth per-channel tone curve: its color is described only by
-an embedded ICC profile, which koni_jxl decodes as sRGB (the documented
-ICC limitation, verified as a monotonic +-1-tight value mapping).
+The `progressive` conformance testcase (its colour described by an embedded
+matrix/TRC ICC profile) now decodes correctly against the authoritative
+`ref.png` (rmse 0.082) via the ICC output transform — see "Output color
+pipeline" above.
 
 ## Streaming / progressive display
 

@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'color/icc_transform.dart';
 import 'color/transfer_function.dart';
 import 'exceptions.dart';
 import 'frame/frame.dart';
@@ -353,14 +354,27 @@ final class _DecoderState {
             .reconstructFloatSamples(bd.bitsPerSample, bd.expBits);
       }
     }
-    // XYB frames come out of the color transform in linear RGB; convert to
-    // the image's tagged transfer function (what djxl outputs).
+    // XYB frames come out of the color transform in linear RGB. Convert to the
+    // output encoding: for a file whose colour is described by a matrix/TRC RGB
+    // ICC profile, apply that profile (linear -> profile device values, the
+    // representation the conformance reference uses); otherwise apply the
+    // image's tagged transfer function. See color/icc_transform.dart.
     if (imageHeader.xybEncoded) {
-      final tf = TransferFunction.forTransfer(imageHeader.colorEncoding.tf);
-      for (var c = 0; c < imageHeader.colorChannelCount && c < 3; c++) {
-        for (final row in planes[c]!.floatRows) {
-          for (var i = 0; i < row.length; i++) {
-            row[i] = tf.fromLinear(row[i]);
+      final icc = imageHeader.colorEncoding.useIccProfile &&
+              iccProfile != null &&
+              imageHeader.colorChannelCount >= 3
+          ? IccRgbOutputTransform.tryParse(iccProfile)
+          : null;
+      if (icc != null) {
+        icc.apply(
+            planes[0]!.floatRows, planes[1]!.floatRows, planes[2]!.floatRows);
+      } else {
+        final tf = TransferFunction.forTransfer(imageHeader.colorEncoding.tf);
+        for (var c = 0; c < imageHeader.colorChannelCount && c < 3; c++) {
+          for (final row in planes[c]!.floatRows) {
+            for (var i = 0; i < row.length; i++) {
+              row[i] = tf.fromLinear(row[i]);
+            }
           }
         }
       }
