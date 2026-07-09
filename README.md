@@ -203,10 +203,19 @@ the compression tables with `tool/bench_lossless_vs_cjxl.dart` and
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Lossy (VarDCT) encoding is now implemented
-end to end; what's left there is compression efficiency (a real
-rate-distortion search, full 27-transform-type support), plus
-lossless-encoder refinements and the remaining decoder gaps.
+See [ROADMAP.md](ROADMAP.md) — its **Next up** section lists the near-term
+priority order. Currently, highest first:
+
+1. Root-cause a latent VarDCT quality gap (one non-default transform-flag
+   combination decodes above the project's `< 2.0` RMSE bar) — it gates
+   defaulting the rectangular/bespoke/large transforms on.
+2. SIMD the scalar EPF pass-0 filter (a rare but ~6.5 s triple-pass path).
+3. Extend the cheap downscaled decode to lossless (Modular) images via the
+   Squeeze transform.
+
+Lossy (VarDCT) encoding is implemented end to end and all 27 transform types
+exist; the broad remaining theme is compression efficiency (a real
+rate-distortion search over transform size) plus the decoder gaps listed above.
 
 ## Development
 

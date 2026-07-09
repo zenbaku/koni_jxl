@@ -7,6 +7,36 @@ beats `cjxl -e3` on real manga pages. This file tracks what's next.
 Status legend: 🔲 not started · 🔨 in progress · ✅ done (kept here for
 context until it ships in a release).
 
+## Next up (picked 2026-07-08)
+
+The near-term priority order, highest first. Details live in the sections
+linked below.
+
+1. **Root-cause the latent VarDCT RMSE gap** (correctness/quality, bounded).
+   `screentone_256` + `maxTransformSize: 256` + `enableRectangularTransforms`
+   + `enableBespokeTransforms` at distance 1.0 decodes at RMSE 3.24, above this
+   project's own `< 2.0` bar. Confirmed pre-existing, not caught by the current
+   suite. It's the only open item that's a quality-bar *violation* rather than a
+   nice-to-have, it's reproducible, and it **blocks** ever defaulting the
+   rectangular/bespoke/large-transform flags on — so it gates the payoff of the
+   whole 27-transform-type effort. See "Follow-up, found not fixed" under the
+   L3 transform section.
+2. **EPF pass-0 SIMD** (decode perf, self-contained). The `epfIterations == 3`
+   path is scalar; an 11 MP triple-pass photo takes ~6.5 s. Vectorize with
+   `Float32x4` per the CLAUDE.md perf rules. See "Performance & infrastructure".
+3. **Modular/lossless downscale via Squeeze** (feature, larger). Completes the
+   thumbnail-grid story for clean lossless scans — the biggest remaining
+   downscale gap (see the "Downscaled decode" item: modular has no DC concept;
+   only the Squeeze transform's low-frequency channels offer a latent low-res
+   form, currently unwired). Substantial: Squeeze is a hierarchical wavelet-like
+   transform needing partial-level decode plumbed into the DC path.
+
+Lower priority / deferred: delta palette (niche), a cost-based optimal LZ77
+parse (large, uncertain over the gated deep matcher), CMYK/LUT-CLUT output
+(real CMS work, niche).
+
+---
+
 **Full 27-transform-type support's success criterion (settled
 2026-07-05, after round 7 shipped DCT 32x32 off-by-default and it wasn't
 obvious from the outside whether that meant the initiative had stalled):
