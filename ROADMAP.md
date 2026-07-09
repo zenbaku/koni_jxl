@@ -1,16 +1,35 @@
 # koni_jxl roadmap
 
 Direction and deferred work. The decoder is feature-complete for the manga
-use case and both packages are published at 0.1.0; the lossless encoder
-beats `cjxl -e3` on real manga pages. This file tracks what's next.
+use case and both packages are published at 0.1.2 (0.1.3 in-tree). The
+lossless encoder is now competitive with `cjxl`: on the 97-image burkardt PNG
+set it totals 60% of the source PNGs (beats PNG on 87/97) and 102.4% of
+`cjxl -e7` (beats cjxl on 19/97). This file tracks what's next.
 
 Status legend: 🔲 not started · 🔨 in progress · ✅ done (kept here for
 context until it ships in a release).
 
-## Next up (picked 2026-07-08)
+## Next up
 
-The near-term priority order, highest first. Details live in the sections
-linked below.
+**The 2026-07-08 priority trio (below) is all done**, as is the lossless-
+encoder arc that followed it (per-leaf predictors, cross-channel context,
+palette >256 colours, deep gated LZ77, and the grayscale single-channel
+palette that closed the burkardt fractal gap — `dla` now beats `cjxl`,
+`sierpinski`/`math_emporium` 290%/229% → 125%/109%). The `sierpinski` residual
+(125%) was investigated and left open: it is `cjxl`'s more exhaustive modular
+tree *search*, and the one lever that helps (lower tree `minGainBits`) regresses
+screentone/flat content and isn't cheaply gate-able (see the lossless-encoder
+section and doc/spec_notes.md).
+
+**The largest genuine open area is now lossy (VarDCT) compression efficiency**
+— a real rate-distortion search over transform-*type* choice (all 27 types
+exist and are correct, but selection is heuristic), which is what keeps smooth/
+photographic lossy quality behind `cjxl -e7`. Lower priority / deferred: delta
+palette (niche), a cost-based optimal LZ77 parse (large, uncertain over the
+gated deep matcher), CMYK/LUT-CLUT output (real CMS work, niche), JPEG bitstream
+reconstruction.
+
+The completed trio, for context — details in the sections linked below:
 
 1. ✅ **Root-cause the latent VarDCT RMSE gap** — DONE. Was an inherited
    jxlatte transcription bug in the default DCT quant weights for DCT
@@ -54,10 +73,6 @@ linked below.
    gen_corpus.py) to exercise the pass-group skip. Flutter thumbnails via
    `JxlImageProvider(cacheWidth/cacheHeight)` get it for free. See
    doc/spec_notes.md's "Downscaled decode".
-
-Lower priority / deferred: delta palette (niche), a cost-based optimal LZ77
-parse (large, uncertain over the gated deep matcher), CMYK/LUT-CLUT output
-(real CMS work, niche).
 
 ---
 

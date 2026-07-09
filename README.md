@@ -48,7 +48,7 @@ VarDCT, restoration filters, animation, splines, and a Float32x4 SIMD
 performance pass.
 
 Correctness is verified **bit-exact against libjxl's `djxl`** on a large
-generated corpus and the official conformance test suite (~210 automated
+generated corpus and the official conformance test suite (~430 automated
 tests), and validated on real-world commercially-distributed CBZ chapters
 containing JPEG-transcoded JXL pages: **34/34 pages match djxl within a
 max pixel difference of 1/255**.
@@ -119,24 +119,27 @@ final lossy = JxlEncoder.encodeLossy(rgbBytes,
 Every encoded file is gated (lossless: bit-exact; lossy: within an RMSE
 threshold) through **both** this package's decoder and djxl.
 
-**Lossless**: picks per image between LZ77, palette (≤256 colors) and
-YCoCg RCT by exact coded-size estimates. It learns a per-image context
-tree (the biggest lever for lossless size), a modular transform (palette
-/ YCoCg RCT), a per-leaf gradient-vs-weighted predictor choice (each tree
-leaf uses whichever codes its own pixels smaller — e.g. screentone leaves
-go weighted while line art stays gradient), and the smallest of four
-entropy modes ({plain, LZ77} x {prefix, ANS}). Real manga pages reportedly
-land near or below `cjxl -e3`,
-at ~0.3-1 s/page single-threaded — pre-existing figures, not
-independently reverified for this pass (`manga_samples/` only has
-JPEG-transcoded pages, a harder and slower case than a clean scan; see
-[doc/BENCHMARKS.md](doc/BENCHMARKS.md)'s "Real-world manga chapters"
-section for what was actually checked). On the synthetic corpus's
-manga-style (screentone) test image, this encoder beats **every** `cjxl`
-effort level including `-e9` — see doc/BENCHMARKS.md for the full,
-reproducible comparison (and why `-e3` specifically isn't a reliable
-bar: `cjxl`'s own effort levels aren't monotonic in size on halftone
-content). 8/16-bit gray/RGB with optional alpha.
+**Lossless**: competitive with `cjxl` and smaller than PNG across diverse
+real content. It picks per image, by exact coded-size estimates, between a
+per-image learned context tree (the biggest lever for lossless size), a
+modular transform (YCoCg RCT, or a palette — RGB up to 4096 colors, or a
+single-channel grayscale palette gated on value sparsity), a per-leaf
+gradient-vs-weighted predictor choice (each tree leaf uses whichever codes
+its own pixels smaller — e.g. screentone leaves go weighted while line art
+stays gradient), cross-channel context on the RCT colour path, and the
+smallest of four entropy modes ({plain, LZ77} × {prefix, ANS}) with a
+per-image hybrid-uint tokenization. Every decision is try-both-keep-smaller,
+so each lever is never-worse.
+
+Validated on the 97-image public [burkardt PNG set](https://people.math.sc.edu/burkardt/data/png/png.html):
+**60% of the source PNGs' size (beating PNG on 87/97) and 102.4% of
+`cjxl -e7` (beating cjxl outright on 19/97)** — i.e. comfortably smaller
+than PNG and within ~2% of cjxl across photos, logos, graphs, medical and
+generated content. On the synthetic corpus's manga-style (screentone) test
+image it beats **every** `cjxl` effort level including `-e9`. Real (JPEG-
+transcoded) manga pages land around `cjxl -e3` at ~0.3-1 s/page single-
+threaded. 8/16-bit gray/RGB with optional alpha. See
+[doc/BENCHMARKS.md](doc/BENCHMARKS.md) for the full reproducible tables.
 
 **Lossy** (`encodeLossy`, RGB 8-bit, any width/height): real HF
 coefficient context model, adaptive per-block quantization, per-region
@@ -193,8 +196,12 @@ pages):
 |---|---|---|
 | lossless decode | 350 ms (9.7 MP/s) | 748 ms (2.1 MP/s) |
 | lossy decode (effort 7) | 300-430 ms | 210-410 ms |
-| lossless size vs. `cjxl` | 48% of `-e7`, 88% of `-e9` | competitive only with `-e1`/`-e3` |
+| lossless size vs. `cjxl -e7` | 48% (beats even `-e9`) | ~102% (within ~2%; 60% of PNG) |
 | lossy size vs. `cjxl -e1` (`distance` 0.5-2.0) | 0.81-0.94x | 1.5x+ |
+
+(Lossless smooth/photographic figure is the 97-image burkardt-set total —
+see doc/BENCHMARKS.md; the encoder beats PNG on 87/97 and `cjxl -e7` on
+19/97.)
 
 Reproduce the decode-speed table with
 `python3 tool/gen_corpus.py && (cd packages/koni_jxl && dart compile exe tool/bench_decode.dart -o /tmp/bd && /tmp/bd)`;
@@ -203,19 +210,20 @@ the compression tables with `tool/bench_lossless_vs_cjxl.dart` and
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) — its **Next up** section lists the near-term
-priority order. Currently, highest first:
+See [ROADMAP.md](ROADMAP.md). The previous **Next up** trio is now all done:
+the latent VarDCT quant-weight gap was root-caused and fixed, the scalar EPF
+pass-0 filter is SIMD (11 MP triple-pass photo 4.8 s → 2.0 s), and downscaled
+decode was extended to lossless (Modular/Squeeze) images. The lossless encoder
+arc also landed — it now beats PNG and is within ~2% of `cjxl -e7` on real
+content (per-leaf predictors, cross-channel context, >256-colour and grayscale
+palettes, deep gated LZ77).
 
-1. Root-cause a latent VarDCT quality gap (one non-default transform-flag
-   combination decodes above the project's `< 2.0` RMSE bar) — it gates
-   defaulting the rectangular/bespoke/large transforms on.
-2. SIMD the scalar EPF pass-0 filter (a rare but ~6.5 s triple-pass path).
-3. Extend the cheap downscaled decode to lossless (Modular) images via the
-   Squeeze transform.
-
-Lossy (VarDCT) encoding is implemented end to end and all 27 transform types
-exist; the broad remaining theme is compression efficiency (a real
-rate-distortion search over transform size) plus the decoder gaps listed above.
+The largest genuine open area is **lossy compression efficiency**: VarDCT
+encoding is implemented end to end and all 27 transform types exist, but there
+is no rate-distortion search over transform-type choice yet, so smooth/
+photographic quality trails `cjxl -e7`. Beyond that are the graceful decoder
+gaps (JPEG bitstream reconstruction, CMYK/LUT-CLUT ICC, float/HDR sample
+*encoding*) — none block the manga use case.
 
 ## Development
 
