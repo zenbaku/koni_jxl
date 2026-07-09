@@ -239,6 +239,21 @@ Takeaways:
   residual gap to `cjxl` on this category is its stronger LZ/context handling of
   the palette-index channel — the next lever if pursued.
 
+A second, larger validation on the diverse public
+[burkardt PNG set](https://people.math.sc.edu/burkardt/data/png/png.html) (97
+real PNGs — photos, logos, graphs, medical, noisy variants; each encoded
+losslessly in its natural channel form, round-trip bit-exact) tells the same
+story at scale: **koni totals 61.5% of the source PNGs (beating PNG on 83/97)
+and 104.3% of `cjxl -e7`**. So across a broad real corpus this encoder is
+comfortably smaller than PNG and within ~4% of `cjxl`. The gap to `cjxl` is
+concentrated on two content classes: (1) *color photos/UI* (`aquarium` 133% of
+`cjxl`) — where the tree-learner omits cross-channel context, a known lever; and
+(2) *fractal/generated/graph* content with long-range self-similarity
+(`sierpinski` 290%, `dla` 278%, `math_emporium` 229%) — where `cjxl`'s LZ77
+captures repetition koni's shorter-range matcher misses (niche content, low
+real-world weight). koni beats `cjxl` outright on 16/97, mostly line-art logos
+where its palette/gradient path is a good fit.
+
 ## Lossy compression vs. `cjxl`
 
 ```
