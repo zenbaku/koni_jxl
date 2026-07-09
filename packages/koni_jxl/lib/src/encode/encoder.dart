@@ -310,6 +310,22 @@ List<int>? _detectPalette(List<Int32List> planes, int maxColors) {
   return colors;
 }
 
+/// Single-channel (grayscale) palette detection: the distinct sample values,
+/// sorted, or null past [maxColors]. A grayscale palette remaps a small, often
+/// *sparse* set of sample values (e.g. bilevel line art / fractals at {0,255})
+/// to a dense 0..k-1 index channel, whose gradient residuals are ±1 tokens
+/// instead of ±255 — a large win on few-colour grayscale that the RGB
+/// [_detectPalette] never reaches (grayscale historically skipped palette
+/// entirely). The caller keeps whichever of palette/plain codes smaller.
+List<int>? _detectPaletteGray(Int32List plane, int maxColors) {
+  final seen = <int>{};
+  for (var i = 0; i < plane.length; i++) {
+    seen.add(plane[i]);
+    if (seen.length > maxColors) return null;
+  }
+  return seen.toList()..sort();
+}
+
 /// Minimum relative gap in learned-tree training entropy for one predictor to
 /// be declared the clear winner (so the loser's Pass B + entropy coding +
 /// assembly is skipped). 2% is comfortably above the strided training set's
@@ -456,15 +472,43 @@ List<int> _mixValues(List<int> contexts, List<int> primary, List<int> alt,
 /// low-colour images; it is not a correctness knob (RCT is always tried).
 const _kPaletteMaxColors = 4096;
 
+/// Distinct-value cap for grayscale palette *detection*. Bounds the hash-set
+/// and palette meta-channel cost; 8-bit grayscale never exceeds 256 distinct
+/// values anyway, so this only bites pathological high-bit-depth input. The
+/// *decision* to spend a second encode is the sparsity gate below, not this cap.
+const _kPaletteMaxColorsGray = 256;
+
+/// A grayscale palette earns its second full encode only when the value set is
+/// **sparse** — many gaps in `[min, max]` — because the transform's whole win is
+/// remapping those sparse values to a dense `0..k-1` index whose gradient
+/// residuals are small (±1 on bilevel line art, versus ±255 raw). Dense
+/// grayscale — photographs using nearly all 256 tones — gains almost nothing
+/// from the remap and would only pay ~2x encode time, so it is skipped here (the
+/// palette is still only *kept* when it codes smaller, so this bounds cost, not
+/// correctness). The 0.8 density cut sits in the wide empirical gap between the
+/// sparse winners (≤0.69 on the burkardt grayscale set: fractals, line art, the
+/// `move*` graphics) and dense photos (≥0.88). See doc/BENCHMARKS.md.
+bool _grayPaletteWorthTrying(List<int> colors) {
+  final span = colors.last - colors.first + 1;
+  return colors.length < 0.8 * span;
+}
+
 List<Int32List> _copyPlanes(List<Int32List> planes) =>
     [for (final p in planes) Int32List.fromList(p)];
 
 /// Color modular encode: try the RCT (non-palette) path always, and the palette
 /// path when the colour count is small enough, keeping whichever is smaller.
-/// Grayscale skips both (no palette/RCT). See [_kPaletteMaxColors].
+/// Grayscale tries a single-channel palette under the same never-worse rule when
+/// its value set is sparse enough to benefit (see [_grayPaletteWorthTrying]).
 Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   if (setup.grayscale) {
-    return _encodeModularCore(setup, planes, null, false);
+    final grayBytes = _encodeModularCore(setup, planes, null, false);
+    final palette = _detectPaletteGray(planes[0], _kPaletteMaxColorsGray);
+    if (palette == null || !_grayPaletteWorthTrying(palette)) return grayBytes;
+    final palBytes = _encodeModularCore(
+        setup, _copyPlanes(planes), palette, false,
+        paletteChannels: 1);
+    return palBytes.length < grayBytes.length ? palBytes : grayBytes;
   }
   final palette = _detectPalette(planes, _kPaletteMaxColors);
   final rctBytes = _encodeModularCore(setup, _copyPlanes(planes), null, true);
@@ -475,7 +519,8 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
 }
 
 Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
-    List<int>? palette, bool applyRct) {
+    List<int>? palette, bool applyRct,
+    {int paletteChannels = 3}) {
   const groupDim = 256;
   final width = setup.width;
   final height = setup.height;
@@ -497,13 +542,19 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
       lookup[palette[i]] = i;
     }
     final p0 = planes[0];
-    final p1 = planes[1];
-    final p2 = planes[2];
     final index = Int32List(p0.length);
-    for (var i = 0; i < p0.length; i++) {
-      index[i] = lookup[(p0[i] << 40) | (p1[i] << 20) | p2[i]]!;
+    if (paletteChannels == 1) {
+      for (var i = 0; i < p0.length; i++) {
+        index[i] = lookup[p0[i]]!;
+      }
+    } else {
+      final p1 = planes[1];
+      final p2 = planes[2];
+      for (var i = 0; i < p0.length; i++) {
+        index[i] = lookup[(p0[i] << 40) | (p1[i] << 20) | p2[i]]!;
+      }
     }
-    planes = [index, ...planes.sublist(3)];
+    planes = [index, ...planes.sublist(paletteChannels)];
   } else if (applyRct) {
     _forwardRct(planes);
   }
@@ -514,11 +565,18 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
   Int32List? pal;
   if (palette != null) {
     final n = palette.length;
-    pal = Int32List(3 * n);
-    for (var i = 0; i < n; i++) {
-      pal[i] = palette[i] >>> 40;
-      pal[n + i] = (palette[i] >>> 20) & 0xFFFFF;
-      pal[2 * n + i] = palette[i] & 0xFFFFF;
+    if (paletteChannels == 1) {
+      pal = Int32List(n);
+      for (var i = 0; i < n; i++) {
+        pal[i] = palette[i];
+      }
+    } else {
+      pal = Int32List(3 * n);
+      for (var i = 0; i < n; i++) {
+        pal[i] = palette[i] >>> 40;
+        pal[n + i] = (palette[i] >>> 20) & 0xFFFFF;
+        pal[2 * n + i] = palette[i] & 0xFFFFF;
+      }
     }
   }
 
@@ -553,7 +611,7 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
           0,
           0,
           palette.length,
-          3,
+          paletteChannels,
           metaValues,
           metaMaxErr,
           trainProps,
@@ -626,8 +684,8 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
     final tree = p.tree;
     final metaContexts = <int>[];
     if (pal != null) {
-      _tileContexts(pal, palette!.length, 0, 0, palette.length, 3, tree,
-          metaContexts, p.metaMaxErr);
+      _tileContexts(pal, palette!.length, 0, 0, palette.length, paletteChannels,
+          tree, metaContexts, p.metaMaxErr);
     }
     final groupContexts = List<List<int>>.generate(numGroups, (_) => []);
     for (var g = 0; g < numGroups; g++) {
@@ -713,7 +771,7 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
         lfGlobal.writeU32(1, 0, 0, 1, 0, 2, 4, 18, 8); // nb_transforms = 1
         lfGlobal.writeBits(1, 2); // transform: palette
         lfGlobal.writeU32(0, 0, 3, 8, 6, 72, 10, 1096, 13); // begin_c = 0
-        lfGlobal.writeU32(3, 1, 0, 3, 0, 4, 0, 1, 13); // num_c = 3
+        lfGlobal.writeU32(paletteChannels, 1, 0, 3, 0, 4, 0, 1, 13); // num_c
         lfGlobal.writeU32(
             palette.length, 0, 8, 256, 10, 1280, 12, 5376, 16); // nb_colors
         lfGlobal.writeU32(0, 0, 0, 1, 8, 257, 10, 1281, 16); // nb_deltas = 0

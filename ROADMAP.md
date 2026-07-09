@@ -1106,6 +1106,24 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
   JPEG-transcoded manga pages) never pays for it (encode time +1.6–3%). Decode
   untouched. See doc/spec_notes.md. Remaining: a cost-based *optimal* parse
   (LZMA/zopfli-style) is the only larger LZ77 lever left.
+- ✅ **Grayscale (single-channel) palette (2026-07-09).** Palette was RGB-only,
+  so few-value *grayscale* content (bilevel line art, fractals) coded raw 0/255
+  values (±255 gradient residuals) instead of a dense `{0,1}` index (±1). This
+  was the dominant term in the burkardt set's **fractal/generated gap** — the
+  content class where `cjxl` was ~2-3× smaller (`sierpinski` 290%, `dla` 277%,
+  `math_emporium` 229% of `cjxl -e7`). Threaded a `paletteChannels` (1 vs 3)
+  parameter through the existing palette machinery (index build, meta channel,
+  `num_c` header); **the decoder needed no changes** (it already round-trips
+  `cjxl`'s grayscale palettes). Attempted under a **sparsity gate** (density
+  `< 0.8`, i.e. many gaps in `[min,max]`), not a raw colour cap, so grayscale
+  *photos* (~all tones used → palette ≈ identity) and manga pages pay zero extra
+  encode time; output is still `min(plain, palette)` so it is never-worse in
+  size. Measured (bit-exact through this decoder and djxl): `dla` **−64.5%**
+  (now beats `cjxl`), `sierpinski` −56.7% (→125%), `math_emporium` −52.2%
+  (→110%), `cat`/`fool`/`washington` −53–60%; grayscale subset **−4.1%** total,
+  several images now beat `cjxl`. Colour path byte-identical. See
+  doc/spec_notes.md. Remaining: the residual `sierpinski` gap is 2-D fractal
+  self-similarity that 1-D LZ77 on the index channel still misses.
 
 ---
 

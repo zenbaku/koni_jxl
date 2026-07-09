@@ -252,17 +252,32 @@ A second, larger validation on the diverse public
 [burkardt PNG set](https://people.math.sc.edu/burkardt/data/png/png.html) (97
 real PNGs — photos, logos, graphs, medical, noisy variants; each encoded
 losslessly in its natural channel form, round-trip bit-exact) tells the same
-story at scale: **koni totals 61.5% of the source PNGs (beating PNG on 83/97)
-and 104.3% of `cjxl -e7`**. So across a broad real corpus this encoder is
-comfortably smaller than PNG and within ~4% of `cjxl`. The gap to `cjxl` is
-concentrated on two content classes: (1) *color photos/UI* — narrowed by the
+story at scale: **koni totals 60.0% of the source PNGs (beating PNG on 87/97)
+and 102.4% of `cjxl -e7`**. So across a broad real corpus this encoder is
+comfortably smaller than PNG and within ~2% of `cjxl`, beating it outright on
+19/97 (mostly line-art logos and now the bilevel fractals below).
+
+The former **fractal/generated gap** — the one class where `cjxl` was 2-3×
+smaller — was closed by the grayscale (single-channel) palette (see
+doc/spec_notes.md). Those images (`sierpinski`, `dla`, `math_emporium`) are
+bilevel; palette remaps their `{0,255}` values to a `{0,1}` index whose gradient
+residuals are ±1 tokens instead of ±255. Apples-to-apples over the whole 97-set
+(git-stash A/B, same tool): **103.0%→102.4% of `cjxl`, 60.3%→60.0% of PNG,
+`cjxl`-beating count 15→19, PNG-beating count 83→87** — the whole-set total moves
+modestly because these files are small, but per image the change is large:
+
+| image          | before        | after         |
+|----------------|---------------|---------------|
+| `dla`          | 50053 (278%)  | 17793 (**99%**, beats `cjxl`) |
+| `math_emporium`| 61449 (229%)  | 29375 (**109%**) |
+| `sierpinski`   | 18917 (290%)  | 8194 (**125%**) |
+
+The remaining gap now concentrates on: (1) *color photos/UI* — narrowed by the
 cross-channel context work above (illustration/UI benefits most; `aquarium`-type
-photos with independent per-channel noise less so); and
-(2) *fractal/generated/graph* content with long-range self-similarity
-(`sierpinski` 290%, `dla` 278%, `math_emporium` 229%) — where `cjxl`'s LZ77
-captures repetition koni's shorter-range matcher misses (niche content, low
-real-world weight). koni beats `cjxl` outright on 16/97, mostly line-art logos
-where its palette/gradient path is a good fit.
+photos with independent per-channel noise less so); and (2) the residual
+`sierpinski` case (125%) — 2-D fractal self-similarity that 1-D LZ77 / context
+modelling on the index channel still doesn't fully capture (niche, low
+real-world weight).
 
 ## Lossy compression vs. `cjxl`
 

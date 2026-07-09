@@ -195,6 +195,60 @@ void main() {
     }
   });
 
+  test('grayscale palette (sparse few-value single channel)', () {
+    // Bilevel / few-value grayscale (fractals, line art) used to skip palette
+    // entirely and code raw 0/255 values, whose gradient residuals are ±255
+    // tokens; the single-channel (num_c=1) palette remaps them to a dense index
+    // whose residuals are ±1. Each layout below is *sparse* (few distinct values
+    // spread across 0..255) so `_grayPaletteWorthTrying` fires; the round-trip
+    // proves the num_c=1 palette bitstream is spec-legal (djxl) and self-exact.
+    for (final (w, h, values) in [
+      (200, 160, [0, 255]), // bilevel — the sierpinski/dla case
+      (200, 160, [0, 64, 128, 255]),
+      (300, 200, [for (var i = 0; i < 30; i++) i * 8]), // 30 sparse values
+    ]) {
+      final pixels = Uint8List(w * h);
+      for (var i = 0; i < pixels.length; i++) {
+        // Structured (not pure noise) so gradient prediction leaves the sparse
+        // structure a palette can exploit, matching the real content.
+        final idx = ((i ~/ w) ~/ 3 + (i % w) ~/ 5) % values.length;
+        pixels[i] = values[idx];
+      }
+      final encoded = JxlEncoder.encodeLossless(pixels,
+          width: w, height: h, grayscale: true);
+
+      final image = JxlDecoder.decode(encoded);
+      final ours = channelAsInts(image.channels[0], 255);
+      for (var i = 0; i < w * h; i++) {
+        if (ours[i] != pixels[i]) {
+          fail('gray-palette our-decoder mismatch at px $i '
+              '(${values.length} values)');
+        }
+      }
+      if (_haveDjxl) {
+        final dir = Directory.systemTemp.createTempSync('koni_enc');
+        try {
+          final jxlPath = '${dir.path}/t.jxl';
+          final outPath = '${dir.path}/t.pgm';
+          File(jxlPath).writeAsBytesSync(encoded);
+          final r =
+              Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+          expect(r.exitCode, 0, reason: 'djxl: ${r.stderr}');
+          final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+          final theirs = ref.intPlanes![0];
+          for (var i = 0; i < w * h; i++) {
+            if (theirs[i] != pixels[i]) {
+              fail('gray-palette djxl mismatch at px $i '
+                  '(${values.length} values)');
+            }
+          }
+        } finally {
+          dir.deleteSync(recursive: true);
+        }
+      }
+    }
+  });
+
   test('16-bit', () {
     _check16(64, 48);
     _check16(300, 260, grayscale: true);

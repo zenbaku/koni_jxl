@@ -444,6 +444,57 @@ and weighted-predictor paths), which is what confirms the property-0 and 16-19
 computations match the decoder — a mismatch would desync the stream and fail
 those gates immediately.
 
+### Lossless encoder — grayscale (single-channel) palette (2026-07-09)
+
+The palette transform was **RGB-only** (`_detectPalette` reads `planes[0/1/2]`,
+and `_encodeModular` returned early for grayscale before ever trying it). So
+few-value *grayscale* content — bilevel line art and fractals at `{0, 255}` — was
+coded as raw grayscale, whose clamped-gradient residuals at every edge are ±255
+(packed to tokens ~510, ≈9 bits each). A single-channel palette remaps those two
+values to a dense `{0, 1}` index whose residuals are ±1 (tokens ≈1-2 bits). Same
+edge count, ~7× cheaper per edge. This was the dominant term in the burkardt
+set's **fractal/generated gap** — the one content class where `cjxl` was ~2-3×
+smaller (`sierpinski` 290%, `dla` 277%, `math_emporium` 229% of `cjxl -e7`).
+`cjxl` palettes these; koni now does too.
+
+Mechanically it reuses the existing palette machinery with a `paletteChannels`
+parameter (1 vs 3) threaded through `_encodeModularCore`: the index build, the
+palette meta channel (`pal`, now `n` values in one row instead of `3·n` in three
+rows), the meta-channel tile height, and the transform header's `num_c` field
+(`U32(Val(1), Val(3), Val(4), BitsOffset(13,1))` — value 1 is the first choice,
+matching libjxl). **The decoder needed zero changes**: it already round-trips
+`cjxl`'s grayscale palettes bit-exactly (verified before writing any encoder
+code), because a `num_c=1` palette is the same inverse transform with one colour
+component.
+
+**When it's attempted — a sparsity gate, not a raw colour cap.** The RGB path
+tries palette for any ≤4096-colour image; a grayscale image always has ≤256
+distinct 8-bit values, so a colour cap alone would double-encode every grayscale
+*photo* (≈256 tones) for nothing. The transform's benefit is *remapping sparse
+values to compact ones*, so `_grayPaletteWorthTrying` gates on **density**
+(`distinct < 0.8 · (max−min+1)`): sparse value sets (bilevel/line-art/`move*`
+graphics: ≤0.69 density on the burkardt set) are tried; dense photos (≥0.88,
+nearly all tones used — palette ≈ identity) are skipped, so the common grayscale
+case (photos, and screentone manga pages, which are ≥200-tone or RGB anyway)
+pays **zero** extra encode time. When tried, output is still `min(plain,
+palette)`, so it is **never-worse** in size by construction; density only bounds
+the 2× encode cost, not correctness.
+
+Measured (burkardt grayscale subset, git-stash A/B, bit-exact through this
+decoder **and** djxl): `dla` **−64.5%** (50053→17793, now 99% of `cjxl` — beats
+it), `cat` −59.6%, `sierpinski` −56.7% (→125% of `cjxl`, was 290%), `washington`
+−56.0%, `fool` −53.2%, `math_emporium` −52.2% (→110%, was 229%), `dots` −16.7%,
+`seahorse` −10.0%, `move3`/`move1` −7.4%/−6.7% (sparse P-mode graphics the
+density gate catches at 153/169 colours). Grayscale subset total **−4.1%**;
+several images now beat `cjxl` outright. Everything else (all colour images, all
+dense grayscale) is byte-identical — the `paletteChannels=3` default preserves
+the colour path exactly (verified: 7 colour images byte-for-byte unchanged).
+Regression test: `encoder_roundtrip_test.dart`'s "grayscale palette (sparse
+few-value single channel)" case (bilevel, 4-value, and 30-value layouts,
+djxl-gated). The residual `sierpinski` gap (125%) is 2D fractal self-similarity
+that 1-D LZ77 / context modelling on the index channel still doesn't fully
+capture — a much harder, nicher lever left open.
+
 ### Lossless encoder — predictor selection from learned-tree training entropy
 
 The encoder used to run *both* predictor pipelines end to end (Pass A →
