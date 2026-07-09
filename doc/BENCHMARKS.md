@@ -195,6 +195,46 @@ Takeaways:
   only for consistency with the decode table and with how this library
   actually ships (Flutter mobile/desktop is always AOT).
 
+## Lossless vs. PNG and `cjxl` on real images (`test-images/png`)
+
+The corpus above is synthetic. This is the fair, real-image, lossless-vs-
+lossless check on the public [`test-images/png`](https://github.com/test-images/png)
+`202105` set (18 × 400×400 PNGs, already `FileOptimizer`-optimized), all
+encoders run on the *same decoded pixels*:
+
+```
+git clone --depth 1 https://github.com/test-images/png.git
+cd png/202105 && for f in *.png; do magick "$f" "${f%.png}.ppm"; done
+dart run tool/bench_lossless_png.dart png/202105     # koni + cjxl + source PNG
+```
+
+Results split cleanly by content type (bytes; % is koni's size vs that baseline;
+round-trip bit-exact on all 18):
+
+```
+category                 koni      PNG    cjxl-e7   koni/PNG  koni/cjxl
+photos + illustration  463069   584147   447681       79%      103%
+web/UI screenshots     274535   259207   237030      106%      116%
+solid-color swatches    65248    17321    74743      377%       87%
+TOTAL                  802852   860675   759454       93%      106%
+```
+
+Takeaways:
+
+- **On real photographic/illustration content this encoder is strong:** ~21%
+  smaller than optimized PNG and within ~3% of `cjxl -e7` (`pg-couplevn` 70% of
+  PNG, `ia-forrest` 77%). This is the meaningful lossless case, and the earlier
+  lossless-optimization rounds pay off here.
+- **Solid-color swatches: koni loses ~3.8× to PNG but *beats* `cjxl` (87%).**
+  A 400×400 solid colour is ~1.9 KB as a palette PNG but ~7–8 KB in *any* JXL —
+  fixed container/modular-header overhead on trivial content, shared by `cjxl`,
+  not a koni-specific weakness.
+- **Flat web/UI graphics are the one real koni weakness.** `web-booking` (a flat
+  UI screenshot): koni 30 KB vs `cjxl` 14 KB vs PNG 11 KB — **2.15× `cjxl`**.
+  `web-surma` 1.55× PNG. Content with large flat regions and a small palette is
+  where `cjxl`'s palette detection and LZ handling clearly beat this encoder's;
+  this is the concrete lever for future encoder work (see doc/spec_notes.md).
+
 ## Lossy compression vs. `cjxl`
 
 ```
