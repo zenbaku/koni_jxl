@@ -131,16 +131,32 @@ encoder     bytes   vs koni_jxl  encode-ms
   cjxl -e9      741      125.6%      315
 ```
 
+> **⚠️ Read this before citing any lossless number below.** These figures are
+> from the **synthetic** corpus, and for lossless compression the synthetic
+> screentone badly **overstates** this encoder's real-world competitiveness.
+> On **real** scanned manga (14 clean 1200×1707 grayscale screentone pages from
+> a private set, measured 2026-07-08), this encoder is **~2.07× larger than the
+> source PNGs and ~2.46× larger than `cjxl -e7`** — it lands right at the
+> raw-pixel entropy floor (≈ `gzip` of the raw pixels), i.e. its
+> prediction/context pipeline adds almost nothing on *irregular* dense
+> screentone, whereas `cjxl` and even PNG's DEFLATE model that structure. The
+> synthetic `gray_screentone` is *regular and periodic*, which the gated LZ77
+> matcher exploits; real screentone is not, so that win does not transfer. This
+> is the same "synthetic validation didn't survive contact with real content"
+> pattern already documented for the lossy transform-selection ROI. **Do not
+> cite "beats cjxl" as a general lossless claim** — it holds only for regular
+> synthetic patterns. See "Real-world validation" in doc/spec_notes.md.
+
 Takeaways:
 
-- **On manga-style content (`gray_screentone`), this encoder beats every
-  `cjxl` effort level, including `-e9`**: 19% of `cjxl -e7`'s size and 34%
-  of `cjxl -e9`'s (libjxl's slowest, most-optimized mode). Three lossless
-  rounds compound here (all in doc/spec_notes.md): the per-image hybrid-uint
-  config choice (~3.9%), per-leaf predictor selection — letting the screentone
-  leaves use the weighted predictor while the line-art majority stays gradient
-  (−24.6%) — and a deeper, gated LZ77 matcher (−46.5%, the largest single
-  lever, since LZ77 is the winning mode for this repetitive content).
+- **On the *synthetic* halftone pattern (`gray_screentone`), this encoder beats
+  every `cjxl` effort level, including `-e9`** (19% of `cjxl -e7`'s size, 34% of
+  `-e9`'s) — but see the warning above: this does **not** generalize to real
+  scanned screentone, where the pattern's irregularity defeats the LZ77 matcher
+  that drives this result. Three lossless rounds compound on the synthetic
+  pattern (all in doc/spec_notes.md): the per-image hybrid-uint config choice
+  (~3.9%), per-leaf predictor selection (−24.6%), and a deeper, gated LZ77
+  matcher (−46.5%, the largest lever, since LZ77 wins on *repetitive* content).
   `cjxl -e3` is not a meaningful comparison point for this image — `cjxl`'s
   own effort levels are **not monotonic in size** on this synthetic
   halftone pattern (verified independently: `-e1` 270 KB, `-e2` 507 KB,
@@ -148,6 +164,17 @@ Takeaways:
   single worst effort level, over 4x larger than `-e1`). Don't cite a
   "beats cjxl -e3" number for this content; it's an artifact of `cjxl`,
   not a meaningful bar.
+- **On real content this encoder is not compression-competitive.** Measured on
+  real manga (above) it loses ~2× to PNG and ~2.5× to `cjxl`; on smooth
+  synthetic gradients (next bullet) it trails `-e7`/`-e9` similarly. The common
+  cause is real, and the same one in both cases: this encoder has no effective
+  model for continuous-tone / high-frequency-textured content — its fixed
+  gradient/WP predictors fail there (delta coding *enlarges* screentone
+  residuals) and its MA-tree context is too weak to make up the difference,
+  so it codes near raw-pixel entropy. `cjxl`'s learned per-context RD search
+  models exactly that. This is the lossless encoder's headline limitation; the
+  library's value for a real JXL workload is its **decoder**, not this encoder's
+  compression ratio.
 - On smooth synthetic gradients (`color_cover`, `gray16_gradient`) this
   encoder is competitive with `cjxl -e1`/`-e3` but well behind `-e7`/`-e9`
   — libjxl's real rate-distortion search over predictors and context

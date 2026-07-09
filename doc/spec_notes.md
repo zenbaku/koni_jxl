@@ -4060,7 +4060,28 @@ up to 1920x1508 full color) decode with zero failures: all 34 pages match
 djxl within a max pixel difference of 1/255, ~0.3-0.4 s per page AOT
 single-threaded. The `jbrd` JPEG reconstruction box is ignored; pixels
 decode through the normal VarDCT path (byte-exact JPEG re-emission is out
-of scope).
+of scope). Reduced-resolution (1:8) decode of those same pages via the
+DC-only fast path runs in ~15-24 ms (≈7x faster than a full decode) — the
+concrete win for a reader's thumbnail grid / page prefetch.
+
+**Lossless encoder, real-content reality check (2026-07-08).** Measured on
+14 real scanned manga pages (clean 1200x1707 grayscale with heavy screentone,
+no JPEG blocking — a private set, so no committed fixture): this encoder
+produces output **~2.07x larger than the source PNGs and ~2.46x larger than
+`cjxl -e7`**, landing essentially at the raw-pixel entropy floor (koni 1.385 MB
+vs. `gzip -9` of the raw pixels 1.394 MB, for one 2 MP page). Diagnosis: on
+*irregular* dense screentone the gradient/WP predictors are counterproductive
+(a horizontal delta *enlarges* the data — `gzip` of the delta is 2.05 MB vs.
+1.39 MB raw) and the MA-tree context model is too weak to capture the dot
+structure, so the encoder codes near raw entropy while `cjxl` (602 KB at `-e1`,
+566 KB at `-e7`) and even PNG's DEFLATE (663 KB) model it. This **contradicts
+the synthetic `gray_screentone` result** (where this encoder beats `cjxl -e9`):
+that pattern is regular/periodic and LZ77-friendly; real screentone is neither.
+The lesson mirrors the lossy transform-selection ROI finding — synthetic
+corpus content overstates real-world competitiveness — and it is now the
+lossless encoder's documented headline limitation. **The library's real-world
+value is its decoder, not this encoder's compression ratio;** closing the gap
+would require a genuinely learned per-context RD model (large, deferred).
 
 Animation is decoded beyond what jxlatte implements (jxlatte stops at
 the first visible frame). One spec detail matters there: for a frame
