@@ -178,10 +178,20 @@ void _tileResiduals(
     int stride,
     List<int> strideState,
     bool useWp,
-    List<int> properties) {
+    List<int> properties,
+    {int channelIndex = 0,
+    Int32List? priorPlane}) {
   final tile = Int32List(tw * th);
   for (var y = 0; y < th; y++) {
     tile.setRange(y * tw, y * tw + tw, plane, (oy + y) * imageWidth + ox);
+  }
+  Int32List? priorTile;
+  if (priorPlane != null) {
+    priorTile = Int32List(tw * th);
+    for (var y = 0; y < th; y++) {
+      priorTile.setRange(
+          y * tw, y * tw + tw, priorPlane, (oy + y) * imageWidth + ox);
+    }
   }
   Int32List? wpRes;
   Int32List? wpErr;
@@ -219,7 +229,8 @@ void _tileResiduals(
       }
       valuesOut.add(value);
       if (counter == 0) {
-        computeProps(tile, tw, th, y, x, properties, wpErr?[o] ?? 0, props);
+        computeProps(tile, tw, th, y, x, properties, wpErr?[o] ?? 0, props,
+            channelIndex: channelIndex, prior: priorTile);
         for (var pi = 0; pi < props.length; pi++) {
           trainProps.add(props[pi]);
         }
@@ -236,16 +247,26 @@ void _tileResiduals(
 /// per-pixel max-error (property 15) is read from [maxErrIn] (filled by Pass
 /// A in the same order) so the weighted predictor isn't recomputed.
 void _tileContexts(Int32List plane, int imageWidth, int ox, int oy, int tw,
-    int th, ContextTree tree, List<int> contextsOut, List<int>? maxErrIn) {
+    int th, ContextTree tree, List<int> contextsOut, List<int>? maxErrIn,
+    {int channelIndex = 0, Int32List? priorPlane}) {
   final tile = Int32List(tw * th);
   for (var y = 0; y < th; y++) {
     tile.setRange(y * tw, y * tw + tw, plane, (oy + y) * imageWidth + ox);
+  }
+  Int32List? priorTile;
+  if (priorPlane != null) {
+    priorTile = Int32List(tw * th);
+    for (var y = 0; y < th; y++) {
+      priorTile.setRange(
+          y * tw, y * tw + tw, priorPlane, (oy + y) * imageWidth + ox);
+    }
   }
   final props = Int32List(tree.properties.length);
   for (var y = 0; y < th; y++) {
     for (var x = 0; x < tw; x++) {
       final me = maxErrIn != null ? maxErrIn[contextsOut.length] : 0;
-      computeProps(tile, tw, th, y, x, tree.properties, me, props);
+      computeProps(tile, tw, th, y, x, tree.properties, me, props,
+          channelIndex: channelIndex, prior: priorTile);
       contextsOut.add(contextFor(tree, props));
     }
   }
@@ -511,7 +532,11 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
   // below `prep`/`finish`.
   _Prep prep(bool useWp) {
     final predictor = useWp ? 6 : 5;
-    final properties = useWp ? wpProperties : gradProperties;
+    // On the RCT colour path the tree may condition on channel index and on
+    // the prior channel (cross-channel context); grayscale/palette can't.
+    final properties = useRct
+        ? (useWp ? rctWpProperties : rctGradProperties)
+        : (useWp ? wpProperties : gradProperties);
     final strideState = [0];
     final trainProps = <int>[];
     final trainTokens = <int>[];
@@ -546,9 +571,9 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
       final oy = (g ~/ groupsX) * groupDim;
       final tw = (width - ox).clamp(0, groupDim);
       final th = (height - oy).clamp(0, groupDim);
-      for (final plane in planes) {
+      for (var pi = 0; pi < planes.length; pi++) {
         _tileResiduals(
-            plane,
+            planes[pi],
             width,
             ox,
             oy,
@@ -561,7 +586,9 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
             stride,
             strideState,
             useWp,
-            properties);
+            properties,
+            channelIndex: useRct ? pi : 0,
+            priorPlane: useRct && pi > 0 ? planes[pi - 1] : null);
       }
     }
 
@@ -608,9 +635,11 @@ Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
       final oy = (g ~/ groupsX) * groupDim;
       final tw = (width - ox).clamp(0, groupDim);
       final th = (height - oy).clamp(0, groupDim);
-      for (final plane in planes) {
-        _tileContexts(plane, width, ox, oy, tw, th, tree, groupContexts[g],
-            p.groupMaxErr?[g]);
+      for (var pi = 0; pi < planes.length; pi++) {
+        _tileContexts(planes[pi], width, ox, oy, tw, th, tree, groupContexts[g],
+            p.groupMaxErr?[g],
+            channelIndex: useRct ? pi : 0,
+            priorPlane: useRct && pi > 0 ? planes[pi - 1] : null);
       }
     }
     return (

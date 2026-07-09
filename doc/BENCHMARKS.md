@@ -213,18 +213,27 @@ round-trip bit-exact on all 18):
 
 ```
 category                 koni      PNG    cjxl-e7   koni/PNG  koni/cjxl
-photos + illustration  463069   584147   447681       79%      103%
-web/UI screenshots     259886   259207   237030      100%      110%
+photos + illustration  454169   584147   447681       78%      101%
+web/UI screenshots     253300   259207   237030       98%      107%
 solid-color swatches    65248    17321    74743      377%       87%
-TOTAL                  788203   860675   759454       92%      104%
+TOTAL                  772717   860675   759454       90%      102%
 ```
 
 Takeaways:
 
-- **On real photographic/illustration content this encoder is strong:** ~21%
-  smaller than optimized PNG and within ~3% of `cjxl -e7` (`pg-couplevn` 70% of
-  PNG, `ia-forrest` 77%). This is the meaningful lossless case, and the earlier
-  lossless-optimization rounds pay off here.
+- **On real photographic/illustration content this encoder is strong:** ~22%
+  smaller than optimized PNG and within ~1% of `cjxl -e7` (`pg-couplevn` 69% of
+  PNG; `ia-installing` now *matches* `cjxl`). This is the meaningful lossless
+  case, and the earlier lossless-optimization rounds pay off here.
+- **Cross-channel context (RCT colour) closed most of the remaining color gap.**
+  Letting the learned tree split on channel index and condition Co/Cg on the
+  prior channel (properties 0/16-19, which the decoder already supports) moved
+  the whole set 104%→**102%** of `cjxl` and 92%→**90%** of PNG, concentrated on
+  illustration/UI content (`ia-installing` −13.7%, `web-surma` −6.8%) where the
+  channels share flat-region structure RCT leaves behind; photographic content
+  (independent per-channel noise) barely moves. Never-worse by construction
+  (the tree splits on the new properties only when they help); ~17% slower
+  encode on colour images, grayscale/palette unaffected. See doc/spec_notes.md.
 - **Solid-color swatches: koni loses ~3.8× to PNG but *beats* `cjxl` (87%).**
   A 400×400 solid colour is ~1.9 KB as a palette PNG but ~7–8 KB in *any* JXL —
   fixed container/modular-header overhead on trivial content, shared by `cjxl`,
@@ -246,8 +255,9 @@ losslessly in its natural channel form, round-trip bit-exact) tells the same
 story at scale: **koni totals 61.5% of the source PNGs (beating PNG on 83/97)
 and 104.3% of `cjxl -e7`**. So across a broad real corpus this encoder is
 comfortably smaller than PNG and within ~4% of `cjxl`. The gap to `cjxl` is
-concentrated on two content classes: (1) *color photos/UI* (`aquarium` 133% of
-`cjxl`) — where the tree-learner omits cross-channel context, a known lever; and
+concentrated on two content classes: (1) *color photos/UI* — narrowed by the
+cross-channel context work above (illustration/UI benefits most; `aquarium`-type
+photos with independent per-channel noise less so); and
 (2) *fractal/generated/graph* content with long-range self-similarity
 (`sierpinski` 290%, `dla` 278%, `math_emporium` 229%) — where `cjxl`'s LZ77
 captures repetition koni's shorter-range matcher misses (niche content, low

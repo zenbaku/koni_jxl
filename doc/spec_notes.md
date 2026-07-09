@@ -404,6 +404,46 @@ Also this session, the learned-tree property set gained the error-feedback
 supports — a small (~0.3%) never-worse win, added after measuring that tree
 depth and threshold granularity barely move real screentone (<1.5%).
 
+### Lossless encoder — cross-channel context for RCT colour (2026-07-09)
+
+Benchmarking real PNGs (test-images/png + the 97-image burkardt set) showed the
+remaining gap to `cjxl` concentrated on *colour* content. Diagnosis: the
+learned tree didn't even split on **channel index** (one shared tree for Y/Co/
+Cg) and omitted the **cross-channel** properties — conditioning Co/Cg on the
+prior channel — that the decoder already computes (`_property` cases 0 and
+16-19). Measured headroom: conditioning the Co residual on the Y residual drops
+its entropy 6-33% (`ia-installing` 33%). So the tree was leaving real structure
+unmodelled that RCT alone doesn't remove.
+
+Added property 0 (channel index) and 16-19 (the immediate prior same-size
+channel's value/|value| and its own clamped-gradient residual/|residual|) to an
+RCT-only colour property set (`rctGradProperties`/`rctWpProperties`).
+`computeProps` gained `channelIndex`/`prior` args and computes 0/16-19 by
+mirroring the decoder's cases exactly — the same `_clamp3`, signed-32
+truncation, and rW=0-at-left / rN=rW-at-top edge handling. The plumbing is tiny
+and contained: contexts are computed in exactly two places (`_tileResiduals`
+Pass A, `_tileContexts` Pass B), both threaded with the channel index and the
+immediate-prior channel's group-tile. **Why the group-tile with group-local
+coords is correct:** each 256×256 group decodes as an independent
+`ModularStream`, so the decoder's cross-channel neighbours are group-local —
+the same reason the existing gradient properties round-trip. Only the RCT path
+uses it (three equal-size channels, no meta channel, so channel index == plane
+index); grayscale/palette pass no prior and pay nothing.
+
+**Never-worse** by construction (the greedy learner splits on the new
+properties only when they reduce entropy past the threshold), so it cannot
+regress any image — verified: photographic content with independent per-channel
+noise barely moves, while illustration/UI content where channels share
+flat-region structure wins big. On test-images/png the whole set went
+104%→**102%** of `cjxl -e7` (92%→90% of PNG): `ia-installing` **−13.7%** (now
+byte-for-byte matching `cjxl`), `web-surma` −6.8%, `ia-forrest` −2.1%. Cost:
+~17% slower encode on colour images (an extra prior-tile copy + a larger tree
+property set); grayscale/palette unaffected. Bit-exact through this decoder
+**and** djxl (`encoder_corpus_test`/`encoder_roundtrip_test`, incl. the alpha
+and weighted-predictor paths), which is what confirms the property-0 and 16-19
+computations match the decoder — a mismatch would desync the stream and fail
+those gates immediately.
+
 ### Lossless encoder — predictor selection from learned-tree training entropy
 
 The encoder used to run *both* predictor pipelines end to end (Pass A →

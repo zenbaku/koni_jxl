@@ -26,6 +26,22 @@ const gradProperties = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 /// (max-error), which is where WP's advantage lives.
 const wpProperties = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
+/// Property sets for multi-channel RCT colour: the base sets plus channel
+/// index (0) and the immediate prior channel's cross-channel properties
+/// (16 = |value|, 17 = value, 18 = |gradient residual|, 19 = gradient
+/// residual — the decoder's `_property` cases 16-19 for the nearest prior
+/// same-size channel). Property 0 lets the tree specialise per channel
+/// (Y/Co/Cg) instead of sharing one tree; 16-19 let Co/Cg condition on the
+/// prior channel. Used only on the RCT path (three equal-size channels, no
+/// meta channel, so channel index == plane index) — see `computeProps`'s
+/// `channelIndex`/`prior` args and the encoder's callers.
+const rctGradProperties = [
+  4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 16, 17, 18, 19 //
+];
+const rctWpProperties = [
+  4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 16, 17, 18, 19 //
+];
+
 /// Candidate split thresholds (the decoder walk is `property > value`).
 const _thresholds = [
   -64, -32, -16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16, 32, 64, 128, //
@@ -34,8 +50,17 @@ const _thresholds = [
 /// Computes [properties] for pixel (y, x) of a tile into [out] (same length),
 /// mirroring the decoder's `_property`. Property 15 (WP max-error) is not
 /// derivable from the tile, so its value is supplied as [maxError].
+///
+/// [channelIndex] supplies property 0 (the decoder's channel index). When
+/// [prior] (the immediate prior same-size channel's tile, same [tw]/[th]) is
+/// given and [channelIndex] >= 1, properties 16-19 are the decoder's
+/// cross-channel values for that prior channel at (y, x): 16 = |value|,
+/// 17 = value, 18 = |gradient residual|, 19 = gradient residual. Grayscale /
+/// palette / the first RCT channel pass no prior, so those props stay 0 —
+/// exactly what the decoder returns there (`k - 16 >= 4 * channelIndex`).
 void computeProps(Int32List tile, int tw, int th, int y, int x,
-    List<int> properties, int maxError, Int32List out) {
+    List<int> properties, int maxError, Int32List out,
+    {int channelIndex = 0, Int32List? prior}) {
   final o = y * tw + x;
   final n = y > 0
       ? tile[o - tw]
@@ -71,8 +96,31 @@ void computeProps(Int32List tile, int tw, int th, int y, int x,
         : (y > 0 ? tile[o - tw - 1] : 0);
     err8 = (w - (westW + northW - nwW).toSigned(32)).toSigned(32);
   }
+  // Cross-channel (16-19): the immediate prior channel's value and its own
+  // clamped-gradient residual at (y, x). Mirrors the decoder's `_property`
+  // cases 16-19 (including `_clamp3` and signed-32 truncation, and the
+  // rW=0-at-left-edge / rN=rW-at-top-edge / rNW=rW edge handling) for the
+  // nearest prior same-size channel. Only the first prior is exposed here
+  // (props 16-19); the decoder's further-back channels (20+) aren't used.
+  var cx16 = 0, cx17 = 0, cx18 = 0, cx19 = 0;
+  if (channelIndex >= 1 && prior != null) {
+    final rC = prior[o];
+    final rW = x > 0 ? prior[o - 1] : 0;
+    final rN = y > 0 ? prior[o - tw] : rW;
+    final rNW = x > 0 && y > 0 ? prior[o - tw - 1] : rW;
+    final lo = rW < rN ? rW : rN;
+    final hi = rW < rN ? rN : rW;
+    final g = (rW + rN - rNW).toSigned(32);
+    final pred = g < lo ? lo : (g > hi ? hi : g);
+    final rG = (rC - pred).toSigned(32);
+    cx16 = rC.abs();
+    cx17 = rC;
+    cx18 = rG.abs();
+    cx19 = rG;
+  }
   for (var i = 0; i < properties.length; i++) {
     out[i] = switch (properties[i]) {
+      0 => channelIndex,
       4 => n.abs(),
       5 => w.abs(),
       6 => n,
@@ -85,6 +133,10 @@ void computeProps(Int32List tile, int tw, int th, int y, int x,
       13 => n - nn,
       14 => w - ww,
       15 => maxError,
+      16 => cx16,
+      17 => cx17,
+      18 => cx18,
+      19 => cx19,
       _ => 0,
     };
   }
