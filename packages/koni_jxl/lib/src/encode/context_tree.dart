@@ -14,13 +14,17 @@ import 'entropy_writer.dart';
 /// the leaves use predictor 6, so the property set is predictor-dependent.
 
 /// Property set for the clamped-gradient predictor (mirrors `_property`):
-/// 4 = |N|, 5 = |W|, 6 = N, 7 = W, 10 = W-NW, 11 = NW-N, 12 = N-NE,
-/// 13 = N-NN, 14 = W-WW.
-const gradProperties = [4, 5, 6, 7, 10, 11, 12, 13, 14];
+/// 4 = |N|, 5 = |W|, 6 = N, 7 = W, 8 = W's own gradient-prediction error,
+/// 9 = the gradient prediction W+N-NW, 10 = W-NW, 11 = NW-N, 12 = N-NE,
+/// 13 = N-NN, 14 = W-WW. Properties 8 and 9 (error-feedback and
+/// predicted-value) are what libjxl's modular encoder leans on; the decoder
+/// already computes them (`_property` cases 8/9) — they were simply never in
+/// this encoder's learned-tree property set.
+const gradProperties = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
 /// Property set for the weighted predictor: the gradient set plus 15
 /// (max-error), which is where WP's advantage lives.
-const wpProperties = [4, 5, 6, 7, 10, 11, 12, 13, 14, 15];
+const wpProperties = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Candidate split thresholds (the decoder walk is `property > value`).
 const _thresholds = [
@@ -49,12 +53,32 @@ void computeProps(Int32List tile, int tw, int th, int y, int x,
   final ne = x + 1 < tw && y > 0 ? tile[o - tw + 1] : n;
   final nn = y > 1 ? tile[o - 2 * tw] : n;
   final ww = x > 1 ? tile[o - 2] : w;
+  // Property 9: the clamped-gradient prediction value W+N-NW.
+  // Property 8: W minus its *own* gradient prediction — the prediction error
+  // at the west neighbour. Both mirror the decoder's `_property` cases 9/8
+  // (including their signed-32 truncation) exactly, so a tree that splits on
+  // them decodes identically. Case 8 reads the W pixel's neighbours (its W,
+  // N, NW), with the decoder's edge handling at x==1/y==0.
+  final grad9 = (w + n - nw).toSigned(32);
+  final int err8;
+  if (x <= 0) {
+    err8 = w; // decoder returns _west(o) here
+  } else {
+    final westW = x > 1 ? tile[o - 2] : (y > 0 ? tile[o - tw - 1] : 0);
+    final northW = y > 0 ? tile[o - tw - 1] : (x > 1 ? tile[o - 2] : 0);
+    final nwW = x > 1
+        ? (y > 0 ? tile[o - tw - 2] : tile[o - 2])
+        : (y > 0 ? tile[o - tw - 1] : 0);
+    err8 = (w - (westW + northW - nwW).toSigned(32)).toSigned(32);
+  }
   for (var i = 0; i < properties.length; i++) {
     out[i] = switch (properties[i]) {
       4 => n.abs(),
       5 => w.abs(),
       6 => n,
       7 => w,
+      8 => err8,
+      9 => grad9,
       10 => w - nw,
       11 => nw - n,
       12 => n - ne,

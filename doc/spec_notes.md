@@ -4064,24 +4064,33 @@ of scope). Reduced-resolution (1:8) decode of those same pages via the
 DC-only fast path runs in ~15-24 ms (≈7x faster than a full decode) — the
 concrete win for a reader's thumbnail grid / page prefetch.
 
-**Lossless encoder, real-content reality check (2026-07-08).** Measured on
-14 real scanned manga pages (clean 1200x1707 grayscale with heavy screentone,
-no JPEG blocking — a private set, so no committed fixture): this encoder
-produces output **~2.07x larger than the source PNGs and ~2.46x larger than
-`cjxl -e7`**, landing essentially at the raw-pixel entropy floor (koni 1.385 MB
-vs. `gzip -9` of the raw pixels 1.394 MB, for one 2 MP page). Diagnosis: on
-*irregular* dense screentone the gradient/WP predictors are counterproductive
-(a horizontal delta *enlarges* the data — `gzip` of the delta is 2.05 MB vs.
-1.39 MB raw) and the MA-tree context model is too weak to capture the dot
-structure, so the encoder codes near raw entropy while `cjxl` (602 KB at `-e1`,
-566 KB at `-e7`) and even PNG's DEFLATE (663 KB) model it. This **contradicts
-the synthetic `gray_screentone` result** (where this encoder beats `cjxl -e9`):
-that pattern is regular/periodic and LZ77-friendly; real screentone is neither.
-The lesson mirrors the lossy transform-selection ROI finding — synthetic
-corpus content overstates real-world competitiveness — and it is now the
-lossless encoder's documented headline limitation. **The library's real-world
-value is its decoder, not this encoder's compression ratio;** closing the gap
-would require a genuinely learned per-context RD model (large, deferred).
+**Lossless encoder, real-content check — and a cautionary measurement tale
+(2026-07-08).** Measured on 14 real scanned manga pages (1200x1707 grayscale
+with heavy screentone — a private set, so no committed fixture), all encoders
+run *losslessly on the same decoded pixels*: this encoder totals 11.89 MB vs.
+`cjxl -e7`'s 11.34 MB (**104.9%** — ~4.9% larger) vs. an optimized grayscale
+PNG's 12.47 MB (**95.4%** — ~4.6% *smaller*). Per page it ranges 104-108% of
+`cjxl` and 90-108% of PNG. **The encoder is competitive on real content** — a
+few-percent gap to `cjxl` (its learned per-context RD search is more thorough
+than these fixed heuristics), and a small win over basic PNG.
+
+The cautionary part: an earlier draft of this section (and the BENCHMARKS
+warning) claimed this encoder was "~2x larger than PNG" on the same set. That
+was **wrong**, from two stacked measurement errors: (1) the source files, named
+`*.png`, are actually **lossy baseline JPEGs** (JFIF, 3-component) — comparing a
+*lossless* re-encode against a *lossy* source is meaningless (no lossless coder
+beats a lossy JPEG on size; that is physics, not a koni weakness), and (2) the
+first pass also compared koni's 1-channel grayscale encode against the source's
+3-channel container. Only after checking `file(1)` on the inputs and rerunning
+lossless-vs-lossless on identical decoded pixels did the real, competitive
+picture emerge. **Lesson: `file`-check real inputs before trusting a
+compression comparison, and never compare lossless output to a lossy source.**
+The synthetic `gray_screentone` "beats `cjxl -e9`" figure is separately real
+but content-specific (regular/periodic → LZ77-friendly); it is a ceiling, not
+a typical result. Property-set note: the learned-tree property set was extended
+with the error-feedback (8) and predicted-value (9) properties the decoder
+already supports; a small (~0.3%) never-worse win here, and the honest lever
+after finding that tree depth/thresholds barely move this content (<1.5%).
 
 Animation is decoded beyond what jxlatte implements (jxlatte stops at
 the first visible frame). One spec detail matters there: for a frame
