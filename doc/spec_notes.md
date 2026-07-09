@@ -3852,6 +3852,25 @@ conformance thresholds.) Weight matrices and coefficient orders are generated la
 transform type actually used. On a 3.4MP page the EPF pass runs in
 ~57 ms and gaborish in ~34 ms.
 
+All three EPF passes are SIMD, including pass 0 (the 12-neighbor
+double-cross that only runs when `epfIterations == 3`; the 4-neighbor
+cross of passes 1/2 was already vectorized). Pass 0 is by far the most
+work — 12 taps each with a 5-tap cross distance (65 abs-diffs/pixel vs.
+the cross passes' ~20), and per neighbor it reaches +-3 pixels
+horizontally (the +-2 taps' own cross), so `_epfPass0GrayVec`/
+`_epfPass0ColorVec` build a shift-by-3 vector the +-2 passes never
+needed. Vectorizing it cut its cost roughly 4x for grayscale and ~7-8x
+for colour (colour amortizes the shuffle/spill overhead across three
+channels' arithmetic better): on the conformance vectors, pass 0 went
+810->207 ms (`grayscale_public_university`, 2880x1620), 1076->131 ms
+(`bike`, 3-channel 2048x2560), and 3001->400 ms (`progressive`, the
+4064x2704 ~11MP triple-pass photo the ROADMAP flagged) — the last taking
+that file's whole decode from ~4.8 s to ~2.0 s single-threaded AOT.
+Like every other float SIMD kernel here it accumulates in float32 lanes
+rather than the scalar reference's float64; the difference is <=1 in 8-bit
+output on those vectors, well inside the lossy conformance thresholds
+(verified against djxl for `bike` and ref.png for the other two).
+
 Note for Flutter Web: dart2js emulates Float32x4 in software, so lossy
 decoding is substantially slower there; AOT targets (Android/iOS/desktop)
 get native SIMD. See "Web compile targets" below for a correctness caveat

@@ -29,9 +29,15 @@ linked below.
    round-trip that forces parameterIndex-16). This **unblocks** ever
    defaulting the rectangular/bespoke/large-transform flags on. See
    doc/spec_notes.md and the L3 transform section's follow-up.
-2. **EPF pass-0 SIMD** (decode perf, self-contained). The `epfIterations == 3`
-   path is scalar; an 11 MP triple-pass photo takes ~6.5 s. Vectorize with
-   `Float32x4` per the CLAUDE.md perf rules. See "Performance & infrastructure".
+2. ✅ **EPF pass-0 SIMD** — DONE. Vectorized both the gray and colour
+   `epfIterations == 3` double-cross kernels (`_epfPass0GrayVec`/
+   `_epfPass0ColorVec`) with `Float32x4`, four pixels at a time, mirroring the
+   already-SIMD passes 1/2. Pass 0 dropped ~4x (grayscale) to ~7-8x (colour);
+   the flagged 11 MP triple-pass photo (`progressive`) went from ~4.8 s to
+   ~2.0 s full decode (pass 0 itself 3.0 s → 0.4 s). Verified against djxl
+   (`bike`) and ref.png (`grayscale_public_university`, `progressive`);
+   float32-lane accumulation stays <=1/255 off the scalar path, inside the
+   lossy gate. See doc/spec_notes.md's Performance status section.
 3. **Modular/lossless downscale via Squeeze** (feature, larger). Completes the
    thumbnail-grid story for clean lossless scans — the biggest remaining
    downscale gap (see the "Downscaled decode" item: modular has no DC concept;
@@ -1170,8 +1176,14 @@ feature un-applied rather than throwing — the only decode-path
 
 ## Performance & infrastructure
 
-- 🔲 **EPF pass-0 SIMD.** The `epfIterations == 3` path (rare) is scalar;
-  an 11 MP triple-pass progressive photo takes ~6.5 s. Vectorize it.
+- ✅ **EPF pass-0 SIMD — done (2026-07-08).** Both the gray and colour
+  `epfIterations == 3` double-cross kernels are now `Float32x4`
+  (`_epfPass0GrayVec`/`_epfPass0ColorVec`), four pixels at a time, mirroring
+  the already-vectorized passes 1/2. Pass 0 dropped ~4x (grayscale) to ~7-8x
+  (colour); the flagged 11 MP triple-pass photo went ~4.8 s → ~2.0 s full
+  decode (pass 0 itself 3.0 s → 0.4 s). Conformance-verified (djxl + ref.png);
+  float32-lane accumulation stays <=1/255 off the scalar path. See
+  doc/spec_notes.md Performance status.
 - 🔲 **Isolate parallelism.** Evaluated and deferred (shared-nothing →
   re-parse or bulk copies; poor ROI at current single-thread speeds).
   Revisit if very large images or batch decoding become a use case.

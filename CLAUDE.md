@@ -157,6 +157,7 @@ function. Float (HDR) sample *decode* is now supported (encoding one remains
 unimplemented, no encoder path ever attempted it).
 Encoder sizing decisions must use exact Huffman code lengths, never
 Shannon entropy (the 1-bit-per-symbol prefix floor dominates skewed
-histograms). Known slow path: EPF pass 0 (epfIterations == 3, rare) is
-scalar; an
-11MP triple-pass progressive photo takes ~6.5 s.
+histograms). All three EPF passes are now Float32x4-SIMD, including pass 0
+(epfIterations == 3): an 11MP triple-pass progressive photo dropped from
+~4.8 s to ~2.0 s (pass 0 itself 3.0 s → 0.4 s). See doc/spec_notes.md's
+Performance status section.
