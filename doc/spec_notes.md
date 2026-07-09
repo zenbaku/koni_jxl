@@ -347,7 +347,7 @@ one section per 256x256 group with the histograms shared via the
 LfGlobal tree stream. Per image the encoder chooses between LZ77
 (hash-chain matcher over the token-value stream, linear distances
 D + 119, length symbols at 224 in the pixel contexts), palette
-(<= 256 colors, luminance-sorted) and YCoCg RCT, using exact
+(luminance-sorted; see the try-both note below) and YCoCg RCT, using exact
 Huffman-code-length size estimates — Shannon entropy is NOT a safe
 proxy: prefix codes pay a 1-bit-per-symbol floor that dominates
 highly skewed histograms (a 16-color image estimated 1K by entropy
@@ -373,6 +373,36 @@ color/tonal content (one piece color page -4%, B/W page flips to WP). Rather
 than run both pipelines fully and keep the smaller, it now decides between
 them from the learned trees' training entropy — see "Predictor selection"
 below. All output is bit-exact through this decoder and djxl.
+
+### Lossless encoder — palette above 256 colors, chosen by try-both (2026-07-09)
+
+Benchmarking the public `test-images/png` set (see doc/BENCHMARKS.md) found
+one real weakness: flat web/UI graphics. `web-booking` (a 400×400 UI
+screenshot, 738 colours, 93% flat runs) coded at 30 KB vs. `cjxl`'s 14 KB and
+PNG's 11 KB. Root cause: `_detectPalette` was capped at **256 colours**, so
+this image got no palette and fell back to RCT + gradient on raw RGB — poor for
+flat content. cjxl palettes it (738 colours → one flat index channel that LZ77
+crushes). The `nb_colors` bitstream field goes to 5376+ and this decoder
+already handles large palettes (it decodes cjxl's), so the cap was pure encoder
+policy. But raising it to a hard threshold *regresses* photographic content
+(forcing a palette on a 36k-colour photo doubled its size in testing) — palette
+wins only when content is both low-colour *and* flat. So the fix is a
+**try-both-keep-smaller** decision (the pattern used for predictors/LZ77/ANS):
+`_encodeModular` now runs the RCT path always and, when the colour count is
+below `_kPaletteMaxColors` (4096), the palette path too, keeping the smaller —
+never-worse by construction. `web-booking` dropped 30 KB → 15.6 KB (1.11×
+`cjxl`), the web/UI category went 116%→110% of `cjxl` with **zero** regression
+elsewhere, and the >256-colour palette output is bit-exact through djxl
+(regression test in `encoder_roundtrip_test.dart`, 512- and 1000-colour cases).
+Cost: palette-eligible (≤4096-colour) images encode ~2× (both paths); photos
+(>4096 colours) are unaffected — `_detectPalette` early-exits and only RCT runs.
+The residual gap to `cjxl` on the palette-index channel is its stronger
+LZ/context modelling, the next lever if pursued.
+
+Also this session, the learned-tree property set gained the error-feedback
+(property 8) and predicted-value (property 9) properties the decoder already
+supports — a small (~0.3%) never-worse win, added after measuring that tree
+depth and threshold granularity barely move real screentone (<1.5%).
 
 ### Lossless encoder — predictor selection from learned-tree training entropy
 

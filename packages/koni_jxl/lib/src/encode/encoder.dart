@@ -427,7 +427,34 @@ List<int> _mixValues(List<int> contexts, List<int> primary, List<int> alt,
   return out;
 }
 
+/// Colour-count cap for even *attempting* the palette transform. Palette wins
+/// on flat/few-colour graphics (UI screenshots, line art) but loses on
+/// photographic content, and a hard threshold picks wrong on both sides — so
+/// [_encodeModular] tries palette *and* non-palette below this cap and keeps
+/// the smaller (never-worse). The cap only bounds the 2x cost to genuinely
+/// low-colour images; it is not a correctness knob (RCT is always tried).
+const _kPaletteMaxColors = 4096;
+
+List<Int32List> _copyPlanes(List<Int32List> planes) =>
+    [for (final p in planes) Int32List.fromList(p)];
+
+/// Color modular encode: try the RCT (non-palette) path always, and the palette
+/// path when the colour count is small enough, keeping whichever is smaller.
+/// Grayscale skips both (no palette/RCT). See [_kPaletteMaxColors].
 Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
+  if (setup.grayscale) {
+    return _encodeModularCore(setup, planes, null, false);
+  }
+  final palette = _detectPalette(planes, _kPaletteMaxColors);
+  final rctBytes = _encodeModularCore(setup, _copyPlanes(planes), null, true);
+  if (palette == null) return rctBytes;
+  final palBytes =
+      _encodeModularCore(setup, _copyPlanes(planes), palette, false);
+  return palBytes.length < rctBytes.length ? palBytes : rctBytes;
+}
+
+Uint8List _encodeModularCore(JxlEncodeSetup setup, List<Int32List> planes,
+    List<int>? palette, bool applyRct) {
   const groupDim = 256;
   final width = setup.width;
   final height = setup.height;
@@ -439,29 +466,25 @@ Uint8List _encodeModular(JxlEncodeSetup setup, List<Int32List> planes) {
   final singleSection = numGroups == 1;
   final globalChannels = width <= groupDim && height <= groupDim;
 
-  // Transform choice: palette when the color count is small, RCT
-  // otherwise (color images only).
-  List<int>? palette;
-  var useRct = false;
-  if (!setup.grayscale) {
-    palette = _detectPalette(planes, 256);
-    if (palette != null) {
-      final lookup = <int, int>{};
-      for (var i = 0; i < palette.length; i++) {
-        lookup[palette[i]] = i;
-      }
-      final p0 = planes[0];
-      final p1 = planes[1];
-      final p2 = planes[2];
-      final index = Int32List(p0.length);
-      for (var i = 0; i < p0.length; i++) {
-        index[i] = lookup[(p0[i] << 40) | (p1[i] << 20) | p2[i]]!;
-      }
-      planes = [index, ...planes.sublist(3)];
-    } else {
-      useRct = true;
-      _forwardRct(planes);
+  // Transform application (the palette-vs-RCT *decision* is [_encodeModular]'s;
+  // here it is a given). Palette: replace the 3 colour planes with one index
+  // channel. RCT: in-place colour decorrelation.
+  final useRct = applyRct;
+  if (palette != null) {
+    final lookup = <int, int>{};
+    for (var i = 0; i < palette.length; i++) {
+      lookup[palette[i]] = i;
     }
+    final p0 = planes[0];
+    final p1 = planes[1];
+    final p2 = planes[2];
+    final index = Int32List(p0.length);
+    for (var i = 0; i < p0.length; i++) {
+      index[i] = lookup[(p0[i] << 40) | (p1[i] << 20) | p2[i]]!;
+    }
+    planes = [index, ...planes.sublist(3)];
+  } else if (applyRct) {
+    _forwardRct(planes);
   }
 
   // The palette meta channel (its colors) is predictor-independent.

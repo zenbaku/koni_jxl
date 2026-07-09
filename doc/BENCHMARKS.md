@@ -214,9 +214,9 @@ round-trip bit-exact on all 18):
 ```
 category                 koni      PNG    cjxl-e7   koni/PNG  koni/cjxl
 photos + illustration  463069   584147   447681       79%      103%
-web/UI screenshots     274535   259207   237030      106%      116%
+web/UI screenshots     259886   259207   237030      100%      110%
 solid-color swatches    65248    17321    74743      377%       87%
-TOTAL                  802852   860675   759454       93%      106%
+TOTAL                  788203   860675   759454       92%      104%
 ```
 
 Takeaways:
@@ -229,11 +229,15 @@ Takeaways:
   A 400×400 solid colour is ~1.9 KB as a palette PNG but ~7–8 KB in *any* JXL —
   fixed container/modular-header overhead on trivial content, shared by `cjxl`,
   not a koni-specific weakness.
-- **Flat web/UI graphics are the one real koni weakness.** `web-booking` (a flat
-  UI screenshot): koni 30 KB vs `cjxl` 14 KB vs PNG 11 KB — **2.15× `cjxl`**.
-  `web-surma` 1.55× PNG. Content with large flat regions and a small palette is
-  where `cjxl`'s palette detection and LZ handling clearly beat this encoder's;
-  this is the concrete lever for future encoder work (see doc/spec_notes.md).
+- **Flat web/UI graphics — was the one real weakness, now largely closed.** The
+  worst case, `web-booking` (a flat UI screenshot, 738 colours), went from koni
+  30 KB (2.66× PNG, 2.15× `cjxl`) to **15.6 KB** (1.37× PNG, 1.11× `cjxl`) once
+  the palette transform was allowed above 256 colours and chosen by a
+  try-both-keep-smaller decision (see doc/spec_notes.md). The web/UI category as
+  a whole went 106%→**100%** of PNG and 116%→**110%** of `cjxl`, with **zero
+  regression** elsewhere (palette is only kept where it actually wins). The
+  residual gap to `cjxl` on this category is its stronger LZ/context handling of
+  the palette-index channel — the next lever if pursued.
 
 ## Lossy compression vs. `cjxl`
 

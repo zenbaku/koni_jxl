@@ -143,11 +143,21 @@ void main() {
     _check(1000, 600, seed: 42);
   });
 
-  test('palette (few distinct colors)', () {
+  test('palette (few distinct colors, incl. >256)', () {
+    // >256-color cases exercise the palette path that `_encodeModular`'s
+    // try-both-keep-smaller decision opened up (the old hard cap was 256, so
+    // flat UI graphics with a few hundred to a few thousand colours — the
+    // web-booking case — got no palette and coded ~2x larger). The format's
+    // nb_colors field goes to 5376+, and djxl round-trips these, confirming
+    // the >256 palette bitstream is spec-legal, not just self-consistent.
+    // Sizes are chosen so (w/13)*(h/11) >= colors, i.e. all `colors` distinct
+    // values actually appear.
     for (final (w, h, colors) in [
       (100, 80, 4),
       (400, 300, 17),
-      (300, 400, 256)
+      (300, 400, 256),
+      (400, 300, 512),
+      (500, 400, 1000),
     ]) {
       final pixels = _flatColors(w, h, colors);
       final encoded = JxlEncoder.encodeLossless(pixels, width: w, height: h);
