@@ -3745,6 +3745,74 @@ to gate manga out, which isn't worth the API surface for a manga-focused codec.
 `quantLF` decoupling (no redundant "coarsen" knob). All 405 tests green; `dart
 analyze` clean.
 
+### Inherited jxlatte bug: wrong default quant weights for DCT 256x128/128x256
+
+**The deviation, and the fix.** libjxl's default DCT quant weights for the
+largest rectangular transform pair (DCT 256x128 and DCT 128x256, which share
+`parameterIndex` 16) use *rectangular* per-channel DC base weights:
+`2.6 · {23629.07, 8611.32, 4492.25}` for channels {X, Y, B}. jxlatte
+transcribed channels 1 and 2 from the neighbouring *square* series instead
+(`2.6 · {…, 9311.32, 4992.25}`), an off-by-exactly-1820/-1300 error in the DC
+band — the fractional tails (`…44206460261196`, `…84647584004484`) matched
+libjxl exactly, only the integer part was the square value. We inherited it
+verbatim in `defaultDctParams[16]` (`vardct/hf_global.dart`). Fixed to the
+rectangular values (jxlatte `HFGlobal.java` lines 184-185 still carry the bug;
+this is the third confirmed jxlatte bug, after the patch blend-mode remap and
+the splines-with-spline-0-coefficients bugs).
+
+**Why it stayed latent, and how it surfaced.** The bug only bites when this
+transform is chosen *with default (non-custom) quant weights*, i.e. at
+`distance == 1.0` (`acScale == 1.0`). At any other distance the encoder writes
+a custom weight table built from the same params, and djxl reads our values
+back verbatim — so encoder, our decoder, and djxl all agree regardless of
+whether the params match libjxl. On the decoder side it was equally latent: no
+corpus/conformance file uses DCT 256x128/128x256 with default weights, so the
+wrong table was never exercised. It surfaced only when the lossy encoder gained
+the ability to *emit* this transform (Tranche B, round 10) and someone ran it
+at distance 1.0 with `maxTransformSize: 256` + `enableRectangularTransforms`.
+
+**Diagnosis trail** (a clean worked example of the "our decoder self-consistent,
+djxl diverges" methodology). Symptom: `screentone_256` + `maxTransformSize: 256`
++ rect at distance 1.0 decoded through **djxl at RMSE 3.34 (max 24)** but through
+**our own decoder at RMSE 1.12** — a large disagreement, unlike every other
+config where they tracked within ~0.06.
+1. **Narrowed the trigger** by sweeping combinations: `+max256+rect` alone
+   reproduces it (bespoke irrelevant); `+max128+rect+bespoke` does not. The
+   `jxl.encdebug` transform tally isolated the single differentiator — a
+   **DCT 128x256** block, present only in the diverging configs.
+2. **Three-way compare** (CLAUDE.md methodology): our decoder 1.12, **jxlatte
+   1.126** (agrees with us), djxl 3.34 → an *inherited* bug, so the fix goes
+   toward djxl, not toward jxlatte.
+3. **Ruled out the usual suspects against jxl-oxide** (a clean-room,
+   conformance-passing Rust decoder, used as a readable stand-in for libjxl):
+   the natural coefficient order for orderID 12 is **byte-identical** to
+   jxl-oxide's `fill_natural_order` (32768 entries); the weight *interpolation*
+   matches libjxl's `Interpolate(distance·(n-1)/√2, …)`; and our
+   `_llfScaleTable` is exactly `1 / jxl-oxide's SCALE_F`, used with `×` instead
+   of `÷` and indexed identically. All correct.
+4. **The clincher:** re-running the trigger across distances showed the
+   divergence **only at distance 1.0** and gone at 0.5/2.0/4.0 — the signature
+   of a default-weights-only problem, since only distance 1.0 leaves the
+   default table in play. Comparing `defaultDctParams[16]` against libjxl's
+   `DequantLibrary()` then found the exact wrong bases. (An FFT of the
+   djxl-vs-ours difference had already localised the error to the top-half
+   128x256 block region with energy near multiples of the LLF grid dims,
+   consistent with a whole-channel dequant-weight scale error.)
+
+**Regression coverage** (`test/encode/vardct_l0_test.dart`). Two tests, both
+verified to fail on the old values: (a) a djxl-free structural invariant — the
+rectangular DC base scales linearly with the longest side, so the DC band
+doubles per size step (`index 12 → 14 → 16`) on every channel, which the bug
+broke (index-14→16 ratio was 2.163 not 2.0 on channels 1/2); (b) a distance-1.0
+djxl round-trip on a near-flat horizontal gradient + low-amplitude ripple that
+forces the whole image onto two parameterIndex-16 blocks *with* AC energy, and
+asserts our decoder agrees with djxl (the divergence is the real signal — a
+plain djxl `< 2.0` gate alone is too weak here, since this synthetic content
+only pushed djxl to ~1.4 pre-fix even while our decoder sat at 0.17). The
+existing "genuinely wins" tests for this pair missed it because they use
+`distance=32` (custom weights, so djxl can't diverge) on a pure gradient (no AC
+energy).
+
 ## Robustness
 
 The public decode surfaces (`JxlInfo.parse`, `JxlDecoder.decode`,

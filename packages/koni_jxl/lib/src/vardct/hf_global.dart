@@ -262,10 +262,19 @@ final List<DctParams> defaultDctParams = [
     _prepend(33520.76593560361656, _seqB),
     _prepend(17972.09512039390824, _seqC),
   ], null, TransformMode.dct),
+  // DCT 256x128 / 128x256 (parameterIndex 16). libjxl's DCT128X256 default
+  // uses the *rectangular* per-channel base weights (2.6 * 23629.07 /
+  // 8611.32 / 4492.25), not the square ones. jxlatte transcribed channels 1
+  // and 2 from the square series (2.6 * 9311.32 / 4992.25) by mistake — an
+  // off-by-exactly-1820/-1300 error in the DC band that we inherited
+  // verbatim. It only surfaces when this transform is chosen with default
+  // (non-custom) quant weights, i.e. distance 1.0: our decoder used the same
+  // wrong table so round-trips were self-consistent, but djxl (correct)
+  // diverged. See doc/spec_notes.md and ROADMAP.md.
   DctParams([
     _prepend(61435.5921973295970, _seqA),
-    _prepend(24209.44206460261196, _seqB),
-    _prepend(12979.84647584004484, _seqC),
+    _prepend(22389.44206460261196, _seqB),
+    _prepend(11679.84647584004484, _seqC),
   ], null, TransformMode.dct),
 ];
 

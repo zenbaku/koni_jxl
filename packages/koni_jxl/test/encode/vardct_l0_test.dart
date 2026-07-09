@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:koni_jxl/koni_jxl.dart';
 import 'package:koni_jxl/src/encode/vardct/vardct_l0_encoder.dart';
+import 'package:koni_jxl/src/vardct/hf_global.dart' show defaultDctParams;
 import 'package:test/test.dart';
 
 import '../util/compare.dart';
@@ -1348,6 +1349,120 @@ void main() {
       }
       final rmse = math.sqrt(sumSq / n);
       expect(rmse, lessThan(2.0), reason: 'rmse $rmse');
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
+
+  // Regression for the inherited jxlatte transcription bug in the default
+  // DCT quant weights for DCT 256x128/128x256 (parameterIndex 16): channels
+  // 1 and 2 used the *square* base weights (2.6 * 9311.32 / 4992.25) instead
+  // of the *rectangular* ones (2.6 * 8611.32 / 4492.25) that libjxl uses --
+  // an off-by-1820/-1300 error in the DC band. It only surfaced when this
+  // transform was chosen with default (non-custom) quant weights, i.e.
+  // distance 1.0 (any other distance writes a custom table and djxl reads
+  // our values back verbatim). Our decoder shared the same wrong table, so
+  // round-trips were self-consistent (RMSE ~1.1) while djxl diverged
+  // (RMSE ~3.3) -- a real quality-bar violation invisible to a
+  // decode-vs-our-decoder check. See doc/spec_notes.md and ROADMAP.md.
+  //
+  // This unit half needs no djxl: libjxl's per-channel DC base weight scales
+  // linearly with the transform's longest side, so each rectangular size
+  // doubling doubles the DC band. DCT 256x128 (index 16) must therefore be
+  // exactly 2x DCT 128x64 (index 14), which must be 2x DCT 64x32 (index 12),
+  // for every channel. The bug broke the index-14 -> 16 ratio on channels 1
+  // and 2 (2.163x instead of 2.0x); this pins it structurally.
+  test('default DCT quant weights follow the rectangular DC doubling series',
+      () {
+    for (var c = 0; c < 3; c++) {
+      final dc12 = defaultDctParams[12].dctParam![c][0]; // DCT 64x32/32x64
+      final dc14 = defaultDctParams[14].dctParam![c][0]; // DCT 128x64/64x128
+      final dc16 = defaultDctParams[16].dctParam![c][0]; // DCT 256x128/128x256
+      expect(dc14, closeTo(2 * dc12, 1e-6),
+          reason: 'channel $c: DCT128x64 DC ($dc14) should be 2x DCT64x32 '
+              '($dc12)');
+      expect(dc16, closeTo(2 * dc14, 1e-6),
+          reason: 'channel $c: DCT256x128 DC ($dc16) should be 2x DCT128x64 '
+              '($dc14) -- the bug made channels 1/2 use the square base');
+    }
+  });
+
+  // End-to-end half of the same regression: a near-flat horizontal gradient
+  // with a low-amplitude ripple forces the whole 256x256 image onto two
+  // parameterIndex-16 blocks (DCT 256x128 or 128x256) at the *default*
+  // distance 1.0 (where the wrong default weights are actually used), while
+  // the ripple gives the mis-scaled channel-1/2 weights AC content to
+  // distort. Pre-fix, our decoder and djxl diverged by RMSE ~1.4 on this
+  // content (our 0.17 vs djxl 1.41); post-fix they agree within ~0.35. The
+  // existing 256x128/128x256 "genuinely wins" tests above use distance=32
+  // (a custom weight table, so djxl reads our values verbatim and can't
+  // diverge) and a pure gradient (no AC energy), which is exactly why they
+  // missed this.
+  test(
+      'DCT 256x128/128x256 round-trips through djxl with default weights '
+      '(distance 1.0)', () {
+    const size = 256;
+    final pixels = Uint8List(size * size * 3);
+    var i = 0;
+    for (var y = 0; y < size; y++) {
+      for (var x = 0; x < size; x++) {
+        final g = x * 255 / size;
+        final ripple = 25 * math.sin(x * math.pi / 3);
+        final v = (g + ripple).round().clamp(0, 255);
+        pixels[i++] = v;
+        pixels[i++] = v;
+        pixels[i++] = v;
+      }
+    }
+    final base = VardctL0Config.fromDistance(1.0);
+    final enc = encodeLossyVardctL0(pixels,
+        width: size,
+        height: size,
+        config: VardctL0Config(
+            quantLF: base.quantLF,
+            acScale: base.acScale,
+            maxTransformSize: 256,
+            enableRectangularTransforms: true));
+
+    final image = JxlDecoder.decode(enc);
+    expect(image.width, size);
+    expect(image.height, size);
+
+    if (!_haveDjxl) return;
+    final dir = Directory.systemTemp.createTempSync('koni_rect256_default');
+    try {
+      final jxlPath = '${dir.path}/t.jxl';
+      final outPath = '${dir.path}/t.ppm';
+      File(jxlPath).writeAsBytesSync(enc);
+      final r =
+          Process.runSync('djxl', [jxlPath, outPath, '--num_threads', '1']);
+      expect(r.exitCode, 0, reason: 'djxl failed: ${r.stderr}');
+      final ref = PnmImage.parse(File(outPath).readAsBytesSync());
+
+      // Our decoder must agree with djxl (the inherited-bug signature is our
+      // decoder being self-consistently "right" while djxl diverges), and
+      // djxl's own reconstruction must clear this project's < 2.0 bar.
+      var oursVsDjxlSq = 0.0;
+      var djxlVsOrigSq = 0.0;
+      var n = 0;
+      for (var c = 0; c < 3; c++) {
+        final ours = channelAsInts(image.channels[c], 255);
+        final theirs = ref.intPlanes![c];
+        for (var j = 0; j < size * size; j++) {
+          final d1 = ours[j] - theirs[j];
+          oursVsDjxlSq += d1 * d1;
+          final d2 = theirs[j] - pixels[j * 3 + c];
+          djxlVsOrigSq += d2 * d2;
+          n++;
+        }
+      }
+      final oursVsDjxl = math.sqrt(oursVsDjxlSq / n);
+      final djxlVsOrig = math.sqrt(djxlVsOrigSq / n);
+      expect(oursVsDjxl, lessThan(0.8),
+          reason: 'our decoder and djxl should agree ($oursVsDjxl); a large '
+              'gap means the default parameterIndex-16 weights diverge from '
+              'libjxl again');
+      expect(djxlVsOrig, lessThan(2.0), reason: 'djxl rmse $djxlVsOrig');
     } finally {
       dir.deleteSync(recursive: true);
     }

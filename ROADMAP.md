@@ -12,15 +12,23 @@ context until it ships in a release).
 The near-term priority order, highest first. Details live in the sections
 linked below.
 
-1. **Root-cause the latent VarDCT RMSE gap** (correctness/quality, bounded).
-   `screentone_256` + `maxTransformSize: 256` + `enableRectangularTransforms`
-   + `enableBespokeTransforms` at distance 1.0 decodes at RMSE 3.24, above this
-   project's own `< 2.0` bar. Confirmed pre-existing, not caught by the current
-   suite. It's the only open item that's a quality-bar *violation* rather than a
-   nice-to-have, it's reproducible, and it **blocks** ever defaulting the
-   rectangular/bespoke/large-transform flags on — so it gates the payoff of the
-   whole 27-transform-type effort. See "Follow-up, found not fixed" under the
-   L3 transform section.
+1. ✅ **Root-cause the latent VarDCT RMSE gap** — DONE. Was an inherited
+   jxlatte transcription bug in the default DCT quant weights for DCT
+   256x128/128x256 (`defaultDctParams[16]`): channels 1 and 2 used the
+   *square* base weights (2.6·9311.32 / 4992.25) instead of the
+   *rectangular* ones libjxl uses (2.6·8611.32 / 4492.25) — an
+   off-by-1820/-1300 error in the DC band. Our decoder shared the same wrong
+   table so round-trips were self-consistent (RMSE ~1.1) while djxl diverged
+   (RMSE ~3.3); confirmed inherited (jxlatte agrees with us to 1.126) via the
+   standard three-way compare, and that the natural order / weight
+   interpolation / LLF scale were all *correct* (verified against jxl-oxide).
+   Only surfaced at distance 1.0 (default weights): any other distance writes
+   a custom table djxl reads back verbatim. Fixed the one constant; latent
+   decoder bug fixed too. Two regression tests added (a djxl-free structural
+   invariant on the rectangular DC doubling series, plus a distance-1.0 djxl
+   round-trip that forces parameterIndex-16). This **unblocks** ever
+   defaulting the rectangular/bespoke/large-transform flags on. See
+   doc/spec_notes.md and the L3 transform section's follow-up.
 2. **EPF pass-0 SIMD** (decode perf, self-contained). The `epfIterations == 3`
    path is scalar; an 11 MP triple-pass photo takes ~6.5 s. Vectorize with
    `Float32x4` per the CLAUDE.md perf rules. See "Performance & infrastructure".
@@ -867,20 +875,41 @@ output for where the gap actually is.
   `flutter test` green; no measurable timing regression. See
   doc/spec_notes.md for the full write-up.
 
-- 🔲 **Follow-up, found not fixed: elevated RMSE at one specific non-
-  default config.** `screentone_256_d0_e7.pgm`, `maxTransformSize: 256`
-  + `enableRectangularTransforms: true` + `enableBespokeTransforms: true`,
-  distance=1.0, decodes through djxl with RMSE 3.24 — above this
-  project's usual `< 2.0` gate. Confirmed (via a git-worktree check
-  against the pre-round-16 commit) to be byte-for-byte pre-existing, not
-  introduced by round 16 or the customParamsByIndex cleanup — a real
-  latent gap in this specific combination of flags/content/distance, not
-  currently caught by the standard test suite's own synthetic "genuinely
-  wins" content. Worth root-causing (likely somewhere in the interaction
-  between a large cascade and RDOQ/hfMult's own heuristics) before
-  `enableRectangularTransforms`/`enableBespokeTransforms`/
-  `maxTransformSize` beyond 16 are ever considered for default-on, but not
-  blocking anything currently shipped (all default off).
+- ✅ **Follow-up, ROOT-CAUSED AND FIXED: elevated RMSE at one specific
+  non-default config.** `screentone_256_d0_e7.pgm`, `maxTransformSize: 256`
+  + `enableRectangularTransforms: true` (+ `enableBespokeTransforms: true`),
+  distance=1.0, decoded through djxl at RMSE 3.24 — above the `< 2.0` gate.
+  The guess above (an interaction between the large cascade and RDOQ/hfMult
+  heuristics) was **wrong**: it was an inherited jxlatte transcription bug in
+  the *default DCT quant weights* for DCT 256x128/128x256
+  (`defaultDctParams[16]`, `hf_global.dart`). Channels 1 and 2 used the
+  *square* per-channel base weights (2.6·9311.32 and 2.6·4992.25) instead of
+  the *rectangular* ones libjxl uses (2.6·8611.32 and 2.6·4492.25) — a clean
+  off-by-1820/-1300 error in the DC band (the fractional tails matched
+  exactly), transcribed from the square series. Diagnosis (see
+  doc/spec_notes.md for the full trail):
+  - Isolated the trigger to `maxTransformSize: 256` + rect **alone** (bespoke
+    not needed), and to a single transform type in the tally: **DCT 128x256**
+    (`+max128+rect` is fine; only the 256-tier rect pair breaks).
+  - Three-way compare per the methodology: our decoder 1.12, **jxlatte 1.126**
+    (agrees with us), djxl 3.34 — an *inherited* bug, so we fix toward djxl.
+  - Ruled out the natural order (byte-identical to jxl-oxide's
+    conformance-correct order for orderID 12), the weight *interpolation*
+    (matches libjxl's `Interpolate`), and the LLF scale table (our
+    `_llfScaleTable` = 1/jxl-oxide's `SCALE_F`, indexed identically) —
+    all correct.
+  - The clincher: the divergence appears **only at distance 1.0** (default
+    weights signalled) and vanishes at other distances (a custom weight table
+    is written from our params and djxl reads it back verbatim), which points
+    squarely at the built-in default table for this transform.
+  Fixed the one constant. This was also a latent *decoder* bug (a djxl-encoded
+  file using this transform with default weights would have mis-decoded);
+  fixed for free. Two regression tests: a djxl-free structural invariant (the
+  rectangular DC base doubles per size: index 12 → 14 → 16) and a distance-1.0
+  djxl round-trip forcing parameterIndex-16 with AC energy. Both verified to
+  fail on the old values. This **unblocks** ever defaulting the
+  rectangular/bespoke/large-transform flags on (nothing shipped was affected —
+  all default off — but the quality-bar violation is gone).
 
 - ✅ **Real-manga ROI evaluation for `enableRectangularTransforms`/
   `enableBespokeTransforms`/`maxTransformSize:32`, round 17.** Built a

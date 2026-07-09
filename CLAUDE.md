@@ -75,8 +75,10 @@ them proves less than it looks like. This machine has everything.
    debugging (`javac -d out $(find java -name '*.java')`, main class
    `com.traneptora.jxlatte.JXLatte`). Identical deviation → inherited;
    document in `doc/spec_notes.md`. Different → our port bug.
-4. jxlatte has real bugs — two found and fixed so far (patch blend-mode
-   remap; splines rendered with spline 0's coefficients). When beyond
+4. jxlatte has real bugs — three found and fixed so far (patch blend-mode
+   remap; splines rendered with spline 0's coefficients; wrong default
+   quant weights for DCT 256x128/128x256, channels 1/2 transcribed from the
+   square series — see doc/spec_notes.md). When beyond
    jxlatte's capabilities (multi-frame animation), djxl alone is ground
    truth. When fixing, verify against djxl and record it in spec_notes.
 5. Java → Dart semantics: `int/2` → `~/`, `>>>` on non-negatives → `>>`,
