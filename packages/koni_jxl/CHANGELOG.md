@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.1.4
+
+### Lossless encoding — now competitive with `cjxl`, smaller than PNG
+
+A series of never-worse compression levers (each tried against a real-assembly
+baseline and kept only when it codes smaller) moved the modular encoder from
+"correct" to genuinely competitive. On the 97-image public burkardt PNG set it
+now totals **60% of the source PNGs (beating PNG on 87/97) and 102.4% of
+`cjxl -e7` (beating cjxl on 19/97)**.
+
+- **Predictor selection from the learned tree's training entropy.** Instead of
+  running both the gradient and weighted-predictor pipelines to completion, the
+  encoder now decides from each learned tree's training entropy and finishes
+  only the winner when it's a clear win — **−17% to −26% encode time**, output
+  bit-identical.
+- **Per-leaf predictor selection.** Each MA-tree leaf independently keeps the
+  image predictor or switches gradient↔weighted wherever that codes its own
+  pixels smaller (`gray_screentone` **−24.6%**; the decoder already supports a
+  per-leaf predictor, so no format change).
+- **Deeper, gated LZ77 matcher** (chain depth 256, lazy lookahead) tried only
+  when LZ77 already beats plain, kept alongside the old matcher so it's provably
+  never-worse: `gray_screentone` **−46.5%**, screentone the winning mode.
+- **Palette above 256 colours** (RGB, up to 4096) and a **single-channel
+  grayscale palette** gated on value sparsity — flat UI graphics **−48%**, and
+  bilevel/fractal grayscale (previously the worst gap to `cjxl`) transformed:
+  `dla` now **beats** `cjxl`, `sierpinski`/`math_emporium` went 290%/229% →
+  125%/109% of `cjxl -e7`.
+- **Cross-channel context for RCT colour** (the tree conditions Co/Cg on the
+  prior channel and on channel index): colour content ~**−2%**, illustration/UI
+  ties `cjxl`.
+- **Per-image hybrid-uint tokenization** (`(4,1,0)` vs `(4,2,0)`, keep smaller):
+  screentone/line-art −2% to −4%.
+
+### Decoding
+
+- **Embedded ICC profiles are now applied as an output colour transform** for
+  matrix/TRC RGB profiles (`color/icc_transform.dart`), not just decoded and
+  exposed. Conformance-verified against `ref.png` — the `progressive` case goes
+  from rmse 12.6 to **0.082**. Grayscale/CMYK/LUT-CLUT profiles still fall back
+  to sRGB.
+- **Spot-colour extra channels are composited onto the image**
+  (`out = mix·spotRGB + (1−mix)·out`), verified against the `spot` conformance
+  case (rmse 115.9 → **0.43**).
+- **Fixed the default VarDCT quant weights for DCT 256×128 / 128×256** — an
+  inherited jxlatte transcription bug (channels 1/2 used the square base weights
+  instead of the rectangular ones), a latent lossy-fidelity gap at the default
+  distance. Confirmed inherited via the standard djxl/jxlatte three-way compare.
+- **Reduced-resolution decode extended to Modular/lossless** responsive
+  (Squeeze) files — decodes the low-frequency pyramid alone and box-downsamples
+  to 1:8 (~3.6× faster on a 1024×1536 responsive file) — and to
+  progressive-DC (separate LF frame) VarDCT files (2.7–6.8× faster).
+- **EPF pass 0 is now `Float32x4`-SIMD** (both gray and colour double-cross
+  kernels), the last scalar EPF kernel: an 11 MP triple-pass progressive photo
+  dropped from ~4.8 s to ~2.0 s full decode (pass 0 itself 3.0 s → 0.4 s).
+- **Chained multi-layer blend modes (`blendmodes`):** investigated and confirmed
+  a libjxl-version deviation koni tracks faithfully (djxl 0.11.2 itself deviates
+  from `ref.png` nearly identically); koni matches djxl/jxlatte to within 8-bit
+  rounding. Not a koni bug; gated against djxl rather than `ref.png`.
+
 ## 0.1.3
 
 ### Decoding

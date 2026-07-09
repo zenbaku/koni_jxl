@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.4
+
+- **`JxlImageProvider` gained `cacheWidth`/`cacheHeight`** for a
+  reduced-resolution decode straight from the idiomatic provider (wrapping a
+  JXL-backed `ImageProvider` in `ResizeImage` has no effect, since JXL bytes
+  never reach the engine's `decode` callback). Pairs with `koni_jxl` 0.1.4's
+  faster downscale paths (VarDCT DC-only, progressive-DC, and Modular/Squeeze
+  responsive).
+- Picks up all of `koni_jxl` 0.1.4: a much stronger lossless encoder (now beats
+  PNG and is within ~2% of `cjxl -e7`), ICC output-colour transforms and
+  spot-colour compositing on the decode path, a VarDCT quant-weight fidelity
+  fix, and a SIMD EPF pass-0 (large progressive photos ~2.4× faster to decode).
+
 ## 0.1.3
 
 - **`decodeJxlToUiImage`/`decodeJxlToUiCodec`/`jxlAwareDecode`** gained
