@@ -1122,8 +1122,14 @@ Smaller levers on top of the current learned-tree + WP + ANS/LZ77 encoder.
   (now beats `cjxl`), `sierpinski` −56.7% (→125%), `math_emporium` −52.2%
   (→110%), `cat`/`fool`/`washington` −53–60%; grayscale subset **−4.1%** total,
   several images now beat `cjxl`. Colour path byte-identical. See
-  doc/spec_notes.md. Remaining: the residual `sierpinski` gap is 2-D fractal
-  self-similarity that 1-D LZ77 on the index channel still misses.
+  doc/spec_notes.md. The residual `sierpinski` gap (125%) was then
+  **investigated and left open**: it is context-model / tree-search quality
+  (LZ77 loses on the index channel; position properties are group-local and
+  don't help), and the one lever that helps — a lower tree `minGainBits` — is
+  unsafe globally (regresses screentone/flat: `gray_screentone` +1.6%,
+  `palette16` +9.8%) and not cheaply gate-able (winner/regressor context counts
+  overlap). Matching `cjxl` here needs its more exhaustive modular tree search
+  (e5→e9 ladder), a much larger lever.
 
 ---
 

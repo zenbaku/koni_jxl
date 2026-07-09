@@ -491,9 +491,33 @@ dense grayscale) is byte-identical — the `paletteChannels=3` default preserves
 the colour path exactly (verified: 7 colour images byte-for-byte unchanged).
 Regression test: `encoder_roundtrip_test.dart`'s "grayscale palette (sparse
 few-value single channel)" case (bilevel, 4-value, and 30-value layouts,
-djxl-gated). The residual `sierpinski` gap (125%) is 2D fractal self-similarity
-that 1-D LZ77 / context modelling on the index channel still doesn't fully
-capture — a much harder, nicher lever left open.
+djxl-gated).
+
+**The residual `sierpinski` gap (125% of `cjxl`) — investigated, not closed.**
+After palettizing, koni codes the index channel with `plain+ans` (LZ77 loses
+decisively — 8092 vs ~22000 est, because 0/1-index gradient residuals defeat the
+distance histogram), so the gap is **context-model / tree-search quality**, not
+LZ77 and not a missing property (libjxl's local property set is the same
+N/W/NW/NE/NN/WW koni already uses; adding position properties 2/3 did nothing
+because they are *group-local* 0..255 coordinates while the fractal spans the
+whole image). The one lever that helped was lowering the tree's `minGainBits`
+split threshold (96→16): `sierpinski` −6.9% (→117%), `math_emporium` −3.4%.
+**Rejected as a global change** — it *regresses* the primary content: measured
+`gray_screentone` **+1.6%**, `screentone_256` **+2.8%**, `palette16` **+9.8%**,
+`clemson_logo` +1.2% (small/flat/screentone trees over-split when the floor
+drops, and the extra tree description + histogram overhead outweighs the
+training-set gain). Photos are exactly neutral (their trees stop at the context
+cap regardless). A never-worse **try-both** (learn a second low-`minGainBits`
+tree, keep the smaller real output) would be correct but is not cheaply
+gateable: the winners' and regressors' context counts overlap completely
+(`sierpinski` 15, `math_emporium` 23 vs `screentone_256` 16/20, `palette16`
+5/7), so no a-priori signal separates "benefits from more contexts" from
+"over-splits" — only real assembly does, which would tax every early-stopping
+image (screentone/flat/manga included) with a second full tree-learn for a
+2-image niche win. Not worth it under the project's "never tax the manga case
+for marginal wins" rule. The true remaining gap is `cjxl`'s more exhaustive
+modular tree search (its own e5→e9 ladder, 7681→5639, shows how much of it is
+search depth); matching that is a much larger, nicher lever left open.
 
 ### Lossless encoder — predictor selection from learned-tree training entropy
 
