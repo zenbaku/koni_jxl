@@ -215,8 +215,18 @@ final class Frame {
     _decodeLfGroups();
   }
 
-  void decodeFrame({List<ImageBuffer>? lfFrame}) {
+  /// When set, the modular pass-group sections (the large, full-resolution
+  /// Squeeze residual channels) are skipped: their target channels are
+  /// zero-allocated instead of decoded, so the inverse Squeeze upsamples the
+  /// low-frequency pyramid with zero high-frequency detail. Only meaningful
+  /// for a Squeeze (responsive) modular frame, where it yields a ~1:8-accurate
+  /// image for a fraction of the decode cost — see the decoder's
+  /// `_modularLowResImageFor` and doc/spec_notes.md's "Downscaled decode".
+  bool modularLowRes = false;
+
+  void decodeFrame({List<ImageBuffer>? lfFrame, bool modularLowRes = false}) {
     this.lfFrame = lfFrame;
+    this.modularLowRes = modularLowRes;
     const timings = bool.fromEnvironment('jxl.timings');
     final sw = timings ? (Stopwatch()..start()) : null;
     void mark(String label) {
@@ -230,6 +240,14 @@ final class Frame {
     final isVarDCT = header.encoding == FrameFlags.vardct;
     lfGlobal = LfGlobal.read(toc.sectionReader(0), this);
     mark('lfGlobal');
+    // Low-res Squeeze decode is only valid for a responsive frame (its
+    // pass-group channels are high-frequency residuals). For a non-Squeeze
+    // modular frame, bail right after the cheap LfGlobal read — before any
+    // LF-group/assembly work — so the caller (`_modularLowResImageFor`) sees
+    // `!usesSqueeze` and falls back to a full decode with minimal waste.
+    if (modularLowRes && !isVarDCT && !lfGlobal.globalModular.usesSqueeze) {
+      return;
+    }
     final padded = paddedFrameSize;
     final colors = colorChannelCount;
     final channelCount = colors + globalMetadata.extraChannels.length;
@@ -400,6 +418,12 @@ final class Frame {
           info.height = (info.height - info.originY).clamp(0, groupHeight);
           info.width = (info.width - info.originX).clamp(0, groupWidth);
         }
+        if (!isVarDCT && modularLowRes) {
+          // Low-res Squeeze decode: skip this large residual group entirely;
+          // its target channels are zero-allocated below so the inverse
+          // Squeeze upsamples the low-frequency pyramid without it.
+          continue;
+        }
         final stream = ModularStream.read(reader, modularContext,
             streamIndex: 18 + 3 * numLfGroups + numGroups * pass + group,
             channelArray: replaced);
@@ -408,15 +432,18 @@ final class Frame {
       }
     }
 
+    final skipPg = !isVarDCT && modularLowRes;
     for (var pass = 0; pass < numPasses; pass++) {
       var j = 0;
       for (var i = 0; i < passes[pass].replacedChannels.length; i++) {
         if (passes[pass].replacedChannels[i] == null) continue;
         final channel = lfGlobal.globalModular.getChannel(i);
         channel.allocate();
-        for (var group = 0; group < numGroups; group++) {
-          final newChannel = passGroups[pass][group].getChannel(j);
-          _copyChannelRegion(newChannel, channel);
+        if (!skipPg) {
+          for (var group = 0; group < numGroups; group++) {
+            final newChannel = passGroups[pass][group].getChannel(j);
+            _copyChannelRegion(newChannel, channel);
+          }
         }
         j++;
       }

@@ -311,10 +311,29 @@ is enforced, while "which path ran" is a timing detail (checked with
 `decodeJxl*` functions and now `JxlImageProvider` take `cacheWidth`/
 `cacheHeight` (folded into the provider's cache key).
 
-**Not cheap (correct via the full-decode fallback):** Modular/lossless has no
-DC concept at all — only the Squeeze transform has a latent low-resolution form
-(the `vshift/hshift >= 3` replacement channels already surfaced in
-`_decodeLfGroups`), which is not wired into any downscale path; plus extra
+**Modular/lossless via Squeeze (responsive) — now wired.** Modular has no DC
+concept, but a **Squeeze (responsive)** frame stores a hierarchical
+low-frequency pyramid: the `vshift/hshift >= 3` channels (the global + LF-group
+sections) hold the low frequencies, the finer Squeeze residuals live in the
+pass groups. `_modularLowResImageFor` (in the decoder) exploits this exactly
+like the VarDCT DC path exploits the LF/HF section split: it decodes the frame
+with `Frame.modularLowRes`, which **zero-fills the pass-group residual channels
+instead of entropy-decoding them** (the bulk of the cost), so the inverse
+Squeeze upsamples the low-frequency pyramid alone. Box-downsampling that to the
+target gives a ~1:8-accurate image — measured RMSE ~0.6 vs. a true
+box-downsample of the full decode, ~3.6x faster on a 1024x1536 responsive file
+(≈75 ms vs. ≈260 ms). The natural cheap scale is again 1:8 (finer targets fall
+back), so the returned image is 1:8-sized and the existing gate treats it just
+like the DC image. The key soundness gate: this only fires when the modular
+stream actually **uses Squeeze** (`ModularStream.usesSqueeze`) — for a
+non-responsive lossless file the pass-group channels *are* the image, not
+residuals, so zero-filling them would be garbage; that case bails right after
+the cheap LfGlobal read (`decodeFrame` returns early), so a non-responsive
+target decode pays only a ~2% probe cost before the full-decode fallback runs.
+Also gated to plain integer colour (bails on XYB/float/YCbCr) and a plain, last,
+full-canvas frame with no patches/splines/noise/format-upsampling.
+
+**Still not cheap (correct via the full-decode fallback):** extra
 channels/alpha (assembled as opaque in the DC image), animation, and
 patches/splines. These are coverage gaps, not correctness gaps.
 

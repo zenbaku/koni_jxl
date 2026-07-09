@@ -38,12 +38,22 @@ linked below.
    (`bike`) and ref.png (`grayscale_public_university`, `progressive`);
    float32-lane accumulation stays <=1/255 off the scalar path, inside the
    lossy gate. See doc/spec_notes.md's Performance status section.
-3. **Modular/lossless downscale via Squeeze** (feature, larger). Completes the
-   thumbnail-grid story for clean lossless scans — the biggest remaining
-   downscale gap (see the "Downscaled decode" item: modular has no DC concept;
-   only the Squeeze transform's low-frequency channels offer a latent low-res
-   form, currently unwired). Substantial: Squeeze is a hierarchical wavelet-like
-   transform needing partial-level decode plumbed into the DC path.
+3. ✅ **Modular/lossless downscale via Squeeze** — DONE. A responsive (Squeeze)
+   lossless frame stores a low-frequency pyramid whose fine residuals live in
+   the pass groups; `_modularLowResImageFor` decodes with `Frame.modularLowRes`
+   (zero-fills those pass-group channels instead of entropy-decoding them), lets
+   the inverse Squeeze upsample the low-frequency pyramid alone, and
+   box-downsamples to 1:8. ~3.6x faster on a 1024x1536 responsive file (≈260 ms
+   → ≈75 ms) at RMSE ~0.6 vs. a true box-downsample. Turned out **far simpler
+   than the "partial-level decode" this item feared** — zeroing the fine
+   residuals and running the normal inverse Squeeze is within the downscale
+   gate, so no partial-Squeeze bookkeeping was needed. Gated on the stream
+   actually using Squeeze (else non-responsive pass-group channels *are* the
+   image; that case bails after the cheap LfGlobal probe, ~2% cost) and plain
+   integer colour. Corpus gained `color_cover_d0_e5_responsive` (via
+   gen_corpus.py) to exercise the pass-group skip. Flutter thumbnails via
+   `JxlImageProvider(cacheWidth/cacheHeight)` get it for free. See
+   doc/spec_notes.md's "Downscaled decode".
 
 Lower priority / deferred: delta palette (niche), a cost-based optimal LZ77
 parse (large, uncertain over the gated deep matcher), CMYK/LUT-CLUT output
@@ -1202,7 +1212,10 @@ feature un-applied rather than throwing — the only decode-path
   **The original `decodeScaled(1/2, 1/4)` framing doesn't fit JXL:** 1/2 and
   1/4 need HF data (AC lives in separate sections from DC), so there is no
   DC-only-style shortcut for them — the natural cheap scale is 1:8 and coarser.
-  Remaining un-cheap cases (all correct via the full-decode fallback):
-  **Modular/lossless** (no DC concept — only the Squeeze transform has a latent
-  low-res form, unwired), extra channels/alpha, animation, patches/splines.
-  See doc/spec_notes.md's "Downscaled decode" for the coverage map.
+  **Modular/lossless via Squeeze (responsive)** was subsequently wired too
+  (2026-07-08): `_modularLowResImageFor` zero-fills the pass-group Squeeze
+  residuals and box-downsamples the upsampled low-frequency pyramid to 1:8,
+  ~3.6x faster on a 1024x1536 responsive file. Remaining un-cheap cases (all
+  correct via the full-decode fallback): non-responsive lossless (no low-res
+  form to exploit), extra channels/alpha, animation, patches/splines. See
+  doc/spec_notes.md's "Downscaled decode" for the coverage map.

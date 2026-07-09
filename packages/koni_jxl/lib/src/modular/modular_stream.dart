@@ -205,6 +205,10 @@ final class ModularStream {
 
   int get encodedChannelCount => channels.length;
 
+  /// Whether this stream applies a Squeeze (responsive) transform — the
+  /// precondition for the decoder's low-res Squeeze downscale path.
+  bool get usesSqueeze => transforms.any((t) => t.tr == TransformInfo.squeeze);
+
   ModularChannel getChannel(int index) => channels[index];
 
   void decodeChannels(BitReader reader, {bool partial = false}) {

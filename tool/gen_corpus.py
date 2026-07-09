@@ -224,6 +224,13 @@ def main():
                      ["-d", "0", "-e", "5"] + vargs, False, False))
     jobs.append(("gray_screentone", "gray_screentone_d0_e5_container",
                  ["-d", "0", "-e", "5", "--container=1"], False, False))
+    # A large responsive (Squeeze) lossless file: unlike the 256x256
+    # screentone responsive variant (whose whole pyramid fits in the global
+    # section), this one is big enough to push its high-frequency Squeeze
+    # residuals into pass groups, exercising the decoder's low-res Squeeze
+    # downscale path (which skips exactly those pass groups).
+    jobs.append(("color_cover", "color_cover_d0_e5_responsive",
+                 ["-d", "0", "-e", "5", "--responsive=1"], False, False))
 
     if not QUICK:
         for src in ["gray_screentone", "gray_gradient", "color_cover"]:

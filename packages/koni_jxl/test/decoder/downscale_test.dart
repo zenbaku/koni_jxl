@@ -133,9 +133,41 @@ void main() {
       expect(_rmseVsBoxDownsample(full, small), lessThan(8.0));
     });
 
-    test('lossless (Modular) image falls back but still downscales correctly',
-        () {
+    test(
+        'plain (non-responsive) lossless (Modular) image falls back but still '
+        'downscales correctly', () {
+      // Not a Squeeze frame, so the low-res Squeeze path bails after the cheap
+      // LfGlobal probe (`usesSqueeze` is false) and the full-decode fallback
+      // serves it.
       final bytes = _read('screentone_256_d0_e7.jxl');
+      final full = JxlDecoder.decode(bytes);
+      final target = (full.width / 8).ceil();
+      final small = JxlDecoder.decode(bytes, targetWidth: target);
+      expect(small.width, target);
+      expect(_rmseVsBoxDownsample(full, small), lessThan(8.0));
+    });
+
+    test(
+        'responsive (Squeeze) lossless image takes the low-res Squeeze path '
+        '(at 1:8) and downscales correctly', () {
+      // Large enough (1024x1536) that its high-frequency Squeeze residuals are
+      // stored in pass groups, which the low-res path skips (decoding only the
+      // vshift/hshift>=3 low-frequency pyramid) — see decoder
+      // _modularLowResImageFor. Present only after tool/gen_corpus.py runs.
+      final file = File('${corpusDir.path}/color_cover_d0_e5_responsive.jxl');
+      if (!file.existsSync()) return;
+      final bytes = file.readAsBytesSync();
+      final full = JxlDecoder.decode(bytes);
+      final target = (full.width / 8).ceil();
+      final small = JxlDecoder.decode(bytes, targetWidth: target);
+      expect(small.width, target);
+      expect(_rmseVsBoxDownsample(full, small), lessThan(8.0));
+    });
+
+    test(
+        'small responsive (Squeeze) lossless image downscales correctly '
+        '(whole pyramid in the global section, no pass groups to skip)', () {
+      final bytes = _read('screentone_256_d0_e5_responsive.jxl');
       final full = JxlDecoder.decode(bytes);
       final target = (full.width / 8).ceil();
       final small = JxlDecoder.decode(bytes, targetWidth: target);
