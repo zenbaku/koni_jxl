@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../exceptions.dart';
+import '../util/math_helper.dart';
 
 /// Result of container demuxing: the raw codestream plus container metadata.
 final class DemuxedStream {
@@ -68,7 +69,10 @@ DemuxedStream demuxContainer(Uint8List data) {
       if (offset + 16 > data.length) {
         throw const JxlTruncatedException('truncated extended box size');
       }
-      final size64 = byteData.getUint64(offset + 8);
+      // Two 32-bit reads instead of getUint64, which dart2js doesn't
+      // implement (throws); wideShl keeps the combine safe past 32 bits.
+      final size64 = wideShl(byteData.getUint32(offset + 8), 32) +
+          byteData.getUint32(offset + 12);
       payloadStart = offset + 16;
       payloadEnd = offset + size64;
     } else if (size32 == 0) {

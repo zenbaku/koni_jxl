@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import '../util/math_helper.dart';
+
 /// LSB-first bit writer: the exact mirror of [BitReader].
 final class BitWriter {
   final _bytes = BytesBuilder();
@@ -13,11 +15,17 @@ final class BitWriter {
     assert(bits >= 0 && bits <= 32);
     assert(value >= 0 && (bits >= 32 || value < (1 << bits)),
         'value $value does not fit in $bits bits');
-    _cache |= value << _cacheBits;
+    // += (not |=) and wideShl (not <<): _cacheBits is always < 8 here, but
+    // `value` can itself need the full 32 bits, so the true combined value
+    // can need up to 39 bits - beyond what dart2js's `<<`/`|` guarantee (they
+    // silently truncate results above 2^32, mirroring BitReader.readBits).
+    // Addition is equivalent to OR here since value's shifted bit range
+    // never overlaps the bits already in _cache.
+    _cache += wideShl(value, _cacheBits);
     _cacheBits += bits;
     while (_cacheBits >= 8) {
       _bytes.addByte(_cache & 0xFF);
-      _cache >>= 8;
+      _cache = wideShr(_cache, 8);
       _cacheBits -= 8;
     }
   }
@@ -95,9 +103,12 @@ final class BitWriter {
       writeBits(0, 16);
       return;
     }
-    final bits64 = (ByteData(8)..setFloat64(0, value)).getUint64(0);
-    final sign = (bits64 >> 63) & 1;
-    var exp16 = ((bits64 >> 52) & 0x7FF).toInt() - 1023 + 15;
+    // The sign, exponent, and the mantissa's top 10 bits all live in the
+    // double's high 32 bits (bits 63-32), so a 32-bit read suffices - no
+    // need for getUint64, which dart2js doesn't implement (throws).
+    final hi32 = (ByteData(8)..setFloat64(0, value)).getUint32(0);
+    final sign = (hi32 >> 31) & 1;
+    var exp16 = ((hi32 >> 20) & 0x7FF) - 1023 + 15;
     int mantissa16;
     if (exp16 >= 31) {
       exp16 = 30;
@@ -106,7 +117,7 @@ final class BitWriter {
       writeBits(sign << 15, 16);
       return;
     } else {
-      mantissa16 = (bits64 >> 42) & 0x3FF;
+      mantissa16 = (hi32 >> 10) & 0x3FF;
     }
     writeBits((sign << 15) | (exp16 << 10) | mantissa16, 16);
   }

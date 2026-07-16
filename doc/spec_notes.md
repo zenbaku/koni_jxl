@@ -4120,6 +4120,42 @@ exposed a new failure elsewhere rather than converging). If dart2js support
 is ever needed, budget for a dedicated pass with the same oracle, not a
 code-reading audit.
 
+**Update**: CI now runs `dart test -p chrome` under both `dart2js` and
+`dart2wasm` (`.github/workflows/ci.yml`'s `test-web` job, one file per test
+tagged `@TestOn('vm')` when it needs `dart:io` - corpus/djxl-gated tests
+can't run in a browser at all, so they're VM-only; everything else, ~146
+tests, now runs on every push). This is a narrower net than the corpus
+oracle above - it never decodes a real multi-KB file, so it can't reproduce
+the "desyncs many symbols later" class of bug those fixes targeted - but it
+compiles and executes every unit/round-trip test under dart2js/dart2wasm's
+actual semantics, which the corpus oracle's throwaway/manual nature never
+did continuously. It immediately found three more bugs the corpus oracle
+structurally could not, because it never exercised the encode path or this
+rare a decode branch on real corpus files:
+- `bit_writer.dart`'s `writeBits`: `_cache |= value << _cacheBits` - the
+  encode-side mirror of the exact bug already fixed in `readBits` above,
+  missed because the oracle only ever decoded, never encoded. Same fix:
+  `_cache += wideShl(value, _cacheBits)`, `_cache = wideShr(_cache, 8)`.
+  `test/util/bit_writer.dart` (a second, test-only BitWriter used to author
+  bitstream vectors) had the identical bug, fixed the same way.
+- `bit_writer.dart`'s `writeF16`: used `ByteData.getUint64`, which dart2js
+  doesn't implement at all (hard `Unsupported operation` crash, not a silent
+  corruption) - unreachable by the corpus oracle since it never encodes.
+  Fixed by reading only `getUint32(0)` - the sign, exponent, and the
+  mantissa's top 10 bits all live in the double's high 32 bits, so the low
+  32 bits (and the 64-bit accessor) were never actually needed.
+- `container.dart`'s `demuxContainer`: the extended (>4 GiB, `size32 == 1`)
+  box-size path also used `getUint64` - unreachable by the corpus oracle
+  since no corpus file is anywhere near 4 GiB. Fixed by combining two
+  `getUint32` reads via `wideShl(hi, 32) + lo`.
+
+All three were caught and fixed before being committed to main, with the
+web CI job green on both compilers plus the full VM suite (429 tests)
+unaffected. Reinforces the corpus-oracle section's own conclusion: this bug
+class isn't findable by code reading, only by actually running code under
+dart2js - and even the prior "thorough" pass had blind spots (encode, rare
+branches) that only running a *different* subset of code surfaced.
+
 Profiling a real manga page's phase timings (`tool/profile_decode.dart -D
 jxl.timings=true`) found the AC coefficient entropy-decode phase
 (`HfCoefficients`'s constructor: per-block/per-channel ANS context

@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:koni_jxl/src/util/math_helper.dart';
+
 /// Test-only LSB-first bit writer: the mirror of BitReader, for authoring
 /// bitstream vectors in tests.
 final class BitWriter {
@@ -10,11 +12,14 @@ final class BitWriter {
   void writeBits(int value, int bits) {
     assert(bits >= 0 && bits <= 32);
     assert(value >= 0 && (bits == 32 || value < (1 << bits)));
-    _cache |= value << _cacheBits;
+    // += / wideShl (not |= / <<): see the production BitWriter for why a
+    // plain << silently truncates on dart2js once value and _cacheBits
+    // together need more than 32 bits.
+    _cache += wideShl(value, _cacheBits);
     _cacheBits += bits;
     while (_cacheBits >= 8) {
       _bytes.addByte(_cache & 0xFF);
-      _cache >>= 8;
+      _cache = wideShr(_cache, 8);
       _cacheBits -= 8;
     }
   }
