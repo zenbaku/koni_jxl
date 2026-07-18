@@ -519,6 +519,41 @@ for marginal wins" rule. The true remaining gap is `cjxl`'s more exhaustive
 modular tree search (its own e5→e9 ladder, 7681→5639, shows how much of it is
 search depth); matching that is a much larger, nicher lever left open.
 
+**Follow-up (2026-07-18): stride-scaling the tree floor — a genuine
+size-correctness fix, but it doesn't reach `sierpinski`, and it defuses the
+manga-tax objection above.** The split-gain floor `minGainBits = 96` is applied
+to `splitGain` measured on the **strided training subset** (`stride =
+totalPixels/300000` for images > 300k px, else 1). Since a subset of `1/stride`
+of the pixels carries `~1/stride` of the bits, a flat floor on `splitGain`
+imposes an *effective full-image* floor of `96 × stride` that **grows with image
+size** — backwards, since a new context's real overhead (tree-description +
+histogram-header bits) is roughly size-independent. Scaling the check to
+`splitGain × stride < minGainBits` makes the effective floor constant.
+Measured (toggle A/B; `sierpinski`/`math_emporium` fetched to scratchpad from
+the burkardt page — **not in-repo, re-fetch to reproduce**):
+- `sierpinski` (966×860, stride 2): **byte-identical (8194 B, 126%)** — its
+  beneficial splits sit in `[16,48)` gain, and stride 2 only drops its floor to
+  48, not far enough. Confirms the gap is genuinely the exhaustive-search wall.
+- `math_emporium` (1376×1096, stride 5): **29375 → 28383 B (−3.4%, 110%→106%)** —
+  larger stride reaches its splits.
+- `gray_screentone` (large synthetic): **+1.6%** (over-splits — perfect
+  periodicity aliases under striding, so training gain overstates real benefit).
+- **Real manga (Naruto page), photos (`color_cover`), and all small content
+  (`screentone_256`/`palette16`, stride 1): byte-identical.**
+
+The important correction: because real manga is byte-identical under
+stride-scaling at base-96, **the paragraph above's reason for rejecting try-both
+is obsolete** — a stride-scaled, prefix-shared try-both (the baseline tree is a
+split-order prefix of the low-floor tree, so one learning pass yields both; the
+second *assembly* only fires where the trees differ) would **never tax any
+content this codec targets**, only `math_emporium`-like generated content. Its
+win (`math_emporium` −3.4%, never-worse everywhere via keep-smaller) is real and
+clean. It still **doesn't ship as a plain default** — not because of a manga tax,
+but because `gray_screentone` (a golden) regresses +1.6%, which is the sole
+reason the keep-smaller machinery would be needed at all — for a win on
+non-target generated content that doesn't even include `sierpinski`. Recorded,
+not built. `sierpinski` itself remains the exhaustive MA-tree-search lever.
+
 ### Lossless encoder — predictor selection from learned-tree training entropy
 
 The encoder used to run *both* predictor pipelines end to end (Pass A →

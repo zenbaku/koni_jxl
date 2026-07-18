@@ -62,9 +62,13 @@ is lossy.) **De-prioritized.**
 
 **What's actually still open:** `sierpinski`'s
 residual gap (125% of `cjxl`, needs `cjxl`'s more exhaustive modular tree
-*search*, not attempted); delta palette (niche); CMYK/LUT-CLUT output (real CMS
-work, niche); JPEG bitstream reconstruction; isolate parallelism (deferred,
-revisit for large images or batch decoding).
+*search* — a stride-scaling follow-up 2026-07-18 confirmed it's genuinely that
+wall: correcting the tree floor's size-scaling helps larger generated content
+`math_emporium` −3.4% but can't reach `sierpinski` at stride 2, byte-identical on
+all real manga/photo/small content — see doc/spec_notes.md); delta palette
+(niche); CMYK/LUT-CLUT output (real CMS work, niche); JPEG bitstream
+reconstruction; isolate parallelism (deferred, revisit for large images or
+batch decoding).
 
 The completed trio, for context — details in the sections linked below:
 
