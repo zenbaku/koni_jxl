@@ -1252,8 +1252,19 @@ feature un-applied rather than throwing — the only decode-path
   the domain spot colours are defined in for the Modular `spot` case; XYB +
   spot (no conformance coverage) blends in the same domain. `dimShift > 0`
   (subsampled) spot channels are skipped (none in the corpus).
-- 🔲 **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
-  a JPEG-transcoded `.jxl` (needs the jbrd box + JPEG serialization).
+- ⏳ **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
+  a JPEG-transcoded `.jxl`, byte-exact. **Phase 1 DONE (2026-07-18):**
+  `JxlDecoder.reconstructJpeg` for **baseline grayscale** transcodes — new
+  `lib/src/jpeg/` (jbrd parser + stored-block Brotli + coefficient capture +
+  baseline entropy writer), all ported from libjxl (`jpeg_data.cc`,
+  `dec_jpeg_data{,_writer}.cc`). Gated byte-exact across sizes, non-×8 dims,
+  multi-LF-group and restart intervals, cross-checked vs djxl (11 round-trip
+  cases + a jbrd fuzz-robustness case). The one non-obvious finding: koni's
+  decoded quantized integers **are** the JPEG coefficients bit-for-bit
+  (luma + all DC), the raw quant matrix is stored transposed, and chroma AC
+  carries chroma-from-luma. Remaining phases: color (CfL inversion +
+  subsampling → unlocks real manga), full RFC 7932 Brotli (Exif/ICC/XMP),
+  progressive scans. See `doc/spec_notes.md`.
 - ✅ **Chained multi-layer blend modes (`blendmodes` conformance case) —
   investigated; NOT a koni bug, it's a libjxl-version deviation koni tracks
   faithfully (2026-07-08).** The `blendmodes` case (5 frames chaining

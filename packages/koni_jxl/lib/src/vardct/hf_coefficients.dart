@@ -160,6 +160,33 @@ final class HfCoefficients {
       throw JxlInvalidBitstreamException(
           'illegal final ANS state in pass group: $pass, $groupID');
     }
+
+    // JPEG reconstruction: capture the raster-frequency AC of each block. JPEG
+    // component `cMap[c]` is `quantizedCoeffs[c]`. Re-derives the per-channel
+    // block placement (mirrors the decode loop) so the nonzero-count skip and
+    // subsampled-block skip do not interfere with capture.
+    final sink = frame.jpegSink;
+    if (sink != null) {
+      final lfLoc = frame.getLFGroupLocation(lfg.lfGroupID);
+      final lfBlkStride = header.lfGroupDim >> 3;
+      for (final i in includedIndices) {
+        final posY = meta.blockY[i];
+        final posX = meta.blockX[i];
+        for (final c in cMap) {
+          final upY = header.jpegUpsamplingY[c];
+          final upX = header.jpegUpsamplingX[c];
+          final groupY = posY - groupPosY;
+          final groupX = posX - groupPosX;
+          final sGroupY = groupY >> upY;
+          final sGroupX = groupX >> upX;
+          if (groupY != sGroupY << upY || groupX != sGroupX << upX) continue;
+          final globalBlockY = ((lfLoc.y * lfBlkStride) >> upY) + (posY >> upY);
+          final globalBlockX = ((lfLoc.x * lfBlkStride) >> upX) + (posX >> upX);
+          sink.setAcBlock(cMap[c], globalBlockY, globalBlockX,
+              quantizedCoeffs[c], sGroupY << 3, sGroupX << 3, coeffWidth[c]);
+        }
+      }
+    }
   }
 
   final Frame frame;

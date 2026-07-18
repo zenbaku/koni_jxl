@@ -4405,3 +4405,56 @@ beyond ceil(visible/2) instead, which shifts the final visible row of
 4:2:0 images whose height is even but not a block multiple (verified:
 jxlatte deviates from djxl by up to 10/255 on such a row; we match djxl
 to 1/255 after the fix).
+
+## JPEG bitstream reconstruction (phase 1: baseline grayscale, 2026-07-18)
+
+`JxlDecoder.reconstructJpeg(bytes)` re-emits the original JPEG file byte-for-byte
+from a JPEG-transcoded `.jxl` (a `cjxl foo.jpg` lossless transcode carrying a
+`jbrd` box). Returns null when there is no `jbrd` box (not a transcode). New
+`lib/src/jpeg/`: `jpeg_data.dart` (the `JPEGData` model), `jbrd_decoder.dart`
+(jbrd box parser), `brotli_stored.dart` (stored-block Brotli), `jpeg_writer.dart`
+(baseline entropy re-encoder + marker assembly), `jpeg_coeff_sink.dart` +
+`jpeg_reconstruct.dart` (capture + orchestration). All three format halves are
+near-verbatim ports of libjxl `lib/jxl/jpeg/{jpeg_data,dec_jpeg_data,
+dec_jpeg_data_writer}.cc` (fetched at tag v0.11.2), not reconstructed from memory
+— the jbrd bit-format and the JPEG re-emission are unforgiving.
+
+**Phase 1 scope: baseline sequential grayscale only.** Color (chroma-from-luma
+inversion + subsampling), progressive scans, compressed-Brotli tails
+(Exif/ICC/XMP markers) and full RFC 7932 Brotli all throw
+`JxlUnsupportedException` pending later phases. Gated in
+`test/decoder/jpeg_reconstruct_test.dart`: byte-exact round-trip (cjpeg → cjxl →
+koni == original, cross-checked vs djxl) across sizes, non-multiple-of-8 dims,
+horizontal/vertical multi-LF-group (>2048px) and restart intervals, plus a jbrd
+fuzz-robustness case.
+
+The load-bearing findings (established empirically, by comparing koni's decoded
+integers to a ground-truth JPEG entropy decoder — the existing "pixels match
+djxl within 1/255" tests do NOT cover any of this):
+
+- **koni's decoded quantized integers ARE the JPEG quantized DCT coefficients,
+  bit-for-bit** — for luma (DC and AC) and for all channels' DC. No scale, no
+  offset, no dequant round-trip. Extraction is: read `lfQuant` (DC, captured in
+  `LfCoefficients` before the line-76 dequant — it is a local, never retained)
+  and `quantizedCoeffs` (AC, already in 2D-raster/natural frequency layout);
+  re-apply DC differential coding on output. No de-zigzag is needed because
+  koni's raster layout matches libjxl's `coeffs[kJPEGNaturalOrder[i]]` access.
+- **The raw JXL quant matrix is stored transposed** relative to JPEG's raster
+  (row-major) DQT layout; `jpeg_reconstruct.dart` transposes it on the way out.
+  This was the last byte-mismatch (inside the DQT segment) before byte-exact.
+- **Channel↔component mappings** (measured, consistent for grayscale and YCbCr
+  4:4:4): `lfQuant` is in JPEG-component order — DC of component `j` is
+  `lfQuant[j]`. `quantizedCoeffs` and the raw quant params (`hfGlobal.params[0]
+  .param`) are in semantic X,Y,B order — AC and the quant table of component `j`
+  are channel `cMap[j]` (`cMap = [1,0,2]`, self-inverse).
+- **Chroma AC carries chroma-from-luma** (the documented `baseCorrelationB=1.0`):
+  the raw `quantizedCoeffs` for the B/Cr channel is a CfL *residual*, not the
+  JPEG coefficient. Grayscale/luma has none of this, so phase 1 is unaffected;
+  color reconstruction (phase 2) must undo the integer-exact CfL from libjxl's
+  reconstruction path.
+
+Capture is gated on `Frame.captureJpeg` (a null-check per block in
+`Lf/HfCoefficients`), so normal pixel decode is untouched — the full 442-test
+suite is unchanged. The jbrd parser allocates the variable-length marker/tail
+blobs only from the decompressed Brotli tail (bounded by the payload), never
+from the header's declared counts, per the robustness contract.

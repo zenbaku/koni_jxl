@@ -64,6 +64,30 @@ final class LfCoefficients {
     lfQuantStream.decodeChannels(reader);
     // lfQuant channels are in Y, X, B order.
     final lfQuant = [for (var i = 0; i < 3; i++) lfQuantStream.getChannel(i)];
+
+    // JPEG reconstruction: capture the pre-dequant integer DC. JPEG component
+    // `ch` is `lfQuant[ch]`; its block grid follows channel `cMap[ch]`'s
+    // subsampling.
+    final sink = frame.jpegSink;
+    if (sink != null) {
+      final lfLoc = frame.getLFGroupLocation(parent.lfGroupID);
+      final lfBlkStride = header.lfGroupDim >> 3;
+      for (var ch = 0; ch < 3; ch++) {
+        final chan = lfQuant[ch];
+        final offY =
+            (lfLoc.y * lfBlkStride) >> header.jpegUpsamplingY[cMap[ch]];
+        final offX =
+            (lfLoc.x * lfBlkStride) >> header.jpegUpsamplingX[cMap[ch]];
+        final buf = chan.buffer!;
+        for (var y = 0; y < chan.height; y++) {
+          final row = y * chan.width;
+          for (var x = 0; x < chan.width; x++) {
+            sink.setDc(ch, offY + y, offX + x, buf[row + x]);
+          }
+        }
+      }
+    }
+
     final scaledDequant = frame.lfGlobal.scaledDequant;
     for (var i = 0; i < 3; i++) {
       final c = cMap[i];

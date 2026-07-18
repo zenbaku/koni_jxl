@@ -5,7 +5,8 @@ import '../util/math_helper.dart';
 
 /// Result of container demuxing: the raw codestream plus container metadata.
 final class DemuxedStream {
-  const DemuxedStream._(this.codestream, this.level, this.isContainer);
+  const DemuxedStream._(this.codestream, this.level, this.isContainer,
+      {this.jbrd});
 
   /// The bare codestream (starts with 0xFF 0x0A).
   final Uint8List codestream;
@@ -15,6 +16,10 @@ final class DemuxedStream {
 
   /// Whether the input was wrapped in an ISOBMFF container.
   final bool isContainer;
+
+  /// The `jbrd` (JPEG bitstream reconstruction data) box payload, if present.
+  /// Non-null only for JPEG-transcoded files.
+  final Uint8List? jbrd;
 }
 
 const _containerSignature = [
@@ -55,6 +60,7 @@ DemuxedStream demuxContainer(Uint8List data) {
 
   final byteData = ByteData.sublistView(data);
   var level = 5;
+  Uint8List? jbrd;
   final parts = <Uint8List>[];
   var offset = 12;
   while (offset < data.length) {
@@ -107,6 +113,8 @@ DemuxedStream demuxContainer(Uint8List data) {
           throw const JxlInvalidBitstreamException('jxlp box too small');
         }
         parts.add(Uint8List.sublistView(data, payloadStart + 4, payloadEnd));
+      case 'jbrd':
+        jbrd = Uint8List.sublistView(data, payloadStart, payloadEnd);
       default:
         break; // Exif, xml , brob, ftyp, ... — skipped.
     }
@@ -128,7 +136,7 @@ DemuxedStream demuxContainer(Uint8List data) {
       pos += part.length;
     }
   }
-  return DemuxedStream._(codestream, level, true);
+  return DemuxedStream._(codestream, level, true, jbrd: jbrd);
 }
 
 /// Extracts as much of the codestream as [data] (a growing prefix of a JXL

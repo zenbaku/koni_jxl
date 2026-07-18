@@ -144,8 +144,13 @@ un-applied:
   onto the image (`decoder._compositeSpotColors`, `out = mix·spotRGB +
   (1−mix)·out`), conformance-gated against `ref.png` (the `spot` case). Only
   `dimShift > 0` (subsampled) spot channels are skipped (none in the corpus).
-- **JPEG bitstream reconstruction** — the `jbrd` box is ignored; pixels decode
-  through the normal VarDCT path (byte-exact JPEG re-emission is out of scope).
+- **JPEG bitstream reconstruction** — `JxlDecoder.reconstructJpeg` re-emits the
+  original JPEG byte-exact from a transcoded `.jxl` (`jpeg/`: jbrd parse,
+  stored-block Brotli, coefficient capture, baseline entropy writer). Phase 1
+  handles **baseline grayscale** only; color (chroma-from-luma inversion +
+  subsampling), progressive scans, compressed-Brotli tails (Exif/ICC/XMP) and
+  full Brotli throw `JxlUnsupportedException` pending later phases. Non-transcode
+  input returns null. Normal pixel decode is unaffected (capture is gated).
 - **ICC-driven output transform** — matrix/TRC RGB ICC profiles ARE now applied
   as a real output transform (`color/icc_transform.dart`, conformance-gated
   against `ref.png` incl. the `progressive` case). Grayscale/CMYK/LUT-CLUT

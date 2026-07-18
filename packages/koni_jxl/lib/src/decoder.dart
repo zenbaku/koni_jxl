@@ -12,6 +12,7 @@ import 'header/image_header.dart';
 import 'icc/icc_codec.dart';
 import 'io/bit_reader.dart';
 import 'io/container.dart';
+import 'jpeg/jpeg_reconstruct.dart';
 import 'jxl_image.dart';
 import 'jxl_limits.dart';
 import 'render/blend.dart';
@@ -65,6 +66,20 @@ final class JxlDecoder {
   /// Still images produce a single frame with duration 0.
   static JxlAnimation decodeAnimation(Uint8List bytes) =>
       _DecoderState()._decode(bytes, allFrames: true);
+
+  /// Reconstructs the original JPEG file from a JPEG-transcoded JXL, byte for
+  /// byte, using its `jbrd` box. Returns null when [bytes] carry no JPEG
+  /// reconstruction data (not a transcode). Throws [JxlUnsupportedException]
+  /// for transcode variants not yet supported.
+  static Uint8List? reconstructJpeg(Uint8List bytes) {
+    final demuxed = demuxContainer(bytes);
+    if (demuxed.jbrd == null) return null;
+    final state = _DecoderState()..captureJpeg = true;
+    state._decode(bytes, allFrames: false);
+    final frame = state.capturedFrame;
+    if (frame == null) return null;
+    return buildJpegFromCapture(frame, demuxed.jbrd!);
+  }
 
   /// Attempts the DC-only fast path; returns null (never throws) whenever it
   /// doesn't apply, so the caller falls back to a normal full decode — that
@@ -317,6 +332,11 @@ final class _DecoderState {
   int _visibleFrames = 0;
   int _invisibleFrames = 0;
 
+  /// JPEG reconstruction: when set, the first regular frame captures quantized
+  /// coefficients and is retained in [capturedFrame].
+  bool captureJpeg = false;
+  Frame? capturedFrame;
+
   JxlAnimation _decode(Uint8List bytes, {required bool allFrames}) {
     final demuxed = demuxContainer(bytes);
     final reader = BitReader(demuxed.codestream);
@@ -360,7 +380,11 @@ final class _DecoderState {
             'src=${header.blendingInfo.source} '
             'alpha=${header.blendingInfo.alphaChannel}) isLast=${header.isLast}');
       }
+      if (captureJpeg && capturedFrame == null) frame.captureJpeg = true;
       frame.decodeFrame(lfFrame: _lfBuffer[header.lfLevel]);
+      if (captureJpeg && capturedFrame == null && frame.captureJpeg) {
+        capturedFrame = frame;
+      }
       if (header.lfLevel > 0) {
         _lfBuffer[header.lfLevel - 1] = frame.buffer;
       }

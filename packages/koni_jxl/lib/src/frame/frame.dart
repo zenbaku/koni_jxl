@@ -1,6 +1,7 @@
 import '../exceptions.dart';
 import '../header/image_header.dart';
 import '../io/bit_reader.dart';
+import '../jpeg/jpeg_coeff_sink.dart';
 import '../modular/ma_tree.dart';
 import '../modular/modular_channel.dart';
 import '../modular/modular_stream.dart';
@@ -84,6 +85,11 @@ final class Frame {
   /// Per-channel frame output, sized to the padded frame size.
   late List<ImageBuffer> buffer;
 
+  /// When set (JPEG reconstruction), the decode captures quantized DC/AC
+  /// coefficients into [jpegSink] via gated hooks in Lf/HfCoefficients.
+  bool captureJpeg = false;
+  JpegCoeffSink? jpegSink;
+
   FrameHeader readFrameHeader() {
     globalReader.zeroPadToByte();
     header = FrameHeader.read(globalReader, globalMetadata);
@@ -144,6 +150,22 @@ final class Frame {
       return (width: (width << factorX) << 3, height: (height << factorY) << 3);
     }
     return (width: width << factorX, height: height << factorY);
+  }
+
+  /// Allocates [jpegSink], one entry per color channel (capture is keyed by
+  /// JPEG component: DC channel `j` and AC channel `cMap[j]`). Component `j`'s
+  /// block grid follows the subsampling of its governing JXL channel.
+  void _allocJpegSink() {
+    final padded = paddedFrameSize;
+    final lumaWib = padded.width >> 3;
+    final lumaHib = padded.height >> 3;
+    final wib = <int>[];
+    final hib = <int>[];
+    for (var j = 0; j < 3; j++) {
+      wib.add(lumaWib >> header.jpegUpsamplingX[cMap[j]]);
+      hib.add(lumaHib >> header.jpegUpsamplingY[cMap[j]]);
+    }
+    jpegSink = JpegCoeffSink(wib, hib);
   }
 
   ModularFrameContext get modularContext => ModularFrameContext(
@@ -352,6 +374,7 @@ final class Frame {
   }
 
   void _decodeLfGroups() {
+    if (captureJpeg && jpegSink == null) _allocJpegSink();
     final globalModular = lfGlobal.globalModular;
     final replacementChannels = <ModularChannel>[];
     final replacementIndices = <int>[];
