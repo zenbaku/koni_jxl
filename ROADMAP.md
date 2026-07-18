@@ -41,8 +41,26 @@ provable-never-worse default would cost ~2x encode, disproportionate to the win
 mechanism (e.g. folding the per-block hfMult insight into the L2 heuristic's own
 thresholds at ~1x — flagged, not attempted).
 
-**What's actually still open:** a cost-based optimal LZ77 parse (large,
-uncertain — "the only larger LZ77 lever left" for lossless); `sierpinski`'s
+**Cost-based optimal LZ77 parse — investigated 2026-07-18, not worth building
+(no real-content beneficiary).** A cheap headroom pre-probe (histogram the
+existing deep matcher's distance/length distribution; measure the plain-vs-LZ
+estimate gap) found that **LZ77 is not the winning mode on any real content** —
+grayscale manga (Naruto), colored manhwa (Solo Leveling, `manga_samples/`), and
+colored comics (One-Piece) all code *plainly*, and not marginally: plain beats
+even shallow-LZ by **26–49%** (`lz/plain` 1.26–1.49 on the colored pages). Root
+cause: these are JPEG-sourced, so lossy DCT quantization leaves per-pixel
+variation even in flat-looking colour fills — no long *exact* byte-repeats for
+LZ77 to exploit, and koni's predictor+ANS codes the small non-repeating
+residuals far better than LZ copies. An optimal parse improves LZ by single-digit
+% over greedy, nowhere near enough to overturn a 1.3–1.5x deficit. LZ77 wins only
+on synthetic perfectly-periodic content (`gray_screentone`), where the deep
+matcher's distances are *spread* (H≈7 bits) so headroom plausibly exists — but
+that niche is already handled never-worse by `min(plain, shallow-lz, deep-lz)`.
+(Colouredness was the hypothesis; the JPEG source is the killer. Truly
+lossless-source flat-colour content could differ, but distributed manga/manhwa
+is lossy.) **De-prioritized.**
+
+**What's actually still open:** `sierpinski`'s
 residual gap (125% of `cjxl`, needs `cjxl`'s more exhaustive modular tree
 *search*, not attempted); delta palette (niche); CMYK/LUT-CLUT output (real CMS
 work, niche); JPEG bitstream reconstruction; isolate parallelism (deferred,
