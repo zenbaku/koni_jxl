@@ -304,6 +304,20 @@ class VardctL0Config {
   /// hides quantization noise — a continuous generalization of the L2
   /// 3-bucket relative-AC-energy heuristic, driven by an RD search rather
   /// than fixed thresholds.
+  ///
+  /// **Round 21 calibrated this (curve `hi=8, knee=1.5, gamma=2`, lambda
+  /// [_kMaskRdLambda] = 0.08) and validated it against real manga** — but the
+  /// default stays **off** by a value judgment, not a correctness gap. At the
+  /// quality manga is actually encoded (distance <= ~1.25) it is a genuine,
+  /// never-worse win: real `manga_samples/` pages come out -0.14% to -2.9%
+  /// smaller at RMSE within noise, photo -1.9% at *better* RMSE. But it is
+  /// structurally unsafe above ~distance 1.25 (the `acScale^2` lambda scaling
+  /// needed for banding safety collapses the rate term at high distance, so the
+  /// RD search over-refines busy content: screentone/line art +24% to +45% at
+  /// distance 4), so a default-on would need distance-gating plus a provable
+  /// byte-min safety net assembling each layout both ways (~2x encode) — a poor
+  /// trade for a ~1.5% win, the same DCT32/`enableFilters` precedent. See
+  /// [_kMaskRdLambda] and doc/spec_notes.md's round 21 entry.
   final bool perceptualMask;
 
   /// Overrides the perceptual masking curve's `(hi, knee, gamma)` constants
@@ -3597,15 +3611,18 @@ double _tokenRate(
 const _rdHfMultCandidates = [1, 2, 4];
 
 /// Perceptual masking curve constants (see [VardctL0Config.perceptualMask]
-/// and [_maskWeight]). Placeholders pending calibration
-/// (`tool/calibrate_perceptual_mask.dart`); overridable at runtime via
+/// and [_maskWeight]). **Calibrated** multi-distance in round 21
+/// (`tool/calibrate_perceptual_mask.dart`, see doc/spec_notes.md), not the
+/// placeholders they started as; overridable at runtime via
 /// [VardctL0Config.maskParamsOverride].
 ///
 /// - [_kMaskHi]: distortion amplification for a maximally-smooth block
 ///   (relEnergy -> 0). Must be large enough to make the RD search keep a
 ///   smooth block's precision boost that plain weighted-MSE (weight 1) threw
 ///   away — i.e. to overcome the rate cost round 3's photo-favorable lambda
-///   couldn't justify on absolute-MSE grounds alone.
+///   couldn't justify on absolute-MSE grounds alone. `8.0` was the calibrated
+///   sweet spot: `hi=4` under-protects (photo bigger *and* worse RMSE at the
+///   winning lambda), `hi=16` over-protects (photo grows).
 /// - [_kMaskKnee]: the relative-AC-energy value at which the weight is halfway
 ///   between [_kMaskHi] and 1. Sits near the L2 heuristic's own thresholds
 ///   (1.0 / 4.0) so the masking transition tracks where the heuristic already
@@ -3615,6 +3632,32 @@ const _rdHfMultCandidates = [1, 2, 4];
 const _kMaskHi = 8.0;
 const _kMaskKnee = 1.5;
 const _kMaskGamma = 2.0;
+
+/// Rate/distortion trade-off constant for the **masking** RD-hfMult path
+/// (`_chooseHfMultRd` when [VardctL0Config.perceptualMask] is on), in
+/// `acScale^2` units — a *separate* constant from the plain path's [_kRdLambda]
+/// (`refStep^2` units): the two scalings differ by ~1e5 at distance 1.0, so the
+/// plain path's `3000` would make `lambda = 3000 * acScale^2 = 3000` here and
+/// coarsen everything. Calibrated to **0.08** multi-distance in round 21
+/// (`tool/calibrate_perceptual_mask.dart`): at distance 1.0 the mask path is
+/// -1.9% bytes at *better* RMSE than the L2 heuristic on `color_cover` (photo),
+/// -2.9% on line art, screentone byte-identical, gradient banding gate safe;
+/// on real `manga_samples/` pages it is never-worse (-0.14% to -2.9%, RMSE
+/// within noise) at distance <= ~1.25.
+///
+/// **Why [VardctL0Config.perceptualMask] still defaults off despite this being
+/// calibrated:** the `acScale^2` scaling that keeps banding protection safe at
+/// every distance *collapses* the rate term at high distance (at distance 8,
+/// `0.08 * acScale^2 ~= 0.004`), so the RD search over-refines busy content
+/// there — screentone/line art balloon +24% to +45% at distance 4 regardless
+/// of this constant. A single scalar lambda cannot satisfy both banding-safety
+/// and busy-content rate-control scaling (round 3's / round 20's modeling gap,
+/// confirmed empirically in round 21). A default-on would need distance-gating
+/// plus a provable byte-min safety net that assembles each layout both ways
+/// (~2x encode) — disproportionate to the ~1.5% win, the same DCT32 value
+/// judgment that keeps [VardctL0Config.maxTransformSize]/`enableFilters` off.
+/// See doc/spec_notes.md's round 21 entry.
+const _kMaskRdLambda = 0.08;
 
 /// Perceptual masking multiplier applied to a block's RD distortion, as a
 /// continuous function of its relative AC energy (`relEnergy = sqrt(Y AC
@@ -3750,13 +3793,16 @@ void _chooseHfMultRd(
   final bootstrap = _chooseAcClustering(bootstrapTokens);
   final lengths = bootstrap.codes.tokenBitLengths();
   final clusterMap = bootstrap.clusterMap;
-  final kLambda = lambdaOverride ?? _kRdLambda;
   // The masking path uses acScale^2 scaling (round 3's mandated fix: refStep^2
   // grows the rate/distortion trade in the *opposite* direction from how this
   // metric scales with the dequant table as distance rises, causing a
   // high-distance banding-protection collapse — see _kRdLambda's doc comment).
   // The plain (non-mask) path keeps refStep^2 so round 3's calibrated (if
-  // unshipped) _kRdLambda is undisturbed.
+  // unshipped) _kRdLambda is undisturbed. Because the two scalings differ by
+  // ~1e5, each path has its OWN default constant (_kMaskRdLambda vs _kRdLambda);
+  // a caller's explicit override applies to whichever path is active.
+  final kLambda =
+      lambdaOverride ?? (perceptualMask ? _kMaskRdLambda : _kRdLambda);
   final maskParams = perceptualMask
       ? (maskOverride ?? (hi: _kMaskHi, knee: _kMaskKnee, gamma: _kMaskGamma))
       : null;

@@ -3909,6 +3909,82 @@ to gate manga out, which isn't worth the API surface for a manga-focused codec.
 `quantLF` decoupling (no redundant "coarsen" knob). All 405 tests green; `dart
 analyze` clean.
 
+### Lossy (VarDCT) encoder — round 21: the refine-only perceptual-mask default, investigated and declined (calibrated + baked as an opt-in)
+
+Round 20 left "turn the perceptual-masking win into a real default for non-manga/
+photo content" open. This round pursued the **safe remnant** of that — the
+refine-only `perceptualMask` distortion term (NOT the coarsen-baseline lever
+round 20 already killed for manga) — with a proper multi-distance calibration
+and a real-manga cost/benefit probe. **Outcome: calibrate it, bake the constant
+into the opt-in path, but keep the default off** — a value judgment (the DCT32
+profile), not a correctness gap. Four findings, in order.
+
+**1. The calibrated sweet spot (curve `hi=8, knee=1.5, gamma=2`, lambda
+`_kMaskRdLambda = 0.08`).** `tool/calibrate_perceptual_mask.dart` previously
+only checked one across-distance lambda (`0.04`) — the wrong value, which hid
+everything below. Extended it to a multi-lambda × multi-distance sweep. At
+distance 1.0 the mask path is **-1.9% bytes at *better* RMSE** than the L2
+heuristic on `color_cover` (1.797 vs 1.810), **-2.9%** on line art (identical
+RMSE), screentone byte-identical, gradient banding gate safe (0.936 vs 0.938).
+`hi=4` under-protects (photo bigger *and* worse RMSE at the winning lambda),
+`hi=16` over-protects (photo grows); `0.08` is the Pareto-win lambda (higher
+lambdas widen the d=1 size win to -5% to -7% but at *worse* RMSE — a size/quality
+retrade, not a Pareto gain).
+
+**2. A fixed-lambda default is structurally unsafe at high distance, and no
+lambda fixes it.** `lambda = _kMaskRdLambda * acScale^2`, so at distance 8
+(`acScale = 0.125`) the effective lambda collapses to `~0.004` — the rate term
+goes nearly free and the RD search over-refines *busy* content. Screentone comes
+out **+48% at distance 8 regardless of lambda** up to `0.24` (confirmed by the
+sweep). The `acScale^2` scaling is *required* for banding safety (gradient RMSE
+tracks the heuristic at every distance) but that same scaling makes busy-content
+rate control collapse at high distance. **A single scalar lambda cannot satisfy
+both** — the exact round 3 / round 20 modeling gap, now confirmed empirically
+rather than argued. So any default-on must gate off above ~distance 1.25.
+
+**3. On *real* manga the refine-only mask is a small never-worse win (correcting
+round 20's synthetic pessimism).** A real-page probe (Naruto B/W screentone +
+One-Piece digital colour, 3 pages each, decoded to source pixels via koni's own
+`JxlDecoder`, re-encoded heuristic vs mask, djxl RMSE) found that at distance 1.0
+— manga's actual operating point — the mask-RD path is **never-worse on every
+real page WITHOUT any safety net**: Naruto -0.14% to -2.74%, One-Piece -1.01% to
+-2.90%, photo -1.94%, RMSE within noise throughout. This is the DCT32/round-7
+pattern *inverted*: round 20's synthetic screentone proxy said "byte-identical/
+neutral," but real manga is a genuine small win (~-1.5% average). At distance 4
+it balloons the expected +24% to +45% (finding 2). So the win is real but
+confined to high quality (distance <= ~1.25).
+
+**4. Why it stays opt-in: the provable-never-worse mechanism is disproportionate
+to the win.** A default-on would need distance-gating (finding 2) *plus* a
+byte-min safety net for a real never-worse guarantee. The encode architecture has
+**no cheap provable net**: `_chooseHfMultRd` recomputes coefficients from the
+pixel planes and re-commits, and RDOQ mutates AC in place, so a byte-min net must
+assemble each transform-candidate layout *both ways* (heuristic hfMult and mask
+hfMult) and keep the smaller. Since the current default already pays for the
+heuristic bodies, `new ≈ old + mask bodies ≈ **2x** encode`, plus intricate
+block-state-isolation code in the hot path (the class where rounds 7 and 19
+shipped safety-net bugs). ~2x encode on the *common* low-distance manga encode
+for a ~1.5% win — some pages as thin as -0.14% — is the same value judgment that
+keeps `maxTransformSize`/`enableFilters`/the round-20 coarsen lever off:
+existence and default-on are separate questions, and this one doesn't clear the
+default-on bar. The mask-RD pass alone (no safety net) measured ~1.5-1.8x.
+
+**What shipped (opt-in, default off):** `_kMaskRdLambda = 0.08` added as a
+*separate* constant from the plain path's `_kRdLambda = 3000` (the two differ by
+~1e5 because the mask path scales by `acScale^2` and the plain path by
+`refStep^2` — before this, an opt-in `perceptualMask` with no lambda override
+wrongly used `3000` and coarsened everything). `_kMaskHi/_kMaskKnee/_kMaskGamma`
+promoted from "placeholders pending calibration" to calibrated. `vardct_l0_test.
+dart`'s perceptual-mask test gained two **fully-baked** cases (no overrides, the
+real config a caller flipping the opt-in on would get, exercising all four baked
+constants). Default path byte-identical (nothing flipped). All encode tests green
+(188/188); `dart analyze` clean.
+
+**Future cheaper path (flagged, not attempted):** if the win comes from better
+per-block hfMult than the 3-bucket L2 heuristic, folding that insight into the
+*heuristic's own thresholds* could capture much of it at ~1x — no RD pass, no
+distance-gating, no never-worse question. A separate investigation.
+
 ### Inherited jxlatte bug: wrong default quant weights for DCT 256x128/128x256
 
 **The deviation, and the fix.** libjxl's default DCT quant weights for the

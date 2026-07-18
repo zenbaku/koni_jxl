@@ -17,13 +17,24 @@ import 'package:koni_jxl/src/encode/vardct/vardct_l0_encoder.dart';
 /// genuinely-smooth blocks (amplifying their distortion so the RD search
 /// keeps their precision boost).
 ///
-/// So this tool reports, per distance, three arms on the same content:
-///   - `heuristic`  : L2 3-bucket (enableRdHfMult off) — the shipped default.
-///   - `plainRd`    : enableRdHfMult on, perceptualMask off — round 3's config.
-///   - `maskRd`     : enableRdHfMult + perceptualMask on — this round.
+/// So this tool reports two views on the same content:
+///   1. A `distance = 1.0` grid over (lambda, hi) with three arms —
+///      `heuristic` (L2 3-bucket, `enableRdHfMult` off, the shipped default),
+///      `plainRd` (round 3's config), and `maskRd` — for finding the winning
+///      curve at manga's operating point.
+///   2. A **multi-lambda × multi-distance** across-distance sweep (round 21):
+///      %-vs-heuristic per content at distances 0.5-8.0, which exposes the
+///      structural high-distance blowup (busy content balloons +24% to +45% at
+///      distance 4+ *regardless of lambda*, because the `acScale^2` scaling that
+///      keeps banding safe collapses the rate term — see doc/spec_notes.md's
+///      round 21 entry). The tool previously only checked one across-distance
+///      lambda (0.04, the wrong value), which hid the whole picture.
 /// The win condition for `maskRd` vs `heuristic`: color_cover smaller (and
 /// RMSE no worse) AND gradient gate comfortably safe AND no screentone/line-art
-/// regression.
+/// regression. Round 21's conclusion: `hi=8, lambda=0.08` is the Pareto sweet
+/// spot at distance <= ~1.25 (a real never-worse win, incl. on real manga), but
+/// no single lambda is safe across all distances, so the mask stays **opt-in**,
+/// default off (`_kMaskRdLambda = 0.08` baked for the opt-in path).
 ///
 /// Runs with `enableVariableTransforms: false` throughout, same isolation
 /// rationale as `tool/calibrate_rd_lambda.dart` (avoids the degenerate
@@ -96,28 +107,57 @@ void main() {
     }
   }
 
-  // Gradient banding + manga-content safety across the full distance range,
-  // for a chosen curve. acScale^2 scaling means the SAME maskLambda should
-  // hold its banding protection at every distance (unlike round 3's refStep^2,
-  // which collapsed it at high distance).
-  const chkLam = 0.04, chkHi = _pickHi, chkKnee = _pickKnee;
-  print('\n${'=' * 78}\nAcross-distance safety for maskRd(lam=$chkLam, '
-      'hi=$chkHi, knee=$chkKnee, gamma=$gamma) [acScale^2]\n${'=' * 78}');
-  print('dist | gradient: heur / mask      | screentone heur/mask | '
-      'lineArt heur/mask');
-  for (final d in <double>[0.5, 1.0, 2.0, 4.0, 8.0]) {
-    final base = _isolatedBase(d);
-    final mask = base.maskRd(chkLam, hi: chkHi, knee: chkKnee, gamma: gamma);
-    final gH = _encodeAndMeasure(gradient, 256, 256, base);
-    final gM = _encodeAndMeasure(gradient, 256, 256, mask);
-    final sH = _encodeAndMeasure(screentone, 256, 256, base);
-    final sM = _encodeAndMeasure(screentone, 256, 256, mask);
-    final lH = _encodeAndMeasure(lineArt, 256, 256, base);
-    final lM = _encodeAndMeasure(lineArt, 256, 256, mask);
-    print('${_p(d, 4)} | rmse ${_f(gH.rmse)}/${_f(gM.rmse)}  '
-        'B ${gH.bytes}/${gM.bytes} | '
-        '${sH.bytes}/${sM.bytes}B ${_f(sH.rmse)}/${_f(sM.rmse)} | '
-        '${lH.bytes}/${lM.bytes}B ${_f(lH.rmse)}/${_f(lM.rmse)}');
+  // Multi-lambda across-distance safety. The busy-content size blowup at high
+  // distance is caused by lambda getting too SMALL (rate ~free -> RD over-
+  // refines busy blocks); a HIGHER kLambda should suppress it, so sweep several.
+  // Reports %-vs-heuristic per content so a single "safe everywhere AND wins at
+  // d~1" lambda (if one exists) is visible. Positive % on busy content = a size
+  // regression (bigger for quality the distance setting was discarding).
+  const chkHi = _pickHi, chkKnee = _pickKnee;
+  const dists = <double>[0.5, 1.0, 2.0, 4.0, 8.0];
+  // Heuristic baselines per distance (cached — reused across every lambda).
+  final baseByDist = {for (final d in dists) d: _isolatedBase(d)};
+  final ccH = {
+    for (final d in dists)
+      d: _encodeAndMeasure(corpusPixels, cw, ch, baseByDist[d]!)
+  };
+  final gH = {
+    for (final d in dists)
+      d: _encodeAndMeasure(gradient, 256, 256, baseByDist[d]!)
+  };
+  final sH = {
+    for (final d in dists)
+      d: _encodeAndMeasure(screentone, 256, 256, baseByDist[d]!)
+  };
+  final lH = {
+    for (final d in dists)
+      d: _encodeAndMeasure(lineArt, 256, 256, baseByDist[d]!)
+  };
+  for (final lam in <double>[0.06, 0.08, 0.12, 0.16, 0.24]) {
+    print('\n${'=' * 78}\nAcross-distance maskRd(lam=$lam, hi=$chkHi, '
+        'knee=$chkKnee, gamma=$gamma) [acScale^2] — %-vs-heuristic\n${'=' * 78}');
+    print('dist |  color_cover %vH rmse(h/m) | grad rmse(h/m) gate | '
+        'screentone %vH | lineArt %vH rmse(h/m)');
+    for (final d in dists) {
+      final mask =
+          baseByDist[d]!.maskRd(lam, hi: chkHi, knee: chkKnee, gamma: gamma);
+      final ccM = _encodeAndMeasure(corpusPixels, cw, ch, mask);
+      final gM = _encodeAndMeasure(gradient, 256, 256, mask);
+      final sM = _encodeAndMeasure(screentone, 256, 256, mask);
+      final lM = _encodeAndMeasure(lineArt, 256, 256, mask);
+      final gate = gM.rmse <= gH[d]!.rmse * 1.02
+          ? 'OK'
+          : gM.rmse <= gH[d]!.rmse * 1.15
+              ? 'MARG'
+              : 'FAIL';
+      print('${_p(d, 4)} | '
+          '${_pct(ccM.bytes, ccH[d]!.bytes).padLeft(6)} '
+          '${_f(ccH[d]!.rmse)}/${_f(ccM.rmse)} | '
+          '${_f(gH[d]!.rmse)}/${_f(gM.rmse)} $gate | '
+          '${_pct(sM.bytes, sH[d]!.bytes).padLeft(6)} | '
+          '${_pct(lM.bytes, lH[d]!.bytes).padLeft(6)} '
+          '${_f(lH[d]!.rmse)}/${_f(lM.rmse)}');
+    }
   }
 }
 

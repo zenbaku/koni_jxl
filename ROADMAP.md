@@ -21,13 +21,32 @@ tree *search*, and the one lever that helps (lower tree `minGainBits`) regresses
 screentone/flat content and isn't cheaply gate-able (see the lossless-encoder
 section and doc/spec_notes.md).
 
-**The largest genuine open area is now lossy (VarDCT) compression efficiency**
-— a real rate-distortion search over transform-*type* choice (all 27 types
-exist and are correct, but selection is heuristic), which is what keeps smooth/
-photographic lossy quality behind `cjxl -e7`. Lower priority / deferred: delta
-palette (niche), a cost-based optimal LZ77 parse (large, uncertain over the
-gated deep matcher), CMYK/LUT-CLUT output (real CMS work, niche), JPEG bitstream
-reconstruction.
+**Superseded by round 20 (see the VarDCT section below): transform-type
+selection is *not* the lever, and the manga `cjxl -e7` gap is not a
+quantization problem at all — that compression thread is closed for the
+manga use case.** The gap was partly a measurement artifact (matched
+*distance* vs. matched *RMSE* — koni actually beats `cjxl -e1` once measured
+correctly), and the real remaining lever — perceptual masking
+(`VardctL0Config.perceptualMask`/`spatialMask`) — is a genuine win on photo
+content (−13% to −22% at matched ssimulacra2) but *hurts* manga screentone
+(+10–25%), so it shipped opt-in, default off. Do not re-open transform
+selection or per-block quant RD for manga without new evidence.
+
+**The perceptual-masking thread is now closed** (round 21, below): the
+coarsen-baseline photo win stays a photo-only opt-in (round 20), and the safe
+refine-only mask remnant was calibrated multi-distance and *also* kept opt-in —
+it's a genuine but ~1.5% never-worse win on real manga at high quality, and a
+provable-never-worse default would cost ~2x encode, disproportionate to the win
+(the DCT32 value judgment). Don't re-open it without a fundamentally cheaper
+mechanism (e.g. folding the per-block hfMult insight into the L2 heuristic's own
+thresholds at ~1x — flagged, not attempted).
+
+**What's actually still open:** a cost-based optimal LZ77 parse (large,
+uncertain — "the only larger LZ77 lever left" for lossless); `sierpinski`'s
+residual gap (125% of `cjxl`, needs `cjxl`'s more exhaustive modular tree
+*search*, not attempted); delta palette (niche); CMYK/LUT-CLUT output (real CMS
+work, niche); JPEG bitstream reconstruction; isolate parallelism (deferred,
+revisit for large images or batch decoding).
 
 The completed trio, for context — details in the sections linked below:
 
@@ -1041,6 +1060,32 @@ output for where the gap actually is.
   pipeline (`tool/bench_perceptual_rd.dart`, `calibrate_perceptual_mask.dart`,
   `calibrate_coarsen_mask.dart`, `validate_manga_perceptual.dart`) reusable
   for any future lossy-quality work.
+- ✅ **Round 21: the refine-only perceptual-mask default — investigated and
+  declined; calibrated and baked as an opt-in.** Pursued the *safe remnant*
+  round 20 left open (the refine-only `perceptualMask` distortion term, not the
+  coarsen lever round 20 killed for manga). Multi-distance calibration found the
+  sweet spot (`hi=8, knee=1.5, gamma=2`, lambda `_kMaskRdLambda = 0.08`): at
+  distance 1.0 it's -1.9% bytes at *better* RMSE on photo, -2.9% on line art,
+  screentone byte-identical, banding-safe. A real-manga probe *corrected round
+  20's synthetic pessimism*: at distance <= ~1.25 (manga's operating point) the
+  mask is a genuine **never-worse win on every real page** (-0.14% to -2.9%,
+  RMSE within noise), not the "neutral" the synthetic proxy predicted. But two
+  facts kept the default **off**: (a) it's structurally unsafe above ~distance
+  1.25 — the `acScale^2` scaling required for banding safety collapses the rate
+  term at high distance, so busy content balloons +24% to +45% at distance 4,
+  and *no lambda fixes it* (one scalar can't satisfy both banding-safety and
+  busy-content rate-control scaling — round 3/20's modeling gap, now confirmed);
+  (b) a *provable* never-worse default would need distance-gating **plus** a
+  byte-min safety net that assembles each layout both ways (~2x encode — the
+  architecture has no cheap provable net, since `_chooseHfMultRd` recomputes
+  from planes and RDOQ mutates AC in place), disproportionate to a ~1.5% win.
+  The DCT32 value judgment. Shipped: `_kMaskRdLambda` (a *separate* constant
+  from the plain path's `_kRdLambda`, since the two scalings differ ~1e5), curve
+  constants promoted placeholder→calibrated, two fully-baked test cases; default
+  path byte-identical, 188/188 encode tests green. Future cheaper path (flagged,
+  not attempted): fold the per-block hfMult insight into the L2 heuristic's own
+  thresholds (~1x, no RD pass, no gating, no never-worse question). See
+  doc/spec_notes.md's round 21 entry.
 
 ---
 

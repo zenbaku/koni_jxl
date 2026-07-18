@@ -391,15 +391,22 @@ void main() {
     // for correctness across the same size shapes and at a coarse distance
     // (where acScale != 1, so the acScale^2 scaling is genuinely exercised),
     // plus a runtime maskParamsOverride. Correctness only — the shipped
-    // default stays off pending multi-distance calibration
-    // (tool/calibrate_perceptual_mask.dart).
-    for (final (w, h, distance, spatial) in [
-      (256, 256, 1.0, false),
-      (264, 104, 1.0, false), // multi-group
-      (2056, 8, 1.0, false), // multi-LF-group
-      (256, 256, 4.0, false), // acScale != 1 -> exercises acScale^2 scaling
-      (256, 256, 2.0, true), // spatial-blur masking signal
-      (264, 104, 1.0, true), // spatial + multi-group (grid indexing)
+    // default stays off (a value judgment, not a calibration gap: round 21
+    // calibrated the curve/lambda but a default-on is disproportionate to the
+    // ~1.5% win, see _kMaskRdLambda's doc comment and doc/spec_notes.md).
+    // `baked == true` uses NO overrides so the shipped default constants
+    // (_kMaskHi/_kMaskKnee/_kMaskGamma/_kMaskRdLambda) are the ones exercised —
+    // the exact config a caller flipping the opt-in on would get, which before
+    // round 21 would have wrongly used the plain path's _kRdLambda=3000.
+    for (final (w, h, distance, spatial, baked) in [
+      (256, 256, 1.0, false, false),
+      (264, 104, 1.0, false, false), // multi-group
+      (2056, 8, 1.0, false, false), // multi-LF-group
+      (256, 256, 4.0, false, false), // acScale != 1 -> exercises acScale^2
+      (256, 256, 2.0, true, false), // spatial-blur masking signal
+      (264, 104, 1.0, true, false), // spatial + multi-group (grid indexing)
+      (256, 256, 1.0, false, true), // fully-baked defaults (real opt-in config)
+      (264, 104, 4.0, false, true), // baked defaults, acScale != 1, multi-group
     ]) {
       final pixels = _synthetic(w, h, 7);
       final base = VardctL0Config.fromDistance(distance);
@@ -413,11 +420,9 @@ void main() {
               enableRdHfMult: true,
               perceptualMask: true,
               spatialMask: spatial,
-              maskParamsOverride: (
-                hi: 8.0,
-                knee: spatial ? 8.0 : 1.5,
-                gamma: 2.0
-              )));
+              maskParamsOverride: baked
+                  ? null
+                  : (hi: 8.0, knee: spatial ? 8.0 : 1.5, gamma: 2.0)));
       final image = JxlDecoder.decode(encoded);
       expect(image.width, w);
       expect(image.height, h);
