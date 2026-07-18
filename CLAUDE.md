@@ -146,11 +146,13 @@ un-applied:
   `dimShift > 0` (subsampled) spot channels are skipped (none in the corpus).
 - **JPEG bitstream reconstruction** — `JxlDecoder.reconstructJpeg` re-emits the
   original JPEG byte-exact from a transcoded `.jxl` (`jpeg/`: jbrd parse,
-  stored-block Brotli, coefficient capture, baseline entropy writer). Phase 1
-  handles **baseline grayscale** only; color (chroma-from-luma inversion +
-  subsampling), progressive scans, compressed-Brotli tails (Exif/ICC/XMP) and
-  full Brotli throw `JxlUnsupportedException` pending later phases. Non-transcode
-  input returns null. Normal pixel decode is unaffected (capture is gated).
+  stored-block Brotli, coefficient capture, baseline entropy writer). Handles
+  **baseline grayscale and YCbCr color** (4:4:4 with integer-exact
+  chroma-from-luma inversion, plus 4:2:0 / 4:2:2 subsampling) — validated
+  byte-exact on both real manga chapters (34 pages). RGB (non-YCbCr) color,
+  progressive scans, and compressed-Brotli tails (Exif/ICC/XMP markers, needing
+  a full Brotli decoder) throw `JxlUnsupportedException`. Non-transcode input
+  returns null. Normal pixel decode is unaffected (capture is gated).
 - **ICC-driven output transform** — matrix/TRC RGB ICC profiles ARE now applied
   as a real output transform (`color/icc_transform.dart`, conformance-gated
   against `ref.png` incl. the `progressive` case). Grayscale/CMYK/LUT-CLUT

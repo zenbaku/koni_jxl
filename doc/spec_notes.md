@@ -4458,3 +4458,51 @@ Capture is gated on `Frame.captureJpeg` (a null-check per block in
 suite is unchanged. The jbrd parser allocates the variable-length marker/tail
 blobs only from the decompressed Brotli tail (bounded by the payload), never
 from the header's declared counts, per the robustness contract.
+
+## JPEG reconstruction — YCbCr color (4:4:4 CfL + subsampling, 2026-07-18)
+
+Extends `reconstructJpeg` from grayscale to full YCbCr color. Validated
+**byte-exact on both real manga chapters** (Naruto 17/17 B/W 4:2:0, One Piece
+17/17 full color) against djxl's reconstruction, plus synthetic 4:4:4 / 4:2:0 /
+4:2:2 sweeps including subsampling-boundary dimensions. The reference is
+libjxl's integer-exact JPEG-output path in `dec_group.cc` (not the float pixel
+path) plus `chroma_from_luma.h`.
+
+- **Chroma-from-luma inversion (4:4:4 only).** The stored `quantizedCoeffs` of
+  the X (Cb) and B (Cr) channels are CfL *residuals*; the JPEG coefficient is
+  recovered by adding back the luma contribution in fixed point
+  (`_invertCfl` in `jpeg_reconstruct.dart`): per block, per AC position `i`,
+  `chroma[i] += (y[i] * ((scaledQ[i]*ratio + r) >> 11) + r) >> 11`, where
+  `ratio = factor * 2^11 / 84`, `scaledQ[i] = 2^11 * qY[i] / qC[i]` (quant
+  tables in JPEG raster order), `r = 2^10`, precision `kCFLFixedPointPrecision
+  = 11`, color factor `84`. The per-64x64-tile `factor` is the raw signed
+  X-from-Y / B-from-Y map from the HF-metadata modular stream
+  (`HfMetadata.hfStreamChannels[0]`/`[1]`), captured per block into
+  `JpegCoeffSink.cflFactor`. DC carries no CfL for a JPEG transcode
+  (`xFactorLF = bFactorLF = 128`, base correlations 0), so the captured
+  `lfQuant` DC is used directly.
+- **Subsampling fell out for free.** libjxl applies **no** CfL to subsampled
+  chroma (`dec_group.cc`: the CfL branch is gated on `cs.Is444()`), so 4:2:0 /
+  4:2:2 reconstruction is just the 3-channel block positioning the grayscale
+  phase already implemented (the `jpegUpsampling` shifts in the capture) — no
+  new algorithm. That is why the real 4:2:0 manga worked as soon as the
+  subsampled gate was lifted.
+- **Channel maps (measured, all consistent).** `lfQuant` is in JPEG-component
+  order (DC of component `j` is `lfQuant[j]`). `quantizedCoeffs`, the raw quant
+  params, and the CfL factor maps are in semantic X,Y,B order; component `j` is
+  channel `cMap[j]` (`cMap = [1,0,2]`). So Cb = X channel (xFromY), Cr = B
+  channel (bFromY), Y = luma.
+- **Robustness guards ported from libjxl** (found via a 30k-case fuzz on the
+  reconstruct path, which caught two real crashes the happy-path tests missed):
+  (1) a Huffman-symbol duplicate check in the jbrd parser — a duplicated 256
+  sentinel otherwise indexed past the 256-entry code table; (2) the coefficient
+  range guard — DC clamped to +/-2047, AC rejected outside +/-4095 (matching
+  `dec_group.cc`), since normal VarDCT decode does not bound coefficient values
+  and a crafted `.jxl` would otherwise overflow the entropy writer's symbol
+  index; (3) a DCT-8-only guard (JPEG has only 8x8 blocks). All are
+  byte-exact-invariant on valid content.
+
+Still deferred: RGB (non-YCbCr / kNone) transcodes carry a DC level-shift
+(`dcoff = 1024 / qtable_DC`) not yet applied; progressive scans; and
+compressed-Brotli jbrd tails (rich Exif/ICC/XMP markers) needing a full
+RFC 7932 Brotli decoder.

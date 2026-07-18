@@ -46,6 +46,7 @@ void main() {
             if (dec.state == JxlStreamState.complete) dec.decodeFinal();
           }
         ),
+        ('reconstruct', () => JxlDecoder.reconstructJpeg(data)),
       ]) {
         try {
           body();

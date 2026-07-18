@@ -9,11 +9,14 @@ import 'package:koni_jxl/koni_jxl.dart';
 import 'package:koni_jxl/src/jpeg/jbrd_decoder.dart';
 import 'package:test/test.dart';
 
-/// JPEG bitstream reconstruction gate (phase 1: baseline grayscale).
+import '../../tool/fuzz_decode.dart' as fuzz;
+
+/// JPEG bitstream reconstruction gate (baseline grayscale + YCbCr color,
+/// 4:4:4 / 4:2:0 / 4:2:2).
 ///
-/// Round-trip: cjpeg -> a baseline grayscale JPEG -> cjxl --lossless_jpeg ->
-/// koni `reconstructJpeg` must reproduce the original JPEG byte-for-byte.
-/// Skips when the JPEG XL / libjpeg CLI tools are absent.
+/// Round-trip: cjpeg -> a baseline JPEG -> cjxl --lossless_jpeg -> koni
+/// `reconstructJpeg` must reproduce the original JPEG byte-for-byte. Skips
+/// when the JPEG XL / libjpeg CLI tools are absent.
 
 bool _have(String tool, List<String> versionArgs) {
   try {
@@ -35,6 +38,22 @@ Uint8List _grayPgm(int w, int h, int seed) {
   for (var y = 0; y < h; y++) {
     for (var x = 0; x < w; x++) {
       data[i++] = (x * 7 + y * 13 + (x ^ y) + seed * 3) & 0xFF;
+    }
+  }
+  out.add(data);
+  return out.toBytes();
+}
+
+Uint8List _colorPpm(int w, int h, int seed) {
+  final out = BytesBuilder();
+  out.add('P6\n$w $h\n255\n'.codeUnits);
+  final data = Uint8List(w * h * 3);
+  var i = 0;
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      data[i++] = (x * 7 + y * 3 + seed) & 0xFF;
+      data[i++] = (y * 11 + x * 2 + seed) & 0xFF;
+      data[i++] = ((x + y) * 5 + (x ^ y)) & 0xFF;
     }
   }
   out.add(data);
@@ -114,5 +133,80 @@ void main() {
         }
       }
     });
+  });
+
+  group('JPEG reconstruction (YCbCr color)', () {
+    // sampling '1x1' = 4:4:4 (exercises chroma-from-luma inversion), '2x2' =
+    // 4:2:0, '2x1' = 4:2:2 (subsampling; no CfL). Boundary dims (not a multiple
+    // of the MCU size) exercise chroma block-grid rounding.
+    for (final (w, h, sample) in const [
+      (64, 64, '1x1'),
+      (103, 67, '1x1'),
+      (320, 200, '1x1'),
+      (64, 64, '2x2'),
+      (30, 22, '2x2'),
+      (126, 90, '2x2'),
+      (257, 129, '2x2'),
+      (256, 192, '2x1'),
+      (103, 67, '2x1'),
+    ]) {
+      test('${w}x$h $sample byte-exact', () {
+        final dir = Directory.systemTemp.createTempSync('koni_jbrc');
+        try {
+          final ppm = '${dir.path}/s.ppm';
+          final jpg = '${dir.path}/s.jpg';
+          final jxl = '${dir.path}/s.jxl';
+          File(ppm).writeAsBytesSync(_colorPpm(w, h, 11));
+
+          final c = Process.runSync('cjpeg',
+              ['-quality', '82', '-sample', sample, '-outfile', jpg, ppm]);
+          expect(c.exitCode, 0, reason: 'cjpeg: ${c.stderr}');
+          final t = Process.runSync(
+              'cjxl', [jpg, jxl, '--lossless_jpeg=1', '-q', '100']);
+          expect(t.exitCode, 0, reason: 'cjxl: ${t.stderr}');
+
+          final original = File(jpg).readAsBytesSync();
+          final rebuilt =
+              JxlDecoder.reconstructJpeg(File(jxl).readAsBytesSync());
+          expect(rebuilt, isNotNull, reason: 'no jbrd surfaced');
+          expect(rebuilt, orderedEquals(original),
+              reason: 'reconstruction not byte-exact');
+        } finally {
+          dir.deleteSync(recursive: true);
+        }
+      }, skip: _tools ? false : 'cjxl/cjpeg/djxl not available');
+    }
+
+    test('mutated transcode only ever throws JxlException', () {
+      // Robustness contract on the codestream->capture->writer path: a valid
+      // jbrd-carrying transcode mutated bit-by-bit can decode to out-of-range
+      // or otherwise degenerate coefficients; reconstructJpeg must reject those
+      // (JxlException) rather than crash (RangeError etc.).
+      final dir = Directory.systemTemp.createTempSync('koni_jbrf');
+      try {
+        final ppm = '${dir.path}/s.ppm';
+        final jpg = '${dir.path}/s.jpg';
+        final jxl = '${dir.path}/s.jxl';
+        File(ppm).writeAsBytesSync(_colorPpm(48, 48, 3));
+        Process.runSync('cjpeg',
+            ['-quality', '80', '-sample', '2x2', '-outfile', jpg, ppm]);
+        Process.runSync('cjxl', [jpg, jxl, '--lossless_jpeg=1', '-q', '100']);
+        final seed = File(jxl).readAsBytesSync();
+
+        for (var caseSeed = 30000; caseSeed < 32000; caseSeed++) {
+          final rng = math.Random(caseSeed);
+          final data = fuzz.mutate(rng, seed);
+          try {
+            JxlDecoder.reconstructJpeg(data);
+          } on JxlException {
+            // The contract for malformed input.
+          } catch (e, st) {
+            fail('case $caseSeed threw ${e.runtimeType}: $e\n$st');
+          }
+        }
+      } finally {
+        dir.deleteSync(recursive: true);
+      }
+    }, skip: _tools ? false : 'cjxl/cjpeg/djxl not available');
   });
 }

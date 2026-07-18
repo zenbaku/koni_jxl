@@ -15,6 +15,10 @@ final class JpegCoeffSink {
       : coeffs = [
           for (var i = 0; i < widthInBlocks.length; i++)
             Int32List(widthInBlocks[i] * heightInBlocks[i] * 64),
+        ],
+        cflFactor = [
+          for (var i = 0; i < widthInBlocks.length; i++)
+            Int32List(widthInBlocks[i] * heightInBlocks[i]),
         ];
 
   /// Per JPEG component, block dimensions and the flat coefficient store
@@ -22,6 +26,24 @@ final class JpegCoeffSink {
   final List<int> widthInBlocks;
   final List<int> heightInBlocks;
   final List<Int32List> coeffs;
+
+  /// Per JPEG component, the raw signed chroma-from-luma factor of each block's
+  /// 64x64 color tile (X-from-Y for Cb, B-from-Y for Cr; 0 for luma). Used to
+  /// invert CfL on 4:4:4 chroma AC during reconstruction.
+  final List<Int32List> cflFactor;
+
+  /// Set if any captured block uses a transform other than DCT 8x8. JPEG only
+  /// has 8x8 blocks, so a transcode never does; a crafted `.jxl` might, and
+  /// reconstruction rejects it rather than emitting wrong bytes.
+  bool nonDct8 = false;
+
+  /// Records the per-tile CfL factor for one block.
+  void setFactor(int component, int blockY, int blockX, int value) {
+    if (component >= coeffs.length) return;
+    final wib = widthInBlocks[component];
+    if (blockX >= wib || blockY >= heightInBlocks[component]) return;
+    cflFactor[component][blockY * wib + blockX] = value;
+  }
 
   /// Records the quantized DC integer for one block (natural position 0).
   void setDc(int component, int blockY, int blockX, int value) {

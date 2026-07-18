@@ -196,8 +196,17 @@ _BlobSizes _visitFields(BitReader br, JpegData jpg, int payloadLen) {
     if (numSymbols > hc.values.length) {
       throw const JxlInvalidBitstreamException('Huffman code too large');
     }
+    // Symbols must be distinct (libjxl's value_slots duplicate check). Without
+    // this a duplicated sentinel value (256) reaches the code-table builder and
+    // indexes past its 256-entry arrays.
+    final seen = List<bool>.filled(kJpegHuffmanAlphabetSize + 1, false);
     for (var i = 0; i < numSymbols; i++) {
-      hc.values[i] = br.readU32(0, 2, 4, 2, 8, 4, 1, 8);
+      final v = br.readU32(0, 2, 4, 2, 8, 4, 1, 8);
+      if (seen[v]) {
+        throw const JxlInvalidBitstreamException('duplicate Huffman symbol');
+      }
+      seen[v] = true;
+      hc.values[i] = v;
     }
     if (hc.values[numSymbols - 1] != kJpegHuffmanAlphabetSize) {
       throw const JxlInvalidBitstreamException('missing EOI Huffman symbol');

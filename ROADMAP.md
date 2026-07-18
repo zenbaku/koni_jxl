@@ -1253,18 +1253,21 @@ feature un-applied rather than throwing — the only decode-path
   spot (no conformance coverage) blends in the same domain. `dimShift > 0`
   (subsampled) spot channels are skipped (none in the corpus).
 - ⏳ **JPEG bitstream reconstruction.** Reconstruct the original JPEG from
-  a JPEG-transcoded `.jxl`, byte-exact. **Phase 1 DONE (2026-07-18):**
-  `JxlDecoder.reconstructJpeg` for **baseline grayscale** transcodes — new
-  `lib/src/jpeg/` (jbrd parser + stored-block Brotli + coefficient capture +
-  baseline entropy writer), all ported from libjxl (`jpeg_data.cc`,
-  `dec_jpeg_data{,_writer}.cc`). Gated byte-exact across sizes, non-×8 dims,
-  multi-LF-group and restart intervals, cross-checked vs djxl (11 round-trip
-  cases + a jbrd fuzz-robustness case). The one non-obvious finding: koni's
-  decoded quantized integers **are** the JPEG coefficients bit-for-bit
-  (luma + all DC), the raw quant matrix is stored transposed, and chroma AC
-  carries chroma-from-luma. Remaining phases: color (CfL inversion +
-  subsampling → unlocks real manga), full RFC 7932 Brotli (Exif/ICC/XMP),
-  progressive scans. See `doc/spec_notes.md`.
+  a JPEG-transcoded `.jxl`, byte-exact. **Baseline grayscale + YCbCr color
+  DONE (2026-07-18):** `JxlDecoder.reconstructJpeg` — new `lib/src/jpeg/` (jbrd
+  parser + stored-block Brotli + coefficient capture + baseline entropy
+  writer + integer-exact chroma-from-luma inversion), all ported from libjxl
+  (`jpeg_data.cc`, `dec_jpeg_data{,_writer}.cc`, `dec_group.cc`,
+  `chroma_from_luma.h`). Handles 4:4:4 (CfL) and 4:2:0 / 4:2:2 (no CfL);
+  **validated byte-exact on both real manga chapters — Naruto 17/17 (B/W
+  4:2:0) and One Piece 17/17 (full color)** vs djxl, plus synthetic sweeps
+  (sizes, non-×8 dims, multi-LF-group, restart, subsampling boundaries) and a
+  30k-case fuzz on the reconstruct path. Non-obvious findings: koni's decoded
+  quantized integers **are** the JPEG coefficients bit-for-bit (luma + all DC);
+  the raw quant matrix is stored transposed; chroma AC in 4:4:4 carries CfL
+  (fixed-point, precision 11, color factor 84) while subsampled chroma carries
+  none. Remaining: full RFC 7932 Brotli (Exif/ICC/XMP markers), progressive
+  scans, RGB (non-YCbCr, DC level-shift). See `doc/spec_notes.md`.
 - ✅ **Chained multi-layer blend modes (`blendmodes` conformance case) —
   investigated; NOT a koni bug, it's a libjxl-version deviation koni tracks
   faithfully (2026-07-08).** The `blendmodes` case (5 frames chaining

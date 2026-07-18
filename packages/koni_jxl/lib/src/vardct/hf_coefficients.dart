@@ -172,6 +172,10 @@ final class HfCoefficients {
       for (final i in includedIndices) {
         final posY = meta.blockY[i];
         final posX = meta.blockX[i];
+        final tt = meta.dctSelectAt(posY, posX);
+        if (tt == null || tt.dctSelectHeight != 1 || tt.dctSelectWidth != 1) {
+          sink.nonDct8 = true; // JPEG has only 8x8 blocks.
+        }
         for (final c in cMap) {
           final upY = header.jpegUpsamplingY[c];
           final upX = header.jpegUpsamplingX[c];
@@ -184,6 +188,14 @@ final class HfCoefficients {
           final globalBlockX = ((lfLoc.x * lfBlkStride) >> upX) + (posX >> upX);
           sink.setAcBlock(cMap[c], globalBlockY, globalBlockX,
               quantizedCoeffs[c], sGroupY << 3, sGroupX << 3, coeffWidth[c]);
+          // Chroma (X->Cb via xFromY, B->Cr via bFromY): record the block's
+          // 64x64 color-tile CfL factor for later integer-exact inversion.
+          if (c == 0 || c == 2) {
+            final corr = meta.hfStreamChannels[c == 0 ? 0 : 1];
+            final corrW = corr.width;
+            sink.setFactor(cMap[c], globalBlockY, globalBlockX,
+                corr.buffer![(posY >> 3) * corrW + (posX >> 3)]);
+          }
         }
       }
     }

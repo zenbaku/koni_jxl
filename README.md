@@ -84,8 +84,9 @@ Not yet / partial (these degrade gracefully — only an unsupported transfer
 function throws `JxlUnsupportedException`):
 
 - ⏳ JPEG bitstream reconstruction: `JxlDecoder.reconstructJpeg` re-emits the
-  original JPEG byte-exact for **baseline grayscale** transcodes; color,
-  progressive, and rich-marker (Exif/ICC) transcodes are not yet supported
+  original JPEG byte-exact for **baseline grayscale + YCbCr color** transcodes
+  (4:4:4 / 4:2:0 / 4:2:2); progressive, RGB, and rich-marker (Exif/ICC)
+  transcodes are not yet supported
 - ⏳ CMYK output; LUT/CLUT ICC profiles (fall back to sRGB)
 - ⏳ Float (HDR) sample *encoding* (decoding is supported)
 - ⚠️ A known chained multi-layer blend-mode deviation (the `blendmodes`
