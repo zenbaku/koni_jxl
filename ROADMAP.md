@@ -1,15 +1,47 @@
 # koni_jxl roadmap
 
-Direction and deferred work. The decoder is feature-complete for the manga
+Direction and deferred work. koni_jxl is now a **complete JPEG XL codec** —
+it decodes lossy (VarDCT) and lossless (modular), and encodes *both* lossless
+(modular) and lossy (VarDCT). The decoder is feature-complete for the manga
 use case and both packages are published at 0.1.2 (0.1.3 in-tree). The
-lossless encoder is now competitive with `cjxl`: on the 97-image burkardt PNG
-set it totals 60% of the source PNGs (beats PNG on 87/97) and 102.4% of
-`cjxl -e7` (beats cjxl on 19/97). This file tracks what's next.
+lossless encoder is competitive with `cjxl`: on the 97-image burkardt PNG set
+it totals 60% of the source PNGs (beats PNG on 87/97) and 102.4% of
+`cjxl -e7` (beats cjxl on 19/97). This file tracks what's left.
 
 Status legend: 🔲 not started · 🔨 in progress · ✅ done (kept here for
 context until it ships in a release).
 
 ## Next up
+
+**Lossy VarDCT encoding is complete and shipped** — the full 27-transform-type
+set, all L0–L4 phases, and 21+ compression-efficiency rounds (see the "Lossy
+(VarDCT) encoding" section below, kept as a done-changelog). What's actually
+left is a short tail of niche and deferred items:
+
+- **JPEG bitstream reconstruction — remaining formats.** Baseline grayscale +
+  YCbCr color are done byte-exact (2026-07-18); RGB (non-YCbCr), progressive
+  scans, and compressed-Brotli marker tails (Exif/ICC/XMP, needing full
+  RFC 7932 Brotli) still throw `JxlUnsupportedException`. See the Decoder-gaps
+  section.
+- **Delta palette (encoder).** The encoder emits only plain palettes
+  (`nb_deltas = 0`); the decoder already supports delta entries. Would help
+  near-flat colour art. Niche.
+- **CMYK / LUT-CLUT ICC output.** LUT/CLUT (`A2B*`/`mAB `) profiles fall back
+  to sRGB; CMYK needs its device-link profile — real CMS work. Niche.
+- **Isolate parallelism (intra-decode).** The Flutter layer already offloads
+  *whole* decodes to a background isolate, but a single decode is not split
+  across isolates. Deferred — revisit for very large images or batch decoding.
+- **`sierpinski` lossless residual (125% of `cjxl`).** A modular tree-*search*
+  quality wall, not a missing feature (a 2026-07-18 stride-scaling follow-up
+  confirmed it: helps larger generated content `math_emporium` −3.4% but can't
+  reach `sierpinski` at stride 2, byte-identical on all real
+  manga/photo/small content). See doc/spec_notes.md.
+- **Real RD-search over transform size** (VarDCT) and **cost-based optimal
+  LZ77 parse** (lossless) — both investigated and de-prioritized (not the
+  manga lever / no real-content beneficiary); details under "Closed threads"
+  below.
+
+### Closed threads — context, don't re-open without new evidence
 
 **The 2026-07-08 priority trio (below) is all done**, as is the lossless-
 encoder arc that followed it (per-leaf predictors, cross-channel context,
@@ -59,16 +91,6 @@ that niche is already handled never-worse by `min(plain, shallow-lz, deep-lz)`.
 (Colouredness was the hypothesis; the JPEG source is the killer. Truly
 lossless-source flat-colour content could differ, but distributed manga/manhwa
 is lossy.) **De-prioritized.**
-
-**What's actually still open:** `sierpinski`'s
-residual gap (125% of `cjxl`, needs `cjxl`'s more exhaustive modular tree
-*search* — a stride-scaling follow-up 2026-07-18 confirmed it's genuinely that
-wall: correcting the tree floor's size-scaling helps larger generated content
-`math_emporium` −3.4% but can't reach `sierpinski` at stride 2, byte-identical on
-all real manga/photo/small content — see doc/spec_notes.md); delta palette
-(niche); CMYK/LUT-CLUT output (real CMS work, niche); JPEG bitstream
-reconstruction; isolate parallelism (deferred, revisit for large images or
-batch decoding).
 
 The completed trio, for context — details in the sections linked below:
 
@@ -131,14 +153,15 @@ worth its ~40% encode-time cost). Don't conflate the two again.
 
 ---
 
-## Headline: lossy (VarDCT) encoding — "a true codec"
+## Lossy (VarDCT) encoding — "a true codec" — SHIPPED (done-changelog)
 
-Today we decode lossy (VarDCT) and encode lossless (modular). Encoding
-lossy makes koni_jxl a complete JPEG XL codec. This is a large project —
-roughly the inverse of the entire lossy decode pipeline — so it's phased.
-Every phase gates the same way the decoder does, but reversed: **our
-encode → djxl decode → within an RMSE/max threshold of the source**, and
-our own decoder must agree with djxl.
+**Complete and shipped — the entries below are a done-changelog, not open
+work.** koni_jxl now encodes lossy (VarDCT) as well as lossless (modular),
+making it a complete JPEG XL codec. It was a large project — roughly the
+inverse of the entire lossy decode pipeline — so it was phased. Every phase
+gated the same way the decoder does, but reversed: **our encode → djxl decode
+→ within an RMSE/max threshold of the source**, and our own decoder must agree
+with djxl.
 
 The decoder already gives us most of the hard reference material: the DCTs
 (we invert them; the forward transforms share structure), the quant-weight
